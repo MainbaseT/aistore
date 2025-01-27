@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -38,7 +39,7 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 	if err != nil {
 		return
 	}
-	if err = t.isIntraCall(r.Header, false); err != nil {
+	if err = t.checkIntraCall(r.Header, false); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
@@ -84,7 +85,6 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 				}
 			}
 			if err != nil {
-				t.statsT.IncErr(stats.ListCount)
 				t.writeErr(w, r, err)
 				return
 			}
@@ -103,13 +103,15 @@ func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
 			return
 		}
 		if ok := t.listObjects(w, r, bck, lsmsg); !ok {
-			t.statsT.IncErr(stats.ListCount)
+			t.statsT.IncBck(stats.ErrListCount, bck.Bucket())
 			return
 		}
+
 		delta := mono.SinceNano(begin)
-		t.statsT.AddMany(
-			cos.NamedVal64{Name: stats.ListCount, Value: 1},
-			cos.NamedVal64{Name: stats.ListLatency, Value: delta},
+		vlabs := map[string]string{stats.VarlabBucket: bck.Cname("")}
+		t.statsT.AddWith(
+			cos.NamedVal64{Name: stats.ListCount, Value: 1, VarLabs: vlabs},
+			cos.NamedVal64{Name: stats.ListLatency, Value: delta, VarLabs: vlabs},
 		)
 	case apc.ActSummaryBck:
 		var bucket, phase string // txn
@@ -175,7 +177,7 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 		code   int
 	)
 	if qbck.Provider != "" {
-		if qbck.IsAIS() || qbck.IsHTTP() { // built-in providers
+		if qbck.IsAIS() || qbck.IsHT() { // built-in providers
 			bcks = bmd.Select(qbck)
 		} else {
 			bcks, code, err = t.blist(qbck, config)
@@ -191,7 +193,7 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 		for provider := range apc.Providers {
 			var buckets cmn.Bcks
 			qbck.Provider = provider
-			if qbck.IsAIS() || qbck.IsHTTP() {
+			if qbck.IsAIS() || qbck.IsHT() {
 				buckets = bmd.Select(qbck)
 			} else {
 				buckets, code, err = t.blist(qbck, config)
@@ -253,7 +255,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 	if lsmsg.SID != "" {
 		smap := t.owner.smap.get()
 		if smap.GetTarget(lsmsg.SID) == nil {
-			err := &errNodeNotFound{"list-objects failure:", lsmsg.SID, t.si, smap}
+			err := &errNodeNotFound{t.si, smap, "list-objects failure:", lsmsg.SID}
 			t.writeErr(w, r, err)
 			return
 		}
@@ -300,7 +302,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck
 	if phase == apc.ActBegin {
 		rns := xreg.RenewBckSummary(bck, msg)
 		if rns.Err != nil {
-			t.writeErr(w, r, rns.Err, http.StatusInternalServerError)
+			t.writeErr(w, r, rns.Err, http.StatusInternalServerError, Silent)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -317,7 +319,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck
 	// never started
 	if xctn == nil {
 		err := cos.NewErrNotFound(t, apc.ActSummaryBck+" job "+msg.UUID)
-		t._erris(w, r, dpq.silent, err, http.StatusNotFound)
+		t._erris(w, r, err, http.StatusNotFound, dpq.silent)
 		return
 	}
 
@@ -344,7 +346,7 @@ func (t *target) bsumm(w http.ResponseWriter, r *http.Request, phase string, bck
 // DELETE { action } /v1/buckets/bucket-name
 // (evict | delete) (list | range)
 func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	msg := aisMsg{}
+	msg := actMsgExt{}
 	if err := readJSON(w, r, &msg); err != nil {
 		return
 	}
@@ -365,23 +367,30 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	switch msg.Action {
 	case apc.ActEvictRemoteBck:
 		keepMD := cos.IsParseBool(apireq.query.Get(apc.QparamKeepRemote))
-		if keepMD {
-			nlp := newBckNLP(apireq.bck)
-			nlp.Lock()
-			defer nlp.Unlock()
+		if !keepMD {
+			t.writeErrAct(w, r, apc.ActEvictRemoteBck) // (instead, expecting updated BMD from primary)
+			return
+		}
+		// arrived via p.destroyBucketData()
+		var (
+			wg  = &sync.WaitGroup{}
+			nlp = newBckNLP(apireq.bck)
+		)
+		nlp.Lock()
+		defer nlp.Unlock()
+		defer wg.Wait()
 
-			core.UncacheBck(apireq.bck)
-			err := fs.DestroyBucket(msg.Action, apireq.bck.Bucket(), apireq.bck.Props.BID)
-			if err != nil {
-				t.writeErr(w, r, err)
-				return
-			}
-			// Recreate bucket directories (now empty), since bck is still in BMD
-			errs := fs.CreateBucket(apireq.bck.Bucket(), false /*nilbmd*/)
-			if len(errs) > 0 {
-				debug.AssertNoErr(errs[0])
-				t.writeErr(w, r, errs[0]) // only 1 err is possible for 1 bck
-			}
+		core.UncacheBcks(wg, apireq.bck)
+		err := fs.DestroyBucket(msg.Action, apireq.bck.Bucket(), apireq.bck.Props.BID)
+		if err != nil {
+			t.writeErr(w, r, err)
+			return
+		}
+		// Recreate bucket directories (now empty), since bck is still in BMD
+		errs := fs.CreateBucket(apireq.bck.Bucket(), false /*nilbmd*/)
+		if len(errs) > 0 {
+			debug.AssertNoErr(errs[0])
+			t.writeErr(w, r, errs[0]) // only 1 err is possible for 1 bck
 		}
 	case apc.ActDeleteObjects, apc.ActEvictObjects:
 		lrMsg := &apc.ListRange{}
@@ -389,9 +398,10 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, msg.Value, err)
 			return
 		}
-		// note extra safety check
+		// extra safety check
 		for _, name := range lrMsg.ObjNames {
-			if !t.isValidObjname(w, r, name) {
+			if err := cmn.ValidateOname(name); err != nil {
+				t.writeErr(w, r, err)
 				return
 			}
 		}
@@ -486,12 +496,12 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		pid := apireq.query.Get(apc.QparamProxyID)
-		nlog.Infof("%s %s <= %s", r.Method, apireq.bck, pid)
+		nlog.Infoln(r.Method, apireq.bck, "<=", pid)
 	}
 
 	debug.Assert(!apireq.bck.IsAIS())
 
-	if apireq.bck.IsHTTP() {
+	if apireq.bck.IsHT() {
 		originalURL := apireq.query.Get(apc.QparamOrigURL)
 		ctx = context.WithValue(ctx, cos.CtxOriginalURL, originalURL)
 		if !inBMD && originalURL == "" {
@@ -505,15 +515,14 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 	if err != nil {
 		if !inBMD {
 			if code == http.StatusNotFound {
-				err = cmn.NewErrRemoteBckNotFound(apireq.bck.Bucket())
 				t.writeErr(w, r, err, code, Silent)
 			} else {
 				err = cmn.NewErrFailedTo(t, "HEAD remote bucket", apireq.bck, err, code)
-				t._erris(w, r, cos.IsParseBool(apireq.query.Get(apc.QparamSilent)), err, code)
+				t._erris(w, r, err, code, cos.IsParseBool(apireq.query.Get(apc.QparamSilent)))
 			}
 			return
 		}
-		nlog.Warningf("%s: bucket %s, err: %v(%d)", t, apireq.bck, err, code)
+		nlog.Warningf("%s: bucket %s, err: %v(%d)", t, apireq.bck.String(), err, code)
 		bucketProps = make(cos.StrKVs)
 		bucketProps[apc.HdrBackendProvider] = apireq.bck.Provider
 		bucketProps[apc.HdrRemoteOffline] = strconv.FormatBool(apireq.bck.IsRemote())
@@ -522,7 +531,7 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 		if k == apc.HdrBucketVerEnabled && apireq.bck.Props != nil {
 			if curr := strconv.FormatBool(apireq.bck.VersionConf().Enabled); curr != v {
 				// e.g., change via vendor-provided CLI and similar
-				nlog.Errorf("%s: %s versioning got out of sync: %s != %s", t, apireq.bck, v, curr)
+				nlog.Errorf("%s: %s versioning got out of sync: %s != %s", t, apireq.bck.String(), v, curr)
 			}
 		}
 		hdr.Set(k, v)

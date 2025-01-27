@@ -6,16 +6,22 @@
 package ios
 
 import (
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/lufia/iostat"
 )
 
 // TODO: NIY
 
-type LsBlk struct{}
+type (
+	blockDev     struct{}
+	BlockDevices []*blockDev
+)
 
-func lsblk(string, bool) *LsBlk { return nil }
+func _lsblk(string, *blockDev) (BlockDevices, error) {
+	return nil, nil
+}
 
-func fs2disks(*LsBlk, string, Label, int, bool) (FsDisks, error) {
+func fs2disks(string, string, cos.MountpathLabel, BlockDevices, int, bool) (FsDisks, error) {
 	driveStats, err := iostat.ReadDriveStats()
 	if err != nil || len(driveStats) == 0 {
 		return nil, err

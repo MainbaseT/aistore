@@ -5,7 +5,6 @@
 package ais
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ec"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
 const fmtErrBckObj = "invalid %s request: expecting bucket and object (names) in the URL, have %v"
@@ -144,16 +144,16 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 		return
 	}
 
-	coiParams := core.AllocCOI()
+	coiParams := xs.AllocCOI()
 	{
 		coiParams.Config = config
 		coiParams.BckTo = bckTo
 		coiParams.ObjnameTo = s3.ObjName(items)
 		coiParams.OWT = cmn.OwtCopy
 	}
-	coi := (*copyOI)(coiParams)
+	coi := (*coi)(coiParams)
 	_, err = coi.do(t, nil /*DM*/, lom)
-	core.FreeCOI(coiParams)
+	xs.FreeCOI(coiParams)
 
 	if err != nil {
 		if err == cmn.ErrSkip {
@@ -166,7 +166,7 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 	}
 
 	var cksumValue string
-	if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
+	if cksum := lom.Checksum(); cksum != nil && cksum.Type() == cos.ChecksumMD5 {
 		cksumValue = cksum.Value()
 	}
 	result := s3.CopyObjectResult{
@@ -214,10 +214,10 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 	ecode, err := poi.do(nil /*response hdr*/, r, dpq)
 	freePOI(poi)
 	if err != nil {
-		t.fsErr(err, lom.FQN)
+		t.FSHC(err, lom.Mountpath(), lom.FQN)
 		s3.WriteErr(w, r, err, ecode)
 	} else {
-		s3.SetEtag(w.Header(), lom)
+		s3.SetS3Headers(w.Header(), lom)
 	}
 	dpqFree(dpq)
 }
@@ -248,7 +248,9 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 		if cmn.Rom.FastV(5, cos.SmoduleS3) {
 			nlog.Infoln("getMptPart", bck.String(), objName, q)
 		}
-		t.getMptPart(w, r, bck, objName, q)
+		lom := core.AllocLOM(objName)
+		t.getMptPart(w, r, bck, lom, q)
+		core.FreeLOM(lom)
 		return
 	}
 	uploadID := q.Get(s3.QparamMptUploadID)
@@ -314,7 +316,7 @@ func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []strin
 		op.ObjAttrs = *lom.ObjAttrs()
 	} else {
 		// cold HEAD
-		objAttrs, ecode, err := t.Backend(lom.Bck()).HeadObj(context.Background(), lom, r)
+		objAttrs, ecode, err := t.HeadCold(lom, r)
 		if err != nil {
 			s3.WriteErr(w, r, err, ecode)
 			return
@@ -324,21 +326,34 @@ func (t *target) headObjS3(w http.ResponseWriter, r *http.Request, items []strin
 
 	custom := op.GetCustomMD()
 	lom.SetCustomMD(custom)
-	if v, ok := custom[cos.HdrETag]; ok {
-		hdr.Set(cos.HdrETag, v)
-	}
-	s3.SetEtag(hdr, lom)
+
+	s3.SetS3Headers(hdr, lom)
+
 	hdr.Set(cos.HdrContentLength, strconv.FormatInt(op.Size, 10))
 	if v, ok := custom[cos.HdrContentType]; ok {
 		hdr.Set(cos.HdrContentType, v)
 	}
-	// e.g. https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Examples
-	// (compare w/ `p.listObjectsS3()`
+
+	// [NOTE] time formatting; choosing atime vs mtime
+	// - https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Examples
+	// - list-objects RFC3339 vs head-object RFC1123
+	// - compare w/ `listObjectsS3`
+	// - see related: `entryToS3` in s3/types
 	lastModified := cos.FormatNanoTime(op.Atime, cos.RFC1123GMT)
 	hdr.Set(cos.S3LastModified, lastModified)
 
-	// TODO: lom.Checksum() via apc.HeaderPrefix+apc.HdrObjCksumType/Val via
-	// s3 obj Metadata map[string]*string
+	// - https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html
+	// - https://docs.aws.amazon.com/AmazonS3/latest/API/RESTCommonResponseHeaders.html
+	if cksum := lom.Checksum(); cksum != nil && cksum.Ty() != cos.ChecksumNone {
+		hdr.Set(cos.S3MetadataChecksumType, cksum.Ty())
+		hdr.Set(cos.S3MetadataChecksumVal, cksum.Val())
+	}
+	// see aws.go `_getCustom`
+	if v, ok := custom[cmn.VersionObjMD]; ok {
+		hdr.Set(cos.S3VersionHeader, v)
+	}
+
+	// TODO: add custom user keys, if any
 }
 
 // DELETE /s3/<bucket-name>/<object-name>

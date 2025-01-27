@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -18,9 +19,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
-
-const defaultLastModified = 0 // When an object was not accessed yet
 
 // NOTE: do not rename structs that have `xml` tags. The names of those structs
 // become a top level tag of resulting XML, and those tags S3-compatible
@@ -31,20 +31,20 @@ type (
 		Name                  string          `xml:"Name"`
 		Ns                    string          `xml:"xmlns,attr"`
 		Prefix                string          `xml:"Prefix"`
-		KeyCount              int             `xml:"KeyCount"`                 // number of object names in the response
-		MaxKeys               int             `xml:"MaxKeys"`                  // "The maximum number of keys returned ..." (s3)
-		IsTruncated           bool            `xml:"IsTruncated"`              // true if there are more pages to read
-		ContinuationToken     string          `xml:"ContinuationToken"`        // original ContinuationToken
-		NextContinuationToken string          `xml:"NextContinuationToken"`    // NextContinuationToken to read the next page
-		Contents              []*ObjInfo      `xml:"Contents"`                 // list of objects
+		ContinuationToken     string          `xml:"ContinuationToken"`        // original
+		NextContinuationToken string          `xml:"NextContinuationToken"`    // to read the next page
+		Contents              []*ObjInfo      `xml:"Contents"`                 // list of object
 		CommonPrefixes        []*CommonPrefix `xml:"CommonPrefixes,omitempty"` // list of dirs (used with `apc.LsNoRecursion`)
+		KeyCount              int             `xml:"KeyCount"`                 // number of object names in the response
+		MaxKeys               int             `xml:"MaxKeys"`                  // "The maximum number of keys returned ..."
+		IsTruncated           bool            `xml:"IsTruncated"`              // true if there are more pages to read
 	}
 	ObjInfo struct {
 		Key          string `xml:"Key"`
 		LastModified string `xml:"LastModified"`
 		ETag         string `xml:"ETag"`
-		Size         int64  `xml:"Size"`
 		Class        string `xml:"StorageClass"`
+		Size         int64  `xml:"Size"`
 	}
 	CommonPrefix struct {
 		Prefix string `xml:"Prefix"`
@@ -63,16 +63,9 @@ type (
 		UploadID string `xml:"UploadId"`
 	}
 
-	// Multipart uploaded part
-	PartInfo struct {
-		ETag       string `xml:"ETag"`
-		PartNumber int32  `xml:"PartNumber"`
-		Size       int64  `xml:"Size,omitempty"`
-	}
-
 	// Multipart upload completion request
 	CompleteMptUpload struct {
-		Parts []*PartInfo `xml:"Part"`
+		Parts []types.CompletedPart `xml:"Part"`
 	}
 
 	// Multipart upload completion response
@@ -84,17 +77,17 @@ type (
 
 	// Multipart uploaded parts response
 	ListPartsResult struct {
-		Bucket   string      `xml:"Bucket"`
-		Key      string      `xml:"Key"`
-		UploadID string      `xml:"UploadId"`
-		Parts    []*PartInfo `xml:"Part"`
+		Bucket   string                `xml:"Bucket"`
+		Key      string                `xml:"Key"`
+		UploadID string                `xml:"UploadId"`
+		Parts    []types.CompletedPart `xml:"Part"`
 	}
 
 	// Active upload info
 	UploadInfoResult struct {
+		Initiated time.Time `xml:"Initiated"`
 		Key       string    `xml:"Key"`
 		UploadID  string    `xml:"UploadId"`
-		Initiated time.Time `xml:"Initiated"`
 	}
 
 	// List of active multipart uploads response
@@ -145,8 +138,8 @@ func NewListObjectResult(bucket string) *ListObjectResult {
 	return &ListObjectResult{
 		Name:     bucket,
 		Ns:       s3Namespace,
-		MaxKeys:  1000,
-		Contents: make([]*ObjInfo, 0),
+		MaxKeys:  apc.MaxPageSizeAWS,
+		Contents: make([]*ObjInfo, 0, apc.MaxPageSizeAWS),
 	}
 }
 
@@ -160,23 +153,37 @@ func (r *ListObjectResult) Add(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) {
 	if entry.Flags&apc.EntryIsDir == 0 {
 		r.Contents = append(r.Contents, entryToS3(entry, lsmsg))
 	} else {
-		r.CommonPrefixes = append(r.CommonPrefixes, &CommonPrefix{Prefix: entry.Name + "/"})
+		prefix := entry.Name
+		if !cos.IsLastB(entry.Name, '/') {
+			prefix += "/"
+		}
+		r.CommonPrefixes = append(r.CommonPrefixes, &CommonPrefix{Prefix: prefix})
 	}
 }
 
-func entryToS3(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) *ObjInfo {
-	objInfo := &ObjInfo{
-		Key:          entry.Name,
-		LastModified: entry.Atime,
-		ETag:         entry.Checksum,
-		Size:         entry.Size,
+func entryToS3(entry *cmn.LsoEnt, lsmsg *apc.LsoMsg) (oi *ObjInfo) {
+	// [NOTE]
+	// as we do not track mtime we choose to _prefer_ atime
+	// even when mtime (a.k.a. "LastModified") exists. Which is not always true (e.g.,
+	// when using S3 compatibility API to access non-S3 buckets)
+	// See related: `headObjS3`
+
+	oi = &ObjInfo{Key: entry.Name, Size: entry.Size, LastModified: entry.Atime}
+
+	if entry.Custom != "" {
+		md := make(cos.StrKVs, 4)
+		cmn.S2CustomMD(md, entry.Custom, "")
+		if oi.LastModified == "" {
+			oi.LastModified = md[cmn.LastModified]
+		}
+		oi.ETag = md[cmn.ETag]
 	}
-	// Some S3 clients do not tolerate empty or missing LastModified, so fill it
-	// with a zero time if the object was not accessed yet
-	if objInfo.LastModified == "" {
-		objInfo.LastModified = cos.FormatNanoTime(defaultLastModified, lsmsg.TimeFormat)
+
+	if oi.LastModified == "" && lsmsg.TimeFormat != "" {
+		oi.LastModified = cos.FormatNanoTime(0, lsmsg.TimeFormat) // 1970-01-01 epoch
 	}
-	return objInfo
+
+	return oi
 }
 
 func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoRes, lsmsg *apc.LsoMsg) {
@@ -188,16 +195,35 @@ func (r *ListObjectResult) FromLsoResult(lst *cmn.LsoRes, lsmsg *apc.LsoMsg) {
 	}
 }
 
-func SetEtag(hdr http.Header, lom *core.LOM) {
-	if hdr.Get(cos.S3CksumHeader) != "" {
-		return
+func SetS3Headers(hdr http.Header, lom *core.LOM) {
+	// ETag
+	if etag := hdr.Get(cos.HdrETag); etag != "" {
+		// ETag is a quoted string:
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+		debug.AssertFunc(func() bool {
+			return etag[0] == '"' && etag[len(etag)-1] == '"'
+		})
+	} else {
+		if v, exists := lom.GetCustomKey(cmn.ETag); exists {
+			hdr.Set(cos.HdrETag, v)
+		} else if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
+			debug.Assert(cksum.Val()[0] != '"', cksum.Val())
+			// NOTE: could this object be multipart?
+			hdr.Set(cos.HdrETag, `"`+cksum.Value()+`"`)
+		}
 	}
-	if v, exists := lom.GetCustomKey(cmn.ETag); exists && !cmn.IsS3MultipartEtag(v) {
-		hdr.Set(cos.S3CksumHeader /*"ETag"*/, v)
-		return
+
+	// s3 version
+	if hdr.Get(cos.S3VersionHeader) == "" {
+		if v, exists := lom.GetCustomKey(cmn.VersionObjMD); exists {
+			// NOTE: could this `cmn.VersionObjMD` value be the result of original GET from gs:// bucket, for instance?
+			hdr.Set(cos.S3VersionHeader, v)
+		}
 	}
-	if cksum := lom.Checksum(); cksum.Type() == cos.ChecksumMD5 {
-		hdr.Set(cos.S3CksumHeader, cksum.Value())
+	for k, v := range lom.GetCustomMD() {
+		if strings.HasPrefix(k, HeaderMetaPrefix) {
+			hdr.Set(k, v)
+		}
 	}
 }
 

@@ -1,8 +1,9 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 from unittest.mock import Mock, patch, call
 
+from aistore.sdk import Bucket
 from aistore.sdk.const import (
     QPARAM_WHAT,
     QPARAM_FORCE,
@@ -15,7 +16,7 @@ from aistore.sdk.const import (
 )
 from aistore.sdk.errors import Timeout, JobInfoNotFound
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.types import JobStatus, JobArgs, BucketModel, ActionMsg, JobSnapshot
+from aistore.sdk.types import JobStatus, JobArgs, ActionMsg, JobSnapshot
 from aistore.sdk.utils import probing_frequency
 from aistore.sdk.job import Job
 
@@ -190,9 +191,12 @@ class TestJob(unittest.TestCase):
 
     def test_job_start_single_bucket(self):
         daemon_id = "daemon id"
-        bucket = BucketModel(client=Mock(RequestClient), name="single bucket")
+        bucket = Bucket(
+            client=Mock(RequestClient),
+            name="single bucket",
+        )
         expected_json = JobArgs(
-            kind=self.job_kind, daemon_id=daemon_id, bucket=bucket
+            kind=self.job_kind, daemon_id=daemon_id, bucket=bucket.as_model()
         ).as_dict()
         self.job_start_exec_assert(
             self.job,
@@ -206,11 +210,19 @@ class TestJob(unittest.TestCase):
     def test_job_start_bucket_list(self):
         daemon_id = "daemon id"
         buckets = [
-            BucketModel(client=Mock(RequestClient), name="first bucket"),
-            BucketModel(client=Mock(RequestClient), name="second bucket"),
+            Bucket(
+                client=Mock(RequestClient),
+                name="first bucket",
+            ),
+            Bucket(
+                client=Mock(RequestClient),
+                name="second bucket",
+            ),
         ]
         expected_json = JobArgs(
-            kind=self.job_kind, daemon_id=daemon_id, buckets=buckets
+            kind=self.job_kind,
+            daemon_id=daemon_id,
+            buckets=[bucket.as_model() for bucket in buckets],
         ).as_dict()
         self.job_start_exec_assert(
             self.job,
@@ -296,8 +308,8 @@ class TestJob(unittest.TestCase):
         self.mock_client.request_deserialize.assert_called()
 
     def test_get_within_timeframe_found_jobs(self):
-        start_time = datetime.now() - timedelta(days=1)
-        end_time = datetime.now()
+        start_time = datetime.now(timezone.utc) - timedelta(days=1)
+        end_time = datetime.now(timezone.utc)
 
         mock_snapshots = [
             JobSnapshot(
@@ -312,7 +324,7 @@ class TestJob(unittest.TestCase):
 
         self.mock_client.request_deserialize.return_value = {"key": mock_snapshots}
 
-        found_jobs = self.job.get_within_timeframe(start_time.time(), end_time.time())
+        found_jobs = self.job.get_within_timeframe(start_time, end_time)
 
         self.assertEqual(len(found_jobs), len(mock_snapshots))
         for found_job, expected_snapshot in zip(found_jobs, mock_snapshots):
@@ -321,9 +333,9 @@ class TestJob(unittest.TestCase):
             self.assertEqual(found_job.end_time, expected_snapshot.end_time)
 
     def test_get_within_timeframe_no_jobs_found(self):
-        start_time = datetime.now() - timedelta(days=1)
-        end_time = datetime.now()
+        start_time = datetime.now(timezone.utc) - timedelta(days=1)
+        end_time = datetime.now(timezone.utc)
         self.mock_client.request_deserialize.return_value = {}
 
         with self.assertRaises(JobInfoNotFound):
-            self.job.get_within_timeframe(start_time.time(), end_time.time())
+            self.job.get_within_timeframe(start_time, end_time)

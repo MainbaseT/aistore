@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
@@ -22,6 +21,11 @@ import (
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/OneOfOne/xxhash"
+)
+
+const (
+	MetaverLOM   = 1 // LOM
+	MetaverChunk = 2 // LOM chunk // TODO: niy
 )
 
 // On-disk metadata layout - changing any of this must be done with respect
@@ -41,7 +45,7 @@ import (
 //   on the version of the layout.
 
 // the one and only currently supported checksum type == xxhash;
-// adding more checksums will likely require a new cmn.MetaverLOM version
+// adding more checksums will likely require a new MetaverLOM version
 const mdCksumTyXXHash = 1
 
 // on-disk xattr names
@@ -92,8 +96,8 @@ const prefLen = 10 // 10B prefix [ version = 1 | checksum-type | 64-bit xxhash ]
 
 const getxattr = "getxattr" // syscall
 
-// used in tests
-func (lom *LOM) AcquireAtimefs() error {
+// usage: unit tests only
+func (lom *LOM) TestAtime() error {
 	_, atimefs, _, err := lom.Fstat(true /*get-atime*/)
 	if err != nil {
 		return err
@@ -103,7 +107,7 @@ func (lom *LOM) AcquireAtimefs() error {
 	return nil
 }
 
-// NOTE: used in tests, ignores `dirty`
+// NOTE usage: tests and `xmeta` only; ignores `dirty`
 func (lom *LOM) LoadMetaFromFS() error {
 	_, atimefs, _, err := lom.Fstat(true /*get-atime*/)
 	if err != nil {
@@ -114,14 +118,18 @@ func (lom *LOM) LoadMetaFromFS() error {
 	}
 	lom.md.Atime = atimefs
 	lom.md.atimefs = uint64(atimefs)
+
+	uname := lom.bck.MakeUname(lom.ObjName)
+	lom.md.uname = cos.UnsafeSptr(uname)
+
 	return nil
 }
 
-func whingeLmeta(err error) (*lmeta, error) {
+func whingeLmeta(cname string, err error) (*lmeta, error) {
 	if cos.IsErrXattrNotFound(err) {
-		return nil, cmn.NewErrLmetaNotFound(err)
+		return nil, cmn.NewErrLmetaNotFound(cname, err)
 	}
-	return nil, os.NewSyscallError(getxattr, err)
+	return nil, os.NewSyscallError(getxattr, fmt.Errorf("%s, err: %w", cname, err))
 }
 
 func (lom *LOM) lmfsReload(populate bool) (md *lmeta, err error) {
@@ -143,7 +151,7 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 	if err != nil {
 		slab.Free(buf)
 		if err != syscall.ERANGE {
-			return whingeLmeta(err)
+			return whingeLmeta(lom.Cname(), err)
 		}
 		debug.Assert(mdSize < xattrMaxSize)
 		// 2nd attempt: max-size
@@ -151,7 +159,7 @@ func (lom *LOM) lmfs(populate bool) (md *lmeta, err error) {
 		b, err = fs.GetXattrBuf(lom.FQN, XattrLOM, buf)
 		if err != nil {
 			slab.Free(buf)
-			return whingeLmeta(err)
+			return whingeLmeta(lom.Cname(), err)
 		}
 	}
 	md, err = lom.unpack(b, mdSize, populate)
@@ -190,7 +198,7 @@ func (lom *LOM) PersistMain() (err error) {
 	buf := lom.pack()
 	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
 		lom.Uncache()
-		T.FSHC(err, lom.FQN)
+		T.FSHC(err, lom.Mountpath(), lom.FQN)
 	} else {
 		lom.md.clearDirty()
 		lom.Recache()
@@ -218,7 +226,7 @@ func (lom *LOM) Persist() (err error) {
 	buf := lom.pack()
 	if err = fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
 		lom.Uncache()
-		T.FSHC(err, lom.FQN)
+		T.FSHC(err, lom.Mountpath(), lom.FQN)
 	} else {
 		lom.md.clearDirty()
 		if lom.Bprops() != nil {
@@ -245,25 +253,6 @@ func (lom *LOM) persistMdOnCopies() (copyFQN string, err error) {
 	}
 	g.smm.Free(buf)
 	return
-}
-
-// NOTE: not clearing dirty flag as the caller will uncache anyway
-func (lom *LOM) flushCold(md *lmeta, atime time.Time) {
-	if err := lom.flushAtime(atime); err != nil {
-		return
-	}
-	if !md.isDirty() || lom.WritePolicy() == apc.WriteNever {
-		return
-	}
-	lom.md = *md
-	if err := lom.syncMetaWithCopies(); err != nil {
-		return
-	}
-	buf := lom.pack()
-	if err := fs.SetXattr(lom.FQN, XattrLOM, buf); err != nil {
-		T.FSHC(err, lom.FQN)
-	}
-	g.smm.Free(buf)
 }
 
 func (lom *LOM) flushAtime(atime time.Time) error {
@@ -323,7 +312,7 @@ func (md *lmeta) unpack(buf []byte) error {
 	if len(buf) < prefLen {
 		return fmt.Errorf("%s: too short (%d)", badLmeta, len(buf))
 	}
-	if buf[0] != cmn.MetaverLOM {
+	if buf[0] != MetaverLOM {
 		return fmt.Errorf("%s: unknown version %d", badLmeta, buf[0])
 	}
 	if buf[1] != mdCksumTyXXHash {
@@ -390,7 +379,7 @@ func (md *lmeta) unpack(buf []byte) error {
 				mpathInfo, _, err := fs.FQN2Mpath(copyFQN)
 				if err != nil {
 					// Mountpath with the copy is missing.
-					if cmn.Rom.FastV(4, cos.SmoduleCluster) {
+					if cmn.Rom.FastV(4, cos.SmoduleCore) {
 						nlog.Warningln(err)
 					}
 					// For utilities and tests: fill the map with mpath names always
@@ -406,7 +395,11 @@ func (md *lmeta) unpack(buf []byte) error {
 			entries := strings.Split(val, customSepa)
 			custom := make(cos.StrKVs, len(entries)/2)
 			for i := 0; i < len(entries); i += 2 {
-				custom[entries[i]] = entries[i+1]
+				key := entries[i]
+				custom[key] = entries[i+1]
+				if key == cmn.OrigFntl {
+					md.lid = md.lid.setlmfl(lmflFntl)
+				}
 			}
 			md.SetCustomMD(custom)
 		default:
@@ -457,7 +450,7 @@ func (md *lmeta) pack(mdSize int64) (buf []byte) {
 	}
 
 	// checksum, prepend, and return
-	buf[0] = cmn.MetaverLOM
+	buf[0] = MetaverLOM
 	buf[1] = mdCksumTyXXHash
 	mdCksumValue := xxhash.Checksum64S(buf[prefLen:], cos.MLCG32)
 	binary.BigEndian.PutUint64(buf[2:], mdCksumValue)

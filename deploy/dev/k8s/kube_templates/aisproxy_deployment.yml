@@ -31,6 +31,10 @@ spec:
         valueFrom:
           fieldRef:
             fieldPath: spec.nodeName
+      - name: MY_POD
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
       - name: AIS_NODE_ROLE
         value: "proxy"
     volumeMounts:
@@ -58,6 +62,7 @@ spec:
         export AIS_SKIP_VERIFY_CRT=${AIS_SKIP_VERIFY_CRT} &&
         export AIS_SERVER_CRT=${AIS_SERVER_CRT} &&
         export AIS_SERVER_KEY=${AIS_SERVER_KEY} &&
+        source /etc/ais/utils.sh &&
         source /etc/ais/aisnode_config.sh &&
         aisnode -config=/etc/ais/ais.json -local_config=/etc/ais/ais_local.json -role=proxy -ntargets=${TARGET_CNT};
   volumes:

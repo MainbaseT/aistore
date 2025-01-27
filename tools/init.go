@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -54,7 +54,6 @@ const (
 
 type g struct {
 	Client *http.Client
-	Log    func(format string, a ...any)
 }
 
 var (
@@ -92,16 +91,14 @@ var (
 
 // NOTE:
 // With no access to cluster configuration the tests
-// currently simply detect protocol type by the env.AIS.Endpoint (proxy's) URL.
+// currently simply detect protocol type by the env.AisEndpoint (proxy's) URL.
 // Certificate check and other TLS is always disabled.
 
 func init() {
-	gctx.Log = tlog.Logf
-
-	if cos.IsHTTPS(os.Getenv(env.AIS.Endpoint)) {
+	if cos.IsHTTPS(os.Getenv(env.AisEndpoint)) {
 		// fill-in from env
 		cmn.EnvToTLS(&tlsArgs)
-		gctx.Client = cmn.NewClientTLS(transportArgs, tlsArgs)
+		gctx.Client = cmn.NewClientTLS(transportArgs, tlsArgs, false /*intra-cluster*/)
 	} else {
 		gctx.Client = cmn.NewClient(transportArgs)
 	}
@@ -117,7 +114,7 @@ func NewClientWithProxy(proxyURL string) *http.Client {
 
 	if parsedURL.Scheme == "https" {
 		cos.AssertMsg(cos.IsHTTPS(proxyURL), proxyURL)
-		tlsConfig, err := cmn.NewTLS(tlsArgs)
+		tlsConfig, err := cmn.NewTLS(tlsArgs, false /*intra-cluster*/)
 		cos.AssertNoErr(err)
 		transport.TLSClientConfig = tlsConfig
 	}
@@ -151,7 +148,7 @@ func InitLocalCluster() {
 
 	// This is needed for testing on Kubernetes if we want to run 'make test-XXX'
 	// Many of the other packages do not accept the 'url' flag
-	if cliAISURL := os.Getenv(env.AIS.Endpoint); cliAISURL != "" {
+	if cliAISURL := os.Getenv(env.AisEndpoint); cliAISURL != "" {
 		if !strings.HasPrefix(cliAISURL, "http") {
 			cliAISURL = "http://" + cliAISURL
 		}
@@ -163,36 +160,38 @@ func InitLocalCluster() {
 		initRemAis() // remote AIS that optionally may be run locally as well and used for testing
 		return
 	}
-	fmt.Printf("Error: %s\n\n", strings.TrimSuffix(err.Error(), "\n"))
-	if strings.Contains(err.Error(), "token") {
-		fmt.Printf("Hint: make sure to provide access token via %s environment or the default config location\n",
-			env.AuthN.TokenFile)
-	} else if strings.Contains(err.Error(), "unreachable") {
-		fmt.Printf("Hint: make sure that cluster is running and/or specify its endpoint via %s environment\n",
-			env.AIS.Endpoint)
-	} else {
-		fmt.Printf("Hint: check api/env/*.go environment and, in particular %q\n", env.AIS.Endpoint)
+	tlog.Logf("Error: %s\n\n", strings.TrimSuffix(err.Error(), "\n"))
+
+	switch {
+	case strings.Contains(err.Error(), "token"):
+		tlog.Logf("Hint: make sure to provide access token via %s environment or the default config location\n",
+			env.AisAuthTokenFile)
+	case strings.Contains(err.Error(), "unreachable"):
+		tlog.Logf("Hint: make sure that cluster is running and/or specify its endpoint via %s environment\n",
+			env.AisEndpoint)
+	default:
+		tlog.Logf("Hint: check api/env/*.go environment and, in particular %s=%s\n", env.AisEndpoint, os.Getenv(env.AisEndpoint))
 		if len(envVars) > 0 {
 			fmt.Println("Docker Environment:")
 			for k, v := range envVars {
-				fmt.Printf("\t%s:\t%s\n", k, v)
+				tlog.Logf("\t%s:\t%s\n", k, v)
 			}
 		}
 	}
+
 	os.Exit(1)
 }
 
 // InitCluster initializes the environment necessary for testing against an AIS cluster.
 // NOTE: the function is also used for testing by NVIDIA/ais-k8s Operator
 func InitCluster(proxyURL string, clusterType ClusterType) (err error) {
-	LoggedUserToken = authn.LoadToken("")
+	LoggedUserToken, _ = authn.LoadToken("") // ignore error as not all tests require token
 	proxyURLReadOnly = proxyURL
 	testClusterType = clusterType
 	if err = initProxyURL(); err != nil {
 		return
 	}
-	initPmap()
-	return
+	return initPmap()
 }
 
 func initProxyURL() (err error) {
@@ -227,11 +226,14 @@ func initProxyURL() (err error) {
 	return
 }
 
-func initPmap() {
+func initPmap() error {
 	bp := BaseAPIParams(proxyURLReadOnly)
 	smap, err := waitForStartup(bp)
-	cos.AssertNoErr(err)
+	if err != nil {
+		return err
+	}
 	pmapReadOnly = smap.Pmap
+	return nil
 }
 
 func initRemAis() {

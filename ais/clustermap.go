@@ -102,6 +102,7 @@ var (
 // as revs
 func (*smapX) tag() string       { return revsSmapTag }
 func (m *smapX) version() int64  { return m.Version }
+func (m *smapX) uuid() string    { return m.UUID }
 func (*smapX) jit(p *proxy) revs { return p.owner.smap.get() }
 
 func (m *smapX) sgl() *memsys.SGL {
@@ -210,16 +211,18 @@ func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
 		}
 	}
 	// pick alternatives
+outer:
 	for _, psi := range m.Pmap {
 		if !m.IsIC(psi) {
 			continue
 		}
-		if orig == "" {
+		switch {
+		case orig == "":
 			orig = psi.URL(cmn.NetIntraControl)
-		} else if disc == "" {
+		case disc == "":
 			disc = psi.URL(cmn.NetIntraControl)
-		} else {
-			break
+		default:
+			break outer
 		}
 	}
 	return orig, disc
@@ -286,6 +289,7 @@ func (m *smapX) addTarget(tsi *meta.Snode) {
 		cos.Assertf(false, "FATAL: duplicate SID: new %s vs %s", tsi.StringEx(), si.StringEx())
 	}
 	tsi.SetName()
+	tsi.InitNetNamer()
 	m.Tmap[tsi.ID()] = tsi
 	m.Version++
 }
@@ -522,14 +526,26 @@ func (r *smapOwner) Listeners() meta.SmapListeners { return r.sls }
 // private
 //
 
+// put new smap version
 func (r *smapOwner) put(smap *smapX) {
+	// residual (in-memory) initialization
 	smap.InitDigests()
 	smap.vstr = strconv.FormatInt(smap.Version, 10)
+
+	for _, psi := range smap.Pmap {
+		psi.SetName()
+	}
+	for _, tsi := range smap.Tmap {
+		tsi.SetName()
+		tsi.InitNetNamer()
+	}
+
+	// put and notify
 	r.smap.Store(smap)
 	r.sls.notify(smap.version())
 }
 
-func (r *smapOwner) get() (smap *smapX) { return r.smap.Load() }
+func (r *smapOwner) get() *smapX { return r.smap.Load() }
 
 func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) (err error) {
 	if err = newSmap.validate(); err != nil {
@@ -711,7 +727,7 @@ func (sls *sls) notify(ver int64) {
 		return
 	}
 	sls.postCh <- ver
-	if len(sls.postCh) == cap(sls.postCh) {
-		nlog.ErrorDepth(1, "sls channel full: Smap v", ver) // unlikely
+	if l, c := len(sls.postCh), cap(sls.postCh); l > c/2 {
+		nlog.ErrorDepth(1, cos.ErrWorkChanFull, l, c, "Smap version:", ver) // unlikely
 	}
 }

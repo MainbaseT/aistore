@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,14 +41,14 @@ type (
 			mtx sync.RWMutex
 		}
 		args     *xreg.TCObjsArgs
-		workCh   chan *cmn.TCObjsMsg
+		workCh   chan *cmn.TCOMsg
 		chanFull atomic.Int64
 		streamingX
 		owt cmn.OWT
 	}
 	tcowi struct {
 		r   *XactTCObjs
-		msg *cmn.TCObjsMsg
+		msg *cmn.TCOMsg
 		// finishing
 		refc atomic.Int32
 	}
@@ -81,7 +82,7 @@ func (p *tcoFactory) Start() error {
 	p.Args.UUID = PrefixTcoID + uuid
 
 	// new x-tco
-	workCh := make(chan *cmn.TCObjsMsg, maxNumInParallel)
+	workCh := make(chan *cmn.TCOMsg, maxNumInParallel)
 	r := &XactTCObjs{streamingX: streamingX{p: &p.streamingF, config: cmn.GCO.Get()}, args: p.args, workCh: workCh}
 	r.pending.m = make(map[string]*tcowi, maxNumInParallel)
 	r.owt = cmn.OwtCopy
@@ -89,7 +90,7 @@ func (p *tcoFactory) Start() error {
 		r.owt = cmn.OwtTransform
 	}
 	p.xctn = r
-	r.DemandBase.Init(p.UUID(), p.Kind(), p.Bck, xact.IdleDefault)
+	r.DemandBase.Init(p.UUID(), p.Kind(), "" /*ctlmsg via SetCtlMsg later*/, p.Bck, xact.IdleDefault) // TODO ctlmsg: arch, tco
 
 	var sizePDU int32
 	if p.kind == apc.ActETLObjects {
@@ -134,11 +135,13 @@ func (r *XactTCObjs) Snap() (snap *core.Snap) {
 	return
 }
 
-func (r *XactTCObjs) Begin(msg *cmn.TCObjsMsg) {
+func (r *XactTCObjs) Begin(msg *cmn.TCOMsg) {
 	wi := &tcowi{r: r, msg: msg}
 	r.pending.mtx.Lock()
+
 	r.pending.m[msg.TxnUUID] = wi
 	r.wiCnt.Inc()
+
 	r.pending.mtx.Unlock()
 }
 
@@ -151,7 +154,7 @@ func (r *XactTCObjs) Run(wg *sync.WaitGroup) {
 		case msg := <-r.workCh:
 			var (
 				smap = core.T.Sowner().Get()
-				lrit = &lriterator{}
+				lrit = &lrit{}
 			)
 			debug.Assert(cos.IsValidUUID(msg.TxnUUID), msg.TxnUUID) // (ref050724: in re: ais/plstcx)
 			r.pending.mtx.Lock()
@@ -175,7 +178,17 @@ func (r *XactTCObjs) Run(wg *sync.WaitGroup) {
 
 			// run
 			var wg *sync.WaitGroup
-			if err = lrit.init(r, &msg.ListRange, r.Bck()); err == nil {
+			if err = lrit.init(r, &msg.ListRange, r.Bck(), lrpWorkersDflt); err == nil {
+				// dynamic ctlmsg
+				{
+					var sb strings.Builder
+					sb.Grow(160)
+					msg.CopyBckMsg.Str(&sb, r.args.BckFrom.Cname(msg.Prefix), r.args.BckTo.Cname(msg.Prepend))
+					sb.WriteByte(' ')
+					msg.ListRange.Str(&sb, lrit.lrp == lrpPrefix)
+					r.Base.SetCtlMsg(sb.String())
+				}
+				// run
 				if msg.Sync && lrit.lrp != lrpList {
 					wg = &sync.WaitGroup{}
 					wg.Add(1)
@@ -189,6 +202,7 @@ func (r *XactTCObjs) Run(wg *sync.WaitGroup) {
 			if wg != nil {
 				wg.Wait()
 			}
+
 			lrit.wait()
 
 			if r.IsAborted() || err != nil {
@@ -213,7 +227,7 @@ fin:
 }
 
 // more work
-func (r *XactTCObjs) Do(msg *cmn.TCObjsMsg) {
+func (r *XactTCObjs) Do(msg *cmn.TCOMsg) {
 	r.IncPending()
 	r.workCh <- msg
 
@@ -222,7 +236,7 @@ func (r *XactTCObjs) Do(msg *cmn.TCObjsMsg) {
 		if l == c {
 			cnt := r.chanFull.Inc()
 			if (cnt >= 10 && cnt <= 20) || (cnt > 0 && cmn.Rom.FastV(5, cos.SmoduleXs)) {
-				nlog.Errorln("work channel full", r.Name())
+				nlog.Errorln(cos.ErrWorkChanFull, r.Name(), "cnt", cnt)
 			}
 		}
 	}
@@ -307,7 +321,7 @@ func (r *XactTCObjs) _put(hdr *transport.ObjHdr, objReader io.Reader, lom *core.
 // tcowi //
 ///////////
 
-func (wi *tcowi) do(lom *core.LOM, lrit *lriterator) {
+func (wi *tcowi) do(lom *core.LOM, lrit *lrit) {
 	var (
 		objNameTo = wi.msg.ToName(lom.ObjName)
 		buf, slab = core.T.PageMM().Alloc()
@@ -317,7 +331,7 @@ func (wi *tcowi) do(lom *core.LOM, lrit *lriterator) {
 	// until after the transformation; here we are disregarding the size anyway as the stats
 	// are done elsewhere
 
-	coiParams := core.AllocCOI()
+	coiParams := AllocCOI()
 	{
 		coiParams.DP = wi.r.args.DP
 		coiParams.Xact = wi.r
@@ -325,13 +339,17 @@ func (wi *tcowi) do(lom *core.LOM, lrit *lriterator) {
 		coiParams.BckTo = wi.r.args.BckTo
 		coiParams.ObjnameTo = objNameTo
 		coiParams.Buf = buf
-		coiParams.OWT = wi.r.owt
 		coiParams.DryRun = wi.msg.DryRun
 		coiParams.LatestVer = wi.msg.LatestVer
 		coiParams.Sync = wi.msg.Sync
+		coiParams.OWT = wi.r.owt
+		coiParams.Finalize = false
+		if coiParams.ObjnameTo == "" {
+			coiParams.ObjnameTo = lom.ObjName
+		}
 	}
-	_, err := core.T.CopyObject(lom, wi.r.p.dm, coiParams)
-	core.FreeCOI(coiParams)
+	_, err := gcoi.CopyObject(lom, wi.r.p.dm, coiParams)
+	FreeCOI(coiParams)
 	slab.Free(buf)
 
 	if err != nil {
@@ -355,13 +373,13 @@ type syncwi struct {
 // interface guard
 var _ lrwi = (*syncwi)(nil)
 
-func (r *XactTCObjs) prune(lrit *lriterator, smap *meta.Smap, pt *cos.ParsedTemplate) {
+func (r *XactTCObjs) prune(pruneit *lrit, smap *meta.Smap, pt *cos.ParsedTemplate) {
 	rp := prune{parent: r, smap: smap}
 	rp.bckFrom, rp.bckTo = r.FromTo()
 
 	// tcb use case
-	if lrit.lrp == lrpPrefix {
-		rp.prefix = lrit.prefix
+	if pruneit.lrp == lrpPrefix {
+		rp.prefix = pruneit.prefix
 		rp.init(r.config)
 		rp.run()
 		rp.wait()
@@ -369,10 +387,10 @@ func (r *XactTCObjs) prune(lrit *lriterator, smap *meta.Smap, pt *cos.ParsedTemp
 	}
 
 	// same range iterator but different bucket
-	var syncit lriterator
-	debug.Assert(lrit.lrp == lrpRange)
+	var syncit lrit
+	debug.Assert(pruneit.lrp == lrpRange)
 
-	err := syncit.init(lrit.parent, lrit.msg, rp.bckTo)
+	err := syncit.init(pruneit.parent, pruneit.msg, rp.bckTo, lrpWorkersDflt)
 	debug.AssertNoErr(err)
 	syncit.pt = pt
 	syncwi := &syncwi{&rp} // reusing only prune.do (and not init/run/wait)
@@ -380,6 +398,6 @@ func (r *XactTCObjs) prune(lrit *lriterator, smap *meta.Smap, pt *cos.ParsedTemp
 	syncit.wait()
 }
 
-func (syncwi *syncwi) do(lom *core.LOM, _ *lriterator) {
+func (syncwi *syncwi) do(lom *core.LOM, _ *lrit) {
 	syncwi.rp.do(lom, nil)
 }

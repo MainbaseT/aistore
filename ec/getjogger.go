@@ -88,7 +88,7 @@ func (*getJogger) freeCtx(ctx *restoreCtx) {
 }
 
 func (c *getJogger) run() {
-	nlog.Infof("started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
+	nlog.Infoln("start [", c.parent.bck.Cname(""), c.mpath, "]")
 
 	for {
 		select {
@@ -106,7 +106,7 @@ func (c *getJogger) run() {
 }
 
 func (c *getJogger) stop() {
-	nlog.Infof("stopping EC for mountpath: %s, bucket: %s", c.mpath, c.parent.bck)
+	nlog.Infoln("stop [", c.parent.bck.Cname(""), c.mpath, "]")
 	c.stopCh.Close()
 }
 
@@ -331,7 +331,7 @@ loop: //nolint:gocritic // keeping label for readability
 
 	b := cos.MustMarshal(ctx.meta)
 	ctMeta := core.NewCTFromLOM(ctx.lom, fs.ECMetaType)
-	if err := ctMeta.Write(bytes.NewReader(b), -1); err != nil {
+	if err := ctMeta.Write(bytes.NewReader(b), -1, "" /*work fqn*/); err != nil {
 		return err
 	}
 	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
@@ -365,7 +365,7 @@ func (c *getJogger) requestSlices(ctx *restoreCtx) error {
 
 	for k, v := range ctx.nodes {
 		if v.SliceID < 1 || v.SliceID > sliceCnt {
-			nlog.Warningf("Node %s has invalid slice ID %d", k, v.SliceID)
+			nlog.Warningf("node %s has invalid slice ID %d", k, v.SliceID)
 			continue
 		}
 
@@ -767,7 +767,7 @@ func (c *getJogger) freeDownloaded(ctx *restoreCtx) {
 // Main function that starts restoring an object that was encoded
 func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
 	if cmn.Rom.FastV(4, cos.SmoduleEC) {
-		nlog.Infof("Starting EC restore %s", ctx.lom)
+		nlog.Infoln("Starting EC restore", ctx.lom.Cname())
 	}
 
 	// Download all slices from the targets that have sent metadata
@@ -792,7 +792,7 @@ func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
 	if err := c.uploadRestoredSlices(ctx, restored); err != nil {
 		nlog.Errorf("failed to upload restored slices of %s: %v", ctx.lom, err)
 	} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
-		nlog.Infof("slices %s restored successfully", ctx.lom)
+		nlog.Infof("restored %s slices", ctx.lom)
 	}
 
 	c.freeDownloaded(ctx)
@@ -849,6 +849,9 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 		nodes := md.RemoteTargets()
 		ctx.nodes = make(map[string]*Metadata, len(nodes))
 		for _, node := range nodes {
+			if node.InMaintOrDecomm() {
+				continue
+			}
 			wg.Add(1)
 			go func(si *meta.Snode, c *getJogger, mtx *sync.Mutex, mdExists bool) {
 				ctx.requestMeta(si, c, mtx, mdExists)
@@ -860,6 +863,9 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 		ctx.nodes = make(map[string]*Metadata, len(tmap))
 		for _, node := range tmap {
 			if node.ID() == core.T.SID() {
+				continue
+			}
+			if node.InMaintOrDecomm() {
 				continue
 			}
 			wg.Add(1)
@@ -895,10 +901,11 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 func (ctx *restoreCtx) requestMeta(si *meta.Snode, c *getJogger, mtx *sync.Mutex, mdExists bool) {
 	md, err := RequestECMeta(ctx.lom.Bucket(), ctx.lom.ObjName, si, c.client)
 	if err != nil {
+		warn := fmt.Sprintf("%s: %s failed request-meta(%s) request: %v", core.T, ctx.lom.Cname(), si, err)
 		if mdExists {
-			nlog.Errorf("No EC meta %s from %s: %v", ctx.lom.Cname(), si, err)
+			nlog.Warningln(warn)
 		} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
-			nlog.Infof("No EC meta %s from %s: %v", ctx.lom.Cname(), si, err)
+			nlog.Infoln(warn)
 		}
 		return
 	}

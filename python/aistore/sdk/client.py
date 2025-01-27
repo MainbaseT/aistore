@@ -1,44 +1,80 @@
 #
-# Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
 #
+from typing import Optional, Tuple, Union
+import os
+import warnings
 
-from __future__ import annotations  # pylint: disable=unused-variable
+from urllib3 import Retry
 
 from aistore.sdk.bucket import Bucket
-from aistore.sdk.const import (
-    PROVIDER_AIS,
-)
+from aistore.sdk.provider import Provider
+from aistore.sdk.const import AIS_AUTHN_TOKEN
 from aistore.sdk.cluster import Cluster
 from aistore.sdk.dsort import Dsort
 from aistore.sdk.request_client import RequestClient
+from aistore.sdk.session_manager import SessionManager
 from aistore.sdk.types import Namespace
 from aistore.sdk.job import Job
-from aistore.sdk.etl import Etl
+from aistore.sdk.etl.etl import Etl
 from aistore.sdk.utils import parse_url
-from aistore.sdk.object import Object
+from aistore.sdk.obj.object import Object
 from aistore.sdk.errors import InvalidURLException
 
 
-# pylint: disable=unused-variable, duplicate-code
 class Client:
     """
     AIStore client for managing buckets, objects, ETL jobs
 
     Args:
         endpoint (str): AIStore endpoint
+        skip_verify (bool, optional): If True, skip SSL certificate verification. Defaults to False.
+        ca_cert (str, optional): Path to a CA certificate file for SSL verification. If not provided, the
+            'AIS_CLIENT_CA' environment variable will be used. Defaults to None.
+        client_cert (Union[str, Tuple[str, str], None], optional): Path to a client certificate PEM file
+            or a path pair (cert, key) for mTLS. If not provided, 'AIS_CRT' and 'AIS_CRT_KEY'
+            environment variables will be used. Defaults to None.
+        timeout (Union[float, Tuple[float, float], None], optional): Request timeout in seconds; a single float
+            for both connect/read timeouts (e.g., 5.0), a tuple for separate connect/read timeouts (e.g., (3.0, 10.0)),
+            or None to disable timeout.
+        retry (urllib3.Retry, optional): Retry configuration object from the urllib3 library.
+        token (str, optional): Authorization token. If not provided, the 'AIS_AUTHN_TOKEN' environment variable
+            will be used. Defaults to None.
     """
 
+    # pylint: disable=too-many-arguments
     def __init__(
         self,
         endpoint: str,
         skip_verify: bool = False,
-        ca_cert: str = None,
-        timeout: float | tuple[float, float] | None = None,
+        ca_cert: Optional[str] = None,
+        client_cert: Optional[Union[str, Tuple[str, str]]] = None,
+        timeout: Optional[Union[float, Tuple[float, float]]] = None,
+        retry: Optional[Retry] = None,
+        token: Optional[str] = None,
     ):
-        self._request_client = RequestClient(endpoint, skip_verify, ca_cert, timeout)
+        session_manager = SessionManager(
+            retry=retry,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            skip_verify=skip_verify,
+        )
+
+        # Check for token from arguments or environment variable
+        if not token:
+            token = os.environ.get(AIS_AUTHN_TOKEN, None)
+        self._request_client = RequestClient(
+            endpoint=endpoint,
+            session_manager=session_manager,
+            timeout=timeout,
+            token=token,
+        )
 
     def bucket(
-        self, bck_name: str, provider: str = PROVIDER_AIS, namespace: Namespace = None
+        self,
+        bck_name: str,
+        provider: Union[Provider, str] = Provider.AIS,
+        namespace: Namespace = None,
     ):
         """
         Factory constructor for bucket object.
@@ -46,7 +82,8 @@ class Client:
 
         Args:
             bck_name (str): Name of bucket
-            provider (str): Provider of bucket, one of "ais", "aws", "gcp", ... (optional, defaults to ais)
+            provider (str or Provider): Provider of bucket, one of "ais", "aws", "gcp", ...
+                (optional, defaults to ais)
             namespace (Namespace): Namespace of bucket (optional, defaults to None)
 
         Returns:
@@ -113,13 +150,40 @@ class Client:
 
     def fetch_object_by_url(self, url: str) -> Object:
         """
-        Retrieve an object based on its URL.
+        Deprecated: Use `get_object_from_url` instead.
+
+        Creates an Object instance from a URL.
+
+        This method does not make any HTTP requests.
 
         Args:
             url (str): Full URL of the object (e.g., "ais://bucket1/file.txt")
 
         Returns:
-            Object: The object retrieved from the specified URL
+            Object: The object constructed from the specified URL
+        """
+        warnings.warn(
+            "The 'fetch_object_by_url' method is deprecated and will be removed in a future release. "
+            "Please use 'get_object_from_url' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_object_from_url(url)
+
+    def get_object_from_url(self, url: str) -> Object:
+        """
+        Creates an Object instance from a URL.
+
+        This method does not make any HTTP requests.
+
+        Args:
+            url (str): Full URL of the object (e.g., "ais://bucket1/file.txt")
+
+        Returns:
+            Object: The object constructed from the specified URL
+
+        Raises:
+            InvalidURLException: If the URL is invalid.
         """
         try:
             provider, bck_name, obj_name = parse_url(url)

@@ -40,7 +40,7 @@ const ActCleanup = "cleanup" // in addition to (apc.ActBegin, ...)
 // (compare with txnCln)
 type txnSrv struct {
 	t          *target
-	msg        *aisMsg
+	msg        *actMsgExt
 	bck        *meta.Bck // aka bckFrom
 	bckTo      *meta.Bck
 	query      url.Values
@@ -123,7 +123,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	case apc.ActCopyObjects, apc.ActETLObjects:
 		var (
 			dp     core.DP
-			tcomsg = &cmn.TCObjsMsg{}
+			tcomsg = &cmn.TCOMsg{}
 		)
 		if err := cos.MorphMarshal(c.msg.Value, tcomsg); err != nil {
 			t.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, t.si, msg.Action, c.msg.Value, err)
@@ -167,7 +167,7 @@ func (t *target) txnHandler(w http.ResponseWriter, r *http.Request) {
 	t.transactions.find(c.uuid, ActCleanup)
 
 	if cmn.IsErrCapExceeded(err) {
-		cs := t.OOS(nil)
+		cs := t.oos(cmn.GCO.Get())
 		t.writeErrStatusf(w, r, http.StatusInsufficientStorage, "%s: %v", cs.String(), err)
 	} else {
 		t.writeErr(w, r, err)
@@ -281,7 +281,7 @@ func (t *target) makeNCopies(c *txnSrv) (string, error) {
 	return "", nil
 }
 
-func (t *target) validateMakeNCopies(bck *meta.Bck, msg *aisMsg) (curCopies, newCopies int64, err error) {
+func (t *target) validateMakeNCopies(bck *meta.Bck, msg *actMsgExt) (curCopies, newCopies int64, err error) {
 	curCopies = bck.Props.Mirror.Copies
 	newCopies, err = _parseNCopies(msg.Value)
 	if err == nil {
@@ -360,7 +360,9 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 		if _, reec := _reEC(bprops, nprops, c.bck, nil /*smap*/); reec {
 			flt := xreg.Flt{Kind: apc.ActECEncode, Bck: c.bck}
 			xreg.DoAbort(flt, errors.New("re-ec"))
-			rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
+
+			// checkAndRecover always false (compare w/ ecEncode below)
+			rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit, false /*check & recover missing/corrupted*/)
 			if rns.Err != nil {
 				return "", rns.Err
 			}
@@ -381,7 +383,7 @@ func (t *target) setBprops(c *txnSrv) (string, error) {
 	return "", nil
 }
 
-func (t *target) validateNprops(bck *meta.Bck, msg *aisMsg) (nprops *cmn.Bprops, err error) {
+func (t *target) validateNprops(bck *meta.Bck, msg *actMsgExt) (nprops *cmn.Bprops, err error) {
 	var (
 		body = cos.MustMarshal(msg.Value)
 		cs   = fs.Cap()
@@ -472,7 +474,7 @@ func (t *target) renameBucket(c *txnSrv) (string, error) {
 	return "", nil
 }
 
-func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *aisMsg) error {
+func (t *target) validateBckRenTxn(bckFrom, bckTo *meta.Bck, msg *actMsgExt) error {
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		return err
@@ -632,7 +634,7 @@ func (t *target) _tcbBegin(c *txnSrv, msg *apc.TCBMsg, dp core.DP) (err error) {
 // Two IDs:
 // - TxnUUID: transaction (txn) ID
 // - xid: xaction ID (will have "tco-" prefix)
-func (t *target) tcobjs(c *txnSrv, msg *cmn.TCObjsMsg, dp core.DP) (xid string, _ error) {
+func (t *target) tcobjs(c *txnSrv, msg *cmn.TCOMsg, dp core.DP) (xid string, _ error) {
 	switch c.phase {
 	case apc.ActBegin:
 		var (
@@ -758,7 +760,8 @@ func (t *target) ecEncode(c *txnSrv) (string, error) {
 		if err = t.transactions.wait(txn, c.timeout.netw, c.timeout.host); err != nil {
 			return "", cmn.NewErrFailedTo(t, "commit", txn, err)
 		}
-		rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit)
+		checkAndRecover := c.msg.Name == apc.ActEcRecover
+		rns := xreg.RenewECEncode(c.bck, c.uuid, apc.ActCommit, checkAndRecover /*missing/corrupted slices, etc.*/)
 		if rns.Err != nil {
 			nlog.Errorf("%s: %s %v", t, txn, rns.Err)
 			return "", rns.Err
@@ -774,7 +777,7 @@ func (t *target) ecEncode(c *txnSrv) (string, error) {
 	return "", nil
 }
 
-func (t *target) validateECEncode(bck *meta.Bck, msg *aisMsg) error {
+func (t *target) validateECEncode(bck *meta.Bck, msg *actMsgExt) error {
 	cs := fs.Cap()
 	if err := cs.Err(); err != nil {
 		return err
@@ -834,8 +837,10 @@ func (t *target) createArchMultiObj(c *txnSrv) (string /*xaction uuid*/, error) 
 		archMsg.FromBckName = bckFrom.Name
 		archlom := core.AllocLOM(archMsg.ArchName)
 		if err := xarch.Begin(archMsg, archlom); err != nil {
-			core.FreeLOM(archlom) // otherwise is freed by x-archive
-			return xid, err
+			// NOTE: unexpected and unlikely - aborting
+			core.FreeLOM(archlom)
+			xarch.Abort(err)
+			return "", err
 		}
 		txn := newTxnArchMultiObj(c, bckFrom, xarch, archMsg)
 		if err := t.transactions.begin(txn); err != nil {

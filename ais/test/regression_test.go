@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -168,7 +168,7 @@ func TestListObjectsCloudGetLocation(t *testing.T) {
 	tassert.CheckFatal(t, err)
 
 	if len(lst.Entries) < m.num {
-		t.Errorf("Bucket %s has %d objects, expected %d", m.bck, len(lst.Entries), m.num)
+		t.Errorf("Bucket %s has %d objects, expected %d", m.bck.String(), len(lst.Entries), m.num)
 	}
 	j := 10
 	if len(lst.Entries) >= 200 {
@@ -340,7 +340,7 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 		}
 		tassert.CheckFatal(t, err)
 
-		tlog.Logf("Renamed %s => %s\n", rtd.bck, rtd.renamedBck)
+		tlog.Logf("Renamed %s => %s\n", rtd.bck.String(), rtd.renamedBck.String())
 		if rtd.wait {
 			postRenameWaitAndCheck(t, baseParams, rtd, m.num, m.objNames, xid)
 		}
@@ -375,7 +375,7 @@ func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regress
 		}
 		tassert.CheckFatal(t, err)
 	} else {
-		tlog.Logf("rename-bucket[%s] %s => %s done\n", xid, rtd.bck, rtd.renamedBck)
+		tlog.Logf("rename-bucket[%s] %s => %s done\n", xid, rtd.bck.String(), rtd.renamedBck.String())
 	}
 	bcks, err := api.ListBuckets(baseParams, cmn.QueryBcks{Provider: rtd.bck.Provider}, apc.FltPresent)
 	tassert.CheckFatal(t, err)
@@ -390,12 +390,12 @@ func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regress
 		if bck.Name == rtd.renamedBck.Name {
 			renamedBucketExists = true
 		} else if bck.Name == rtd.bck.Name {
-			t.Fatalf("original ais bucket %s still exists after rename", rtd.bck)
+			t.Fatalf("original ais bucket %s still exists after rename", rtd.bck.String())
 		}
 	}
 
 	if !renamedBucketExists {
-		t.Fatalf("renamed ais bucket %s does not exist after rename", rtd.renamedBck)
+		t.Fatalf("renamed ais bucket %s does not exist after rename", rtd.renamedBck.String())
 	}
 
 	lst, err := api.ListObjects(baseParams, rtd.renamedBck, nil, api.ListArgs{})
@@ -411,8 +411,13 @@ func postRenameWaitAndCheck(t *testing.T, baseParams api.BaseParams, rtd regress
 				tlog.Logf("not found: %s\n", name)
 			}
 		}
-		t.Fatalf("wrong number of objects in the bucket %s renamed as %s (before: %d. after: %d)",
-			rtd.bck, rtd.renamedBck, numPuts, len(unique))
+		err := fmt.Errorf("wrong number of objects in the bucket %s renamed as %s (before: %d. after: %d)",
+			rtd.bck.String(), rtd.renamedBck.String(), numPuts, len(unique))
+		if rtd.wait {
+			t.Fatal(err)
+		} else {
+			tlog.Logln("Warning: " + err.Error())
+		}
 	}
 }
 
@@ -599,8 +604,8 @@ func TestGetClusterStats(t *testing.T) {
 		tStats, err := api.GetDaemonStats(baseParams, tsi)
 		tassert.CheckFatal(t, err)
 
-		vCDF := vStats.TargetCDF
-		tCDF := tStats.TargetCDF
+		vCDF := vStats.Tcdf
+		tCDF := tStats.Tcdf
 		if vCDF.PctMax != tCDF.PctMax || vCDF.PctAvg != tCDF.PctAvg {
 			t.Errorf("%s: stats are different: [%+v] vs [%+v]\n", tname, vCDF, tCDF)
 		}
@@ -647,7 +652,7 @@ func TestLRU(t *testing.T) {
 	for tid, v := range cluStats.Target {
 		filesEvicted[tid] = tools.GetNamedStatsVal(v, "lru.evict.n")
 		bytesEvicted[tid] = tools.GetNamedStatsVal(v, "lru.evict.size")
-		for _, c := range v.TargetCDF.Mountpaths {
+		for _, c := range v.Tcdf.Mountpaths {
 			usedPct = min(usedPct, c.PctUsed)
 		}
 	}
@@ -663,7 +668,7 @@ func TestLRU(t *testing.T) {
 	}
 
 	tlog.Logf("LRU: current min space usage in the cluster: %d%%\n", usedPct)
-	tlog.Logf("setting 'space.lowm=%d' and 'space.highwm=%d'\n", lowWM, highWM)
+	tlog.Logf("setting 'space.lowwm=%d' and 'space.highwm=%d'\n", lowWM, highWM)
 
 	// All targets: set new watermarks; restore upon exit
 	oconfig := tools.GetClusterConfig(t)
@@ -777,9 +782,9 @@ func TestPrefetchList(t *testing.T) {
 	lst, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 	if len(lst.Entries) != m.num {
-		t.Errorf("list-objects %s: expected %d, got %d", bck, m.num, len(lst.Entries))
+		t.Errorf("list-objects %s: expected %d, got %d", bck.String(), m.num, len(lst.Entries))
 	} else {
-		tlog.Logf("list-objects %s: %d is correct\n", bck, len(m.objNames))
+		tlog.Logf("list-objects %s: %d is correct\n", bck.String(), len(m.objNames))
 	}
 }
 
@@ -904,7 +909,7 @@ func TestPrefetchRange(t *testing.T) {
 	lst, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 	if len(lst.Entries) < len(files) {
-		t.Errorf("list-objects %s/%s: expected %d, got %d", bck, m.prefix, len(files), len(lst.Entries))
+		t.Errorf("list-objects %s/%s: expected %d, got %d", bck.String(), m.prefix, len(files), len(lst.Entries))
 	} else {
 		var count int
 		for _, e := range lst.Entries {
@@ -915,9 +920,9 @@ func TestPrefetchRange(t *testing.T) {
 			}
 		}
 		if count != len(files) {
-			t.Errorf("list-objects %s/%s: expected %d, got %d", bck, m.prefix, len(files), count)
+			t.Errorf("list-objects %s/%s: expected %d, got %d", bck.String(), m.prefix, len(files), count)
 		} else {
-			tlog.Logf("list-objects %s/%s: %d is correct\n", bck, m.prefix, len(files))
+			tlog.Logf("list-objects %s/%s: %d is correct\n", bck.String(), m.prefix, len(files))
 		}
 	}
 }

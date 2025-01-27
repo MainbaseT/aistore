@@ -1,7 +1,7 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
@@ -35,14 +35,22 @@ const (
 	lrpPrefix
 )
 
+// when number of workers is not defined in a respective control message
+// (see e.g. PrefetchMsg.NumWorkers)
+// we have two special values
+const (
+	lrpWorkersNone = -1 // no workers at all - iterated LOMs get executed by the (iterating) goroutine
+	lrpWorkersDflt = 0  // num workers = number of mountpaths
+)
+
 // common for all list-range
 type (
 	// one multi-object operation work item
 	lrwi interface {
-		do(*core.LOM, *lriterator)
+		do(*core.LOM, *lrit)
 	}
 	// a strict subset of core.Xact, includes only the methods
-	// lriterator needs for itself
+	// lrit needs for itself
 	lrxact interface {
 		IsAborted() bool
 		Finished() bool
@@ -54,11 +62,11 @@ type (
 		wi  lrwi
 	}
 	lrworker struct {
-		lrit *lriterator
+		lrit *lrit
 	}
 
 	// common multi-object operation context and list|range|prefix logic
-	lriterator struct {
+	lrit struct {
 		parent lrxact
 		msg    *apc.ListRange
 		bck    *meta.Bck
@@ -91,12 +99,14 @@ var (
 )
 
 ////////////////
-// lriterator //
+// lrit //
 ////////////////
 
-func (r *lriterator) init(xctn lrxact, msg *apc.ListRange, bck *meta.Bck, blocking ...bool) error {
-	avail := fs.GetAvail()
-	l := len(avail)
+func (r *lrit) init(xctn lrxact, msg *apc.ListRange, bck *meta.Bck, numWorkers int) error {
+	var (
+		avail = fs.GetAvail()
+		l     = len(avail)
+	)
 	if l == 0 {
 		return cmn.ErrNoMountpaths
 	}
@@ -104,28 +114,50 @@ func (r *lriterator) init(xctn lrxact, msg *apc.ListRange, bck *meta.Bck, blocki
 	r.msg = msg
 	r.bck = bck
 
-	// list is the simplest and always single-threaded
 	if msg.IsList() {
 		r.lrp = lrpList
-		return nil
+	} else {
+		if err := r._inipr(msg); err != nil {
+			return err
+		}
 	}
-	if err := r._inipr(msg); err != nil {
-		return err
-	}
-	if l == 1 {
-		return nil
-	}
-	if len(blocking) > 0 && blocking[0] {
+
+	// run single-threaded
+	if numWorkers == lrpWorkersNone {
 		return nil
 	}
 
-	// num-workers == num-mountpaths but note:
-	// these are not _joggers_
-	r.workers = make([]*lrworker, 0, l)
-	for range avail {
+	// tuneup number of concurrent workers (heuristic)
+	if numWorkers == lrpWorkersDflt {
+		numWorkers = l
+	}
+	if a := cmn.MaxParallelism(); a > numWorkers+8 {
+		var bump bool
+		a <<= 1
+		switch r.lrp {
+		case lrpList:
+			bump = len(msg.ObjNames) > a
+		case lrpRange:
+			bump = int(r.pt.Count()) > a
+		case lrpPrefix:
+			bump = true // err on that other side
+		}
+		if bump {
+			numWorkers += 2
+		}
+	} else {
+		numWorkers = min(numWorkers, a)
+	}
+	nlog.Infoln("init:", numWorkers, "workers")
+
+	// but note: these are _not_ joggers
+	r.workers = make([]*lrworker, 0, numWorkers)
+	for range numWorkers {
 		r.workers = append(r.workers, &lrworker{r})
 	}
-	r.workCh = make(chan lrpair, l)
+
+	// work channel capacity: up to 4 pending work items per
+	r.workCh = make(chan lrpair, min(numWorkers<<2, 512))
 	return nil
 }
 
@@ -134,7 +166,7 @@ func (r *lriterator) init(xctn lrxact, msg *apc.ListRange, bck *meta.Bck, blocki
 // - "copy entire source bucket", or even
 // - "archive entire bucket as a single shard" (caution!)
 
-func (r *lriterator) _inipr(msg *apc.ListRange) error {
+func (r *lrit) _inipr(msg *apc.ListRange) error {
 	pt, err := cos.NewParsedTemplate(msg.Template)
 	if err != nil {
 		if err == cos.ErrEmptyTemplate {
@@ -143,7 +175,7 @@ func (r *lriterator) _inipr(msg *apc.ListRange) error {
 		}
 		return err
 	}
-	if err := cmn.ValidatePrefix(pt.Prefix); err != nil {
+	if err := cmn.ValidatePrefix("bad list-range request", pt.Prefix); err != nil {
 		nlog.Errorln(err)
 		return err
 	}
@@ -158,7 +190,7 @@ pref:
 	return nil
 }
 
-func (r *lriterator) run(wi lrwi, smap *meta.Smap) (err error) {
+func (r *lrit) run(wi lrwi, smap *meta.Smap) (err error) {
 	for _, worker := range r.workers {
 		r.wg.Add(1)
 		go worker.run()
@@ -174,7 +206,7 @@ func (r *lriterator) run(wi lrwi, smap *meta.Smap) (err error) {
 	return err
 }
 
-func (r *lriterator) wait() {
+func (r *lrit) wait() {
 	if r.workers == nil {
 		return
 	}
@@ -182,9 +214,9 @@ func (r *lriterator) wait() {
 	r.wg.Wait()
 }
 
-func (r *lriterator) done() bool { return r.parent.IsAborted() || r.parent.Finished() }
+func (r *lrit) done() bool { return r.parent.IsAborted() || r.parent.Finished() }
 
-func (r *lriterator) _list(wi lrwi, smap *meta.Smap) error {
+func (r *lrit) _list(wi lrwi, smap *meta.Smap) error {
 	r.lrp = lrpList
 	for _, objName := range r.msg.ObjNames {
 		if r.done() {
@@ -203,7 +235,7 @@ func (r *lriterator) _list(wi lrwi, smap *meta.Smap) error {
 	return nil
 }
 
-func (r *lriterator) _range(wi lrwi, smap *meta.Smap) error {
+func (r *lrit) _range(wi lrwi, smap *meta.Smap) error {
 	r.pt.InitIter()
 	for objName, hasNext := r.pt.Next(); hasNext; objName, hasNext = r.pt.Next() {
 		if r.done() {
@@ -222,16 +254,20 @@ func (r *lriterator) _range(wi lrwi, smap *meta.Smap) error {
 	return nil
 }
 
+// TODO -- FIXME: this is the last remaining place where we list remote bucket by each and every target
+
 // (compare with ais/plstcx)
-func (r *lriterator) _prefix(wi lrwi, smap *meta.Smap) error {
+func (r *lrit) _prefix(wi lrwi, smap *meta.Smap) error {
 	var (
 		err     error
 		ecode   int
 		lst     *cmn.LsoRes
-		msg     = &apc.LsoMsg{Prefix: r.prefix, Props: apc.GetPropsStatus}
-		npg     = newNpgCtx(r.bck, msg, noopCb, nil /*core.LsoInvCtx bucket inventory*/)
+		lsmsg   = &apc.LsoMsg{Prefix: r.prefix, Props: apc.GetPropsStatus}
+		npg     = newNpgCtx(r.bck, lsmsg, noopCb, nil /*core.LsoInvCtx bucket inventory*/)
 		bremote = r.bck.IsRemote()
 	)
+	lsmsg.SetFlag(apc.LsNoDirs)
+
 	if err := r.bck.Init(core.T.Bowner()); err != nil {
 		return err
 	}
@@ -244,14 +280,14 @@ func (r *lriterator) _prefix(wi lrwi, smap *meta.Smap) error {
 		}
 		if bremote {
 			lst = &cmn.LsoRes{Entries: allocLsoEntries()}
-			ecode, err = core.T.Backend(r.bck).ListObjects(r.bck, msg, lst) // (TODO comment above)
+			ecode, err = core.T.Backend(r.bck).ListObjects(r.bck, lsmsg, lst) // (TODO comment above)
 		} else {
 			npg.page.Entries = allocLsoEntries()
 			err = npg.nextPageA()
 			lst = &npg.page
 		}
 		if err != nil {
-			nlog.Errorln(core.T.String()+":", err, ecode)
+			nlog.Errorln(core.T.String(), "[", err, "ecode", ecode, "]")
 			freeLsoEntries(lst.Entries)
 			return err
 		}
@@ -259,7 +295,7 @@ func (r *lriterator) _prefix(wi lrwi, smap *meta.Smap) error {
 			if !be.IsStatusOK() {
 				continue
 			}
-			if be.IsDir() { // NOTE: always skip virtual dirs (apc.EntryIsDir)
+			if be.IsAnyFlagSet(apc.EntryIsDir) { // always skip virtual dirs
 				continue
 			}
 			if r.done() {
@@ -283,12 +319,12 @@ func (r *lriterator) _prefix(wi lrwi, smap *meta.Smap) error {
 			break
 		}
 		// token for the next page
-		msg.ContinuationToken = lst.ContinuationToken
+		lsmsg.ContinuationToken = lst.ContinuationToken
 	}
 	return nil
 }
 
-func (r *lriterator) do(lom *core.LOM, wi lrwi, smap *meta.Smap) (bool /*this lom done*/, error) {
+func (r *lrit) do(lom *core.LOM, wi lrwi, smap *meta.Smap) (bool /*this lom done*/, error) {
 	if err := lom.InitBck(r.bck.Bucket()); err != nil {
 		return false, err
 	}

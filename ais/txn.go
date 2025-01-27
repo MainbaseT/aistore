@@ -25,7 +25,6 @@ import (
 
 // GC
 const (
-	gcTxnsInterval   = time.Hour
 	gcTxnsNumKeep    = 16
 	gcTxnsTimeotMult = 10
 
@@ -40,7 +39,7 @@ type (
 		isDone() (done bool, err error)
 		set(nlps []core.NLP)
 		// triggers
-		commitAfter(caller string, msg *aisMsg, err error, args ...any) (bool, error)
+		commitAfter(caller string, msg *actMsgExt, err error, args ...any) (bool, error)
 		rsvp(err error)
 		// cleanup
 		abort(error)
@@ -49,9 +48,9 @@ type (
 		String() string
 	}
 	rndzvs struct { // rendezvous records
-		timestamp  int64
 		err        *txnError
 		callerName string
+		timestamp  int64
 	}
 	// two maps, two locks
 	transactions struct {
@@ -114,7 +113,7 @@ type (
 	}
 	txnTCObjs struct {
 		xtco *xs.XactTCObjs
-		msg  *cmn.TCObjsMsg
+		msg  *cmn.TCOMsg
 		txnBckBase
 	}
 	txnECEncode struct {
@@ -157,7 +156,7 @@ func (txns *transactions) init(t *target) {
 	txns.t = t
 	txns.m = make(map[string]txn, 8)
 	txns.rendezvous.m = make(map[string]rndzvs, 8)
-	hk.Reg("txn"+hk.NameSuffix, txns.housekeep, gcTxnsInterval)
+	hk.Reg("txn"+hk.NameSuffix, txns.housekeep, hk.DelOldIval)
 }
 
 func (txns *transactions) begin(txn txn, nlps ...core.NLP) (err error) {
@@ -218,7 +217,7 @@ func (txns *transactions) find(uuid, act string) (txn, error) {
 	return txn, nil
 }
 
-func (txns *transactions) commitBefore(caller string, msg *aisMsg) error {
+func (txns *transactions) commitBefore(caller string, msg *actMsgExt) error {
 	var (
 		rndzvs rndzvs
 		ok     bool
@@ -234,7 +233,7 @@ func (txns *transactions) commitBefore(caller string, msg *aisMsg) error {
 	return fmt.Errorf("rendezvous record %s:%d already exists", msg.UUID, rndzvs.timestamp)
 }
 
-func (txns *transactions) commitAfter(caller string, msg *aisMsg, err error, args ...any) (errDone error) {
+func (txns *transactions) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (errDone error) {
 	txns.mtx.Lock()
 	txn, ok := txns.m[msg.UUID]
 	txns.mtx.Unlock()
@@ -333,21 +332,21 @@ func (txns *transactions) _wait(txn txn, timeoutNetw, timeoutHost time.Duration)
 }
 
 // GC orphaned transactions
-func (txns *transactions) housekeep() (d time.Duration) {
+func (txns *transactions) housekeep(int64) (d time.Duration) {
 	var (
 		errs    []error
 		orphans []txn
 		config  = cmn.GCO.Get()
 	)
-	d = gcTxnsInterval
+	d = hk.DelOldIval
 	txns.mtx.Lock()
 	l := len(txns.m)
 	if l == 0 {
 		txns.mtx.Unlock()
 		return
 	}
-	if l > max(gcTxnsNumKeep*4, 16) {
-		d = gcTxnsInterval / 10
+	if l > max(gcTxnsNumKeep<<2, 32) {
+		d >>= 2
 	}
 	now := time.Now()
 	for _, txn := range txns.m {
@@ -490,7 +489,7 @@ func (txn *txnBckBase) String() string {
 	return fmt.Sprintf("txn-%s[%s]-%s%s%s]", txn.action, txn.uid, txn.bck.Bucket().String(), tm, res)
 }
 
-func (txn *txnBckBase) commitAfter(caller string, msg *aisMsg, err error, args ...any) (found bool, errDone error) {
+func (txn *txnBckBase) commitAfter(caller string, msg *actMsgExt, err error, args ...any) (found bool, errDone error) {
 	if txn.callerName != caller || msg.UUID != txn.uuid() {
 		return
 	}
@@ -582,7 +581,7 @@ func (txn *txnTCB) String() string {
 // txnTCObjs //
 ///////////////
 
-func newTxnTCObjs(c *txnSrv, bckFrom *meta.Bck, xtco *xs.XactTCObjs, msg *cmn.TCObjsMsg) (txn *txnTCObjs) {
+func newTxnTCObjs(c *txnSrv, bckFrom *meta.Bck, xtco *xs.XactTCObjs, msg *cmn.TCOMsg) (txn *txnTCObjs) {
 	txn = &txnTCObjs{xtco: xtco, msg: msg}
 	txn.init(bckFrom)
 	txn.fillFromCtx(c)

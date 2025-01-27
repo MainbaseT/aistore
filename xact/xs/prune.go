@@ -6,7 +6,6 @@
 package xs
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -49,7 +48,7 @@ func (rp *prune) init(config *cmn.Config) {
 		// DoLoad:  noLoad
 	}
 	rmopts.Bck.Copy(rp.bckTo.Bucket())
-	rp.joggers = mpather.NewJoggerGroup(rmopts, config, "")
+	rp.joggers = mpather.NewJoggerGroup(rmopts, config, nil)
 	rp.filter = prob.NewDefaultFilter()
 	rp.same = rp.bckTo.Equal(rp.bckFrom, true, true)
 }
@@ -131,7 +130,7 @@ func (rp *prune) do(dst *core.LOM, _ []byte) error {
 			}
 		}
 	} else {
-		_, ecode, err = core.T.Backend(src.Bck()).HeadObj(context.Background(), src, nil /*origReq*/)
+		_, ecode, err = core.T.HeadCold(src, nil /*origReq*/)
 	}
 
 	if (err == nil && ecode == 0) || !cos.IsNotExist(err, ecode) /*not complaining*/ {

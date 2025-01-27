@@ -1,6 +1,6 @@
 # Python Tests
 
-This directory contains unit tests and integration tests for each of the python package interfaces we provide to access AIStore, including the Amazon S3 botocore, SDK, and Pytorch datasets APIs.
+This directory contains unit tests and integration tests for each of the python package interfaces we provide to access AIStore, including the Amazon S3 botocore, SDK, and PyTorch datasets APIs.
 It also contains tests for verifying s3 compatibility.
 
 ---
@@ -50,7 +50,7 @@ environment variable must be set; otherwise these tests will be skipped.
 
 All tests should support running on all operating systems, given access to a working AIS cluster. 
 
-Because of the way our botocore patch works, simply running pytest on the entire test directory will fail those tests. See the [botocore test README](python/tests/unit/botocore_patch/README.md) for more info
+Because of the way our botocore patch works, simply running pytest on the entire test directory will fail those tests. See the [botocore test README](/python/tests/unit/botocore_patch/README.md) for more info
 
 Below are the recommended commands for running the test suites. Run these commands from the aistore/python directory. 
 

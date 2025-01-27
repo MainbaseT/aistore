@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -80,6 +80,7 @@ func newEtlMD() (e *etlMD) {
 // as revs
 func (*etlMD) tag() string       { return revsEtlMDTag }
 func (e *etlMD) version() int64  { return e.Version }
+func (*etlMD) uuid() string      { return "" } // TODO: add
 func (*etlMD) jit(p *proxy) revs { return p.owner.etl.get() }
 func (*etlMD) sgl() *memsys.SGL  { return nil }
 
@@ -266,8 +267,8 @@ func loadEtlMD(mpaths fs.MPI, path string) (mainEtlMD *etlMD) {
 			mainEtlMD = etlMD
 			continue
 		}
-		if !mainEtlMD.cksum.Equal(etlMD.cksum) {
-			cos.ExitLogf("EtlMD is different (%q): %v vs %v", mpath, mainEtlMD, etlMD)
+		if mainEtlMD.cksum.IsEmpty() {
+			cos.ExitLogf("EtlMD is not checksummed (%q): %v", mpath, mainEtlMD)
 		}
 		if mainEtlMD.cksum.Equal(etlMD.cksum) {
 			continue

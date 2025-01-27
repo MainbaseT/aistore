@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -25,12 +25,8 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact/xreg"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
-
-// interface guard
-var _ core.Target = (*target)(nil)
-
-func (t *target) FSHC(err error, path string) { t.fsErr(err, path) }
 
 func (*target) DataClient() *http.Client { return g.client.data }
 
@@ -39,15 +35,12 @@ func (*target) GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
 }
 
 func (t *target) Health(si *meta.Snode, timeout time.Duration, query url.Values) ([]byte, int, error) {
-	return t.reqHealth(si, timeout, query, t.owner.smap.get())
+	return t.reqHealth(si, timeout, query, t.owner.smap.get(), false /*retry*/)
 }
 
 func (t *target) Backend(bck *meta.Bck) core.Backend {
 	if bck.IsRemoteAIS() {
 		return t.backend[apc.AIS]
-	}
-	if bck.IsHTTP() {
-		return t.backend[apc.HTTP]
 	}
 	provider := bck.Provider
 	if bck.Props != nil {
@@ -62,13 +55,14 @@ func (t *target) Backend(bck *meta.Bck) core.Backend {
 		}
 		// nil when configured & not-built
 	}
-	c, _ := backend.NewDummyBackend(t)
+	c, _ := backend.NewDummyBackend(t, nil)
 	return c
 }
 
 func (t *target) PutObject(lom *core.LOM, params *core.PutParams) error {
 	debug.Assert(params.WorkTag != "" && !params.Atime.IsZero())
 	workFQN := fs.CSM.Gen(lom, fs.WorkfileType, params.WorkTag)
+
 	poi := allocPOI()
 	{
 		poi.t = t
@@ -135,19 +129,9 @@ func (t *target) HeadObjT2T(lom *core.LOM, si *meta.Snode) bool {
 //     the AIS cluster (by performing a cold GET if need be).
 //   - if the dst is cloud, we perform a regular PUT logic thus also making sure that the new
 //     replica gets created in the cloud bucket of _this_ AIS cluster.
-func (t *target) CopyObject(lom *core.LOM, dm core.DM, params *core.CopyParams) (size int64, err error) {
-	coi := (*copyOI)(params)
-	// defaults
-	coi.OWT = cmn.OwtCopy
-	coi.Finalize = false
-	if coi.ObjnameTo == "" {
-		coi.ObjnameTo = lom.ObjName
-	}
-	realDM, ok := dm.(*bundle.DataMover) // TODO -- FIXME: eliminate typecast
-	debug.Assert(ok)
-
-	size, err = coi.do(t, realDM, lom)
-
+func (t *target) CopyObject(lom *core.LOM, dm *bundle.DataMover, params *xs.CoiParams) (size int64, err error) {
+	coi := (*coi)(params)
+	size, err = coi.do(t, dm, lom)
 	coi.stats(size, err)
 	return size, err
 }
@@ -162,7 +146,7 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (ecode
 		if owt == cmn.OwtGetTryLock {
 			if !lom.TryLock(true) {
 				if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-					nlog.Warningf("%s: %s(%s) is busy", t, lom, owt)
+					nlog.Warningln(t.String(), lom.String(), owt.String(), "is busy")
 				}
 				return 0, cmn.ErrSkip // e.g. prefetch can skip it and keep on going
 			}
@@ -176,12 +160,19 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (ecode
 	}
 
 	// 2. GET remote object and store it
-	now := mono.NanoTime()
-	if ecode, err = t.Backend(lom.Bck()).GetObj(ctx, lom, owt, nil /*origReq*/); err != nil {
+	var (
+		now     = mono.NanoTime()
+		backend = t.Backend(lom.Bck())
+	)
+	if ecode, err = backend.GetObj(ctx, lom, owt, nil /*origReq*/); err != nil {
 		if owt != cmn.OwtGetPrefetchLock {
 			lom.Unlock(true)
 		}
-		nlog.Infoln(t.String()+":", "failed to GET remote", lom.Cname()+":", err, ecode)
+		if cmn.IsErrFailedTo(err) {
+			nlog.Warningln(err)
+		} else {
+			nlog.Warningln("failed to GET remote", lom.Cname(), "[", err, ecode, "]")
+		}
 		return ecode, err
 	}
 
@@ -194,12 +185,17 @@ func (t *target) GetCold(ctx context.Context, lom *core.LOM, owt cmn.OWT) (ecode
 	}
 
 	// 4. stats
-	t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetColdSize, Value: lom.Lsize()},
-		cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(now)},
-	)
+	t.coldstats(backend, lom, now)
 	return 0, nil
+}
+
+func (t *target) coldstats(backend core.Backend, lom *core.LOM, started int64) {
+	vlabs := map[string]string{stats.VarlabBucket: lom.Bck().Cname("")}
+	t.statsT.AddWith(
+		cos.NamedVal64{Name: backend.MetricName(stats.GetCount), Value: 1, VarLabs: vlabs},
+		cos.NamedVal64{Name: backend.MetricName(stats.GetLatencyTotal), Value: mono.SinceNano(started), VarLabs: vlabs},
+		cos.NamedVal64{Name: backend.MetricName(stats.GetSize), Value: lom.Lsize(), VarLabs: vlabs},
+	)
 }
 
 func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn core.Xact, err error) {
@@ -207,6 +203,24 @@ func (t *target) GetColdBlob(params *core.BlobParams, oa *cmn.ObjAttrs) (xctn co
 	debug.Assert(params.Msg != nil)
 	_, xctn, err = t.blobdl(params, oa)
 	return xctn, err
+}
+
+func (t *target) HeadCold(lom *core.LOM, origReq *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+	var (
+		backend = t.Backend(lom.Bck())
+		now     = mono.NanoTime()
+		vlabs   = map[string]string{stats.VarlabBucket: lom.Bck().Cname("")}
+	)
+	oa, ecode, err = backend.HeadObj(context.Background(), lom, origReq)
+	if err != nil {
+		t.statsT.IncWith(stats.ErrHeadCount, vlabs)
+	} else {
+		t.statsT.AddWith(
+			cos.NamedVal64{Name: backend.MetricName(stats.HeadCount), Value: 1, VarLabs: vlabs},
+			cos.NamedVal64{Name: backend.MetricName(stats.HeadLatencyTotal), Value: mono.SinceNano(now), VarLabs: vlabs},
+		)
+	}
+	return oa, ecode, err
 }
 
 func (t *target) Promote(params *core.PromoteParams) (ecode int, err error) {
@@ -299,7 +313,7 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 			core.FreeLOM(clone)
 		}
 	}
-	if params.Cksum != nil && cksum != nil {
+	if params.Cksum != nil && cksum != nil && !cksum.IsEmpty() {
 		if !cksum.Equal(params.Cksum) {
 			err = cos.NewErrDataCksum(
 				cksum.Clone(),
@@ -324,8 +338,9 @@ func (t *target) _promLocal(params *core.PromoteParams, lom *core.LOM) (fileSize
 	return
 }
 
-// TODO: use DM streams
-// TODO: Xact.InObjsAdd on the receive side
+// [TODO]
+// - use DM streams
+// - Xact.InObjsAdd on the receive side
 func (t *target) _promRemote(params *core.PromoteParams, lom *core.LOM, tsi *meta.Snode, smap *smapX) (int64, error) {
 	lom.FQN = params.SrcFQN
 
@@ -334,26 +349,38 @@ func (t *target) _promRemote(params *core.PromoteParams, lom *core.LOM, tsi *met
 		return -1, nil
 	}
 
-	coiParams := core.AllocCOI()
+	coiParams := xs.AllocCOI()
 	{
 		coiParams.BckTo = lom.Bck()
 		coiParams.OWT = cmn.OwtPromote
 		coiParams.Xact = params.Xact
 		coiParams.Config = params.Config
 	}
-	coi := (*copyOI)(coiParams)
+	coi := (*coi)(coiParams)
 	size, err := coi.send(t, nil /*DM*/, lom, lom.ObjName, tsi)
-	core.FreeCOI(coiParams)
+	xs.FreeCOI(coiParams)
 
 	return size, err
 }
 
-//
-// implements health.fspathDispatcher interface
-//
-
-func (t *target) DisableMpath(mpath, reason string) (err error) {
-	nlog.Warningf("Disabling mountpath %s: %s", mpath, reason)
-	_, err = t.fsprg.disableMpath(mpath, true /*dont-resilver*/) // NOTE: not resilvering upon FSCH calling
-	return
+func (t *target) ECRestoreReq(ct *core.CT, tsi *meta.Snode, uuid string) error {
+	q := ct.Bck().NewQuery()
+	ct.Bck().AddUnameToQuery(q, apc.QparamBckTo)
+	q.Set(apc.QparamECObject, ct.ObjectName())
+	q.Set(apc.QparamUUID, uuid)
+	cargs := allocCargs()
+	{
+		cargs.si = tsi
+		cargs.req = cmn.HreqArgs{
+			Method: http.MethodPost,
+			Base:   tsi.URL(cmn.NetIntraControl),
+			Path:   apc.URLPathEC.Join(apc.ActEcRecover),
+			Query:  q,
+		}
+	}
+	res := t.call(cargs, t.owner.smap.get())
+	freeCargs(cargs)
+	err := res.toErr()
+	freeCR(res)
+	return err
 }

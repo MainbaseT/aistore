@@ -4,7 +4,13 @@
  */
 package apc
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+
+	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
+)
 
 // AIS http header conventions:
 //   - always starts with the prefix "ais-"
@@ -15,62 +21,75 @@ import "strings"
 const HdrError = "Hdr-Error"
 
 const (
-	HeaderPrefix = "ais-"
+	aisPrefix = "Ais-"
 
 	// bucket inventory - an alternative way to list (very large) buckets
-	HdrInventory = HeaderPrefix + "bucket-inventory" // must be present and must be "true" (or "y", "yes", "on" case-insensitive)
-	HdrInvName   = HeaderPrefix + "inv-name"         // optional; name of the inventory (to override the system default)
-	HdrInvID     = HeaderPrefix + "inv-id"           // optional; inventory ID (ditto)
+	HdrInventory = aisPrefix + "Bucket-Inventory" // must be present and must be "true" (or "y", "yes", "on" case-insensitive)
+	HdrInvName   = aisPrefix + "Inv-Name"         // optional; name of the inventory (to override the system default)
+	HdrInvID     = aisPrefix + "Inv-Id"           // optional; inventory ID (ditto)
 
 	// GET via x-blob-download
-	HdrBlobDownload = HeaderPrefix + ActBlobDl      // must be present and must be "true" (or "y", "yes", "on" case-insensitive)
-	HdrBlobChunk    = HeaderPrefix + "blob-chunk"   // optional; e.g., 1mb, 2MIB, 3m, or 1234567 (bytes)
-	HdrBlobWorkers  = HeaderPrefix + "blob-workers" // optional; the default number of workers is dfltNumWorkers in xs/blob_download.go
+	HdrBlobDownload = aisPrefix + "Blob-Download" // must be present and must be "true" (or "y", "yes", "on" case-insensitive)
+	HdrBlobChunk    = aisPrefix + "Blob-Chunk"    // optional; e.g., 1mb, 2MIB, 3m, or 1234567 (bytes)
+	HdrBlobWorkers  = aisPrefix + "Blob-Workers"  // optional; the default number of workers is dfltNumWorkers in xs/blob_download.go
 
 	// Bucket props headers
-	HdrBucketProps      = HeaderPrefix + "bucket-props"       // => cmn.Bprops
-	HdrBucketSumm       = HeaderPrefix + "bucket-summ"        // => cmn.BsummResult (see also: QparamFltPresence)
-	HdrBucketVerEnabled = HeaderPrefix + "versioning-enabled" // Enable/disable object versioning in a bucket.
-	HdrBackendProvider  = HeaderPrefix + "provider"           // ProviderAmazon et al. - see cmn/bck.go.
+	HdrBucketProps      = aisPrefix + "Bucket-Props"       // => cmn.Bprops
+	HdrBucketSumm       = aisPrefix + "Bucket-Summ"        // => cmn.BsummResult (see also: QparamFltPresence)
+	HdrBucketVerEnabled = aisPrefix + "Versioning-Enabled" // Enable/disable object versioning in a bucket.
+	HdrBackendProvider  = aisPrefix + "Provider"           // ProviderAmazon et al. - see cmn/bck.go.
 
 	// including BucketProps.Extra.AWS
-	HdrS3Region   = HeaderPrefix + "cloud_region"
-	HdrS3Endpoint = HeaderPrefix + "endpoint"
-	HdrS3Profile  = HeaderPrefix + "profile"
+	HdrS3Region   = aisPrefix + "Cloud_region"
+	HdrS3Endpoint = aisPrefix + "Endpoint"
+	HdrS3Profile  = aisPrefix + "Profile"
 
 	// including BucketProps.Extra.HTTP
-	HdrOrigURLBck = HeaderPrefix + "original-url"
+	HdrOrigURLBck = aisPrefix + "Original-Url"
 
 	// remote AIS
-	HdrRemAisUUID  = HeaderPrefix + "remote-ais-uuid"
-	HdrRemAisAlias = HeaderPrefix + "remote-ais-alias"
-	HdrRemAisURL   = HeaderPrefix + "remote-ais-url"
+	HdrRemAisUUID  = aisPrefix + "Remote-Ais-Uuid"
+	HdrRemAisAlias = aisPrefix + "Remote-Ais-Alias"
+	HdrRemAisURL   = aisPrefix + "Remote-Ais-Url"
 
-	HdrRemoteOffline = HeaderPrefix + "remote-offline" // When accessing cached remote bucket with no backend connectivity.
+	HdrRemoteOffline = aisPrefix + "Remote-Offline" // When accessing cached remote bucket with no backend connectivity.
 
 	// Object props headers
-	HdrObjCksumType = HeaderPrefix + "checksum-type"  // Checksum type, one of SupportedChecksums().
-	HdrObjCksumVal  = HeaderPrefix + "checksum-value" // Checksum value.
-	HdrObjAtime     = HeaderPrefix + "atime"          // Object access time.
-	HdrObjCustomMD  = HeaderPrefix + "custom-md"      // Object custom metadata.
-	HdrObjVersion   = HeaderPrefix + "version"        // Object version/generation - ais or cloud.
+	HdrObjCksumType = aisPrefix + "Checksum-Type"  // Checksum type, one of SupportedChecksums().
+	HdrObjCksumVal  = aisPrefix + "Checksum-Value" // Checksum value.
+	HdrObjAtime     = aisPrefix + "Atime"          // Object access time.
+	HdrObjCustomMD  = aisPrefix + "Custom-Md"      // Object custom metadata.
+	HdrObjVersion   = aisPrefix + "Version"        // Object version/generation - ais or cloud.
 
-	// Append object header.
-	HdrAppendHandle = HeaderPrefix + "append-handle"
+	// Append object header
+	HdrAppendHandle = aisPrefix + "Append-Handle"
 
 	// api.PutApndArchArgs message flags
-	HdrPutApndArchFlags = HeaderPrefix + "pine"
+	HdrPutApndArchFlags = aisPrefix + "Pine"
 
-	// Query objects handle header.
-	HdrHandle = HeaderPrefix + "query-handle"
+	// Query objects handle header
+	HdrHandle = aisPrefix + "Query-Handle"
 
-	// Reverse proxy headers.
-	HdrNodeID  = HeaderPrefix + "node-id"
-	HdrNodeURL = HeaderPrefix + "node-url"
+	// Reverse proxy header
+	HdrNodeID = aisPrefix + "Node-Id"
 
 	// uptimes, respectively
-	HdrNodeUptime    = HeaderPrefix + "node-uptime"
-	HdrClusterUptime = HeaderPrefix + "cluster-uptime"
+	HdrNodeUptime    = aisPrefix + "Node-Uptime"
+	HdrClusterUptime = aisPrefix + "Cluster-Uptime"
+
+	HdrNodeFlags = aisPrefix + "Node-Flags"
+)
+
+// Custom S3 headers
+const (
+	// HdrSignedRequestStyle describes what type of request style was used to sign the request.
+	// This is important because we don't really have way of knowing if the request
+	// was signed with the style:
+	//	* `virtual-hosted` - https://<bucket>.s3.<region>.amazonaws.com/<path_to_object> or,
+	//	* `path`           - https://s3.<region>.amazonaws.com/<bucket>/<path_to_object>.
+	// By default, (if the header is empty or not set) we use `virtual-hosted` style.
+	// In case, the value of this header is not valid, the error will be thrown.
+	HdrSignedRequestStyle = aisPrefix + "S3-Signed-Request-Style"
 )
 
 // AuthN consts
@@ -81,35 +100,59 @@ const (
 
 // Internally used headers
 const (
-	HdrCallerID        = HeaderPrefix + "caller-id" // Marker of intra-cluster request.
-	HdrT2TPutterID     = HeaderPrefix + "putter-id" // DaemonID of the target that performs intra-cluster PUT
-	HdrCallerName      = HeaderPrefix + "caller-name"
-	HdrCallerIsPrimary = HeaderPrefix + "caller-is-primary"
-	HdrCallerSmapVer   = HeaderPrefix + "caller-smap-ver"
+	HdrCallerID        = aisPrefix + "Caller-Id" // Marker of intra-cluster request.
+	HdrT2TPutterID     = aisPrefix + "Putter-Id" // DaemonID of the target that performs intra-cluster PUT
+	HdrCallerName      = aisPrefix + "Caller-Name"
+	HdrCallerIsPrimary = aisPrefix + "Caller-Is-Primary"
+	HdrCallerSmapVer   = aisPrefix + "Caller-Smap-Ver"
 
-	HdrXactionID = HeaderPrefix + "xaction-id"
+	HdrXactionID = aisPrefix + "Xaction-Id"
 
-	// Stream related headers.
-	HdrSessID   = HeaderPrefix + "session-id"
-	HdrCompress = HeaderPrefix + "compress" // LZ4Compression, etc.
+	// intra-cluster streams
+	HdrSessID   = aisPrefix + "Session-Id"
+	HdrCompress = aisPrefix + "Compress" // LZ4
 
 	// Promote(dir)
-	HdrPromoteNamesHash = HeaderPrefix + "promote-names-hash"
-	HdrPromoteNamesNum  = HeaderPrefix + "promote-names-num"
+	HdrPromoteNamesHash = aisPrefix + "Promote-Names-Hash"
+	HdrPromoteNamesNum  = aisPrefix + "Promote-Names-Num"
+
+	// EC
+	HdrActiveEC = aisPrefix + "Ec"
 )
 
-//
-// convert prop name to HTTP header tag name
-//
+const lais = len(aisPrefix)
 
+// internal (json) obj prop => canonical http header
+// usage:
+// - target InitObjProps2Hdr
+// - api/object
 func PropToHeader(prop string) string {
-	if strings.HasPrefix(prop, HeaderPrefix) {
-		return prop
-	}
+	debug.Assert(!strings.HasPrefix(prop, aisPrefix), "already converted: ", prop)
 	if prop[0] == '.' || prop[0] == '_' {
 		prop = prop[1:]
 	}
-	prop = strings.ReplaceAll(prop, ".", "-")
-	prop = strings.ReplaceAll(prop, "_", "-")
-	return HeaderPrefix + prop
+
+	var (
+		l   = len(prop)
+		out = make([]byte, l+lais)
+		o   = out[lais:]
+		up  = true
+	)
+	copy(out, aisPrefix)
+	for i := range l {
+		c := prop[i]
+		if c == '.' || c == '_' {
+			c = '-'
+		}
+		switch {
+		case up && 'a' <= c && c <= 'z':
+			o[i] = byte(unicode.ToUpper(rune(c)))
+		case !up && 'A' <= c && c <= 'Z':
+			o[i] = byte(unicode.ToLower(rune(c)))
+		default:
+			o[i] = c
+		}
+		up = c == '-'
+	}
+	return cos.UnsafeS(out)
 }

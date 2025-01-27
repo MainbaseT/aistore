@@ -115,7 +115,6 @@ const (
 	ActClearRequests  = "clear-requests"
 	ActEnableRequests = "enable-requests"
 
-	URLCT   = "ct"   // for using in URL path - requests for slices/replicas
 	URLMeta = "meta" /// .. - metadata requests
 
 	// EC switches to disk from SGL when memory pressure is high and the amount of
@@ -123,13 +122,17 @@ const (
 	objSizeHighMem = 50 * cos.MiB
 )
 
+const invalOpcode = "invalid opcode"
+
 type (
+	onFin = func(lom *core.LOM, err error)
+
 	// request - structure to request an object to be EC'ed or restored
 	request struct {
 		LIF      core.LIF   // object info
 		Action   string     // what to do with the object (see Act* consts)
 		ErrCh    chan error // for final EC result (used only in restore)
-		Callback core.OnFinishObj
+		Callback onFin
 
 		putTime time.Time // time when the object is put into main queue
 		tm      time.Time // to measure different steps
@@ -207,7 +210,7 @@ func Init() {
 	xreg.RegBckXact(&encFactory{})
 
 	if err := initManager(); err != nil {
-		cos.ExitLog("Failed to init manager:", err)
+		cos.ExitLog("Failed to initialize EC manager:", err)
 	}
 }
 
@@ -233,7 +236,7 @@ func (s *slice) free() {
 		}
 	}
 	if s.workFQN != "" {
-		if err := os.Remove(s.workFQN); err != nil && !os.IsNotExist(err) {
+		if err := cos.RemoveFile(s.workFQN); err != nil {
 			nlog.Errorln(err)
 		}
 	}
@@ -383,7 +386,7 @@ func RequestECMeta(bck *cmn.Bck, objName string, si *meta.Snode, client *http.Cl
 	path := apc.URLPathEC.Join(URLMeta, bck.Name, objName)
 	query := url.Values{}
 	query = bck.AddToQuery(query)
-	url := si.URL(cmn.NetIntraData) + path
+	url := si.URL(cmn.NetIntraControl) + path
 	rq, err := http.NewRequest(http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return nil, err
@@ -401,7 +404,7 @@ func RequestECMeta(bck *cmn.Bck, objName string, si *meta.Snode, client *http.Cl
 	if resp.StatusCode != http.StatusOK {
 		return nil, cmn.NewErrFailedTo(core.T, "request ec md", bck.Cname(objName), err)
 	}
-	return MetaFromReader(resp.Body)
+	return MetaFromReader(resp.Body, resp.ContentLength)
 }
 
 // Saves the main replica to local drives
@@ -466,7 +469,7 @@ func WriteSliceAndMeta(hdr *transport.ObjHdr, args *WriteArgs) error {
 	if err := ct.Write(args.Reader, hdr.ObjAttrs.Size, tmpFQN); err != nil {
 		return err
 	}
-	if err := ctMeta.Write(bytes.NewReader(args.MD), -1); err != nil {
+	if err := ctMeta.Write(bytes.NewReader(args.MD), -1, "" /*work fqn*/); err != nil {
 		return err
 	}
 	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
@@ -493,11 +496,9 @@ func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) (err error) {
 	if err = writeObject(lom, args.Reader, lom.Lsize(true), args.Xact); err != nil {
 		return
 	}
-	if !args.Cksum.IsEmpty() && args.Cksum.Value() != "" { // NOTE: empty value
-		if !lom.EqCksum(args.Cksum) {
-			err = cos.NewErrDataCksum(args.Cksum, lom.Checksum(), lom.Cname())
-			return
-		}
+	if !args.Cksum.IsEmpty() && !lom.EqCksum(args.Cksum) {
+		err = cos.NewErrDataCksum(args.Cksum, lom.Checksum(), lom.Cname())
+		return
 	}
 	ctMeta := core.NewCTFromLOM(lom, fs.ECMetaType)
 	ctMeta.Lock(true)
@@ -508,13 +509,13 @@ func WriteReplicaAndMeta(lom *core.LOM, args *WriteArgs) (err error) {
 			return
 		}
 		if rmErr := lom.RemoveMain(); rmErr != nil {
-			nlog.Errorf("nested error: save replica -> remove replica: %v", rmErr)
+			nlog.Errorln("nested error: save replica -> remove replica:", rmErr)
 		}
 		if rmErr := cos.RemoveFile(ctMeta.FQN()); rmErr != nil {
-			nlog.Errorf("nested error: save replica -> remove metafile: %v", rmErr)
+			nlog.Errorln("nested error: save replica -> remove metafile:", rmErr)
 		}
 	}()
-	if err = ctMeta.Write(bytes.NewReader(args.MD), -1); err != nil {
+	if err = ctMeta.Write(bytes.NewReader(args.MD), -1, "" /*work fqn*/); err != nil {
 		return
 	}
 	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
@@ -534,4 +535,8 @@ func AllocLomFromHdr(hdr *transport.ObjHdr) (lom *core.LOM, err error) {
 	}
 	lom.CopyAttrs(&hdr.ObjAttrs, false /*skip checksum*/)
 	return lom, nil
+}
+
+func errLossMpath(r core.Xact, lom *core.LOM) error {
+	return fmt.Errorf("%s: loss of a mountpath [%s, %s]", r.Name(), lom, lom.Mountpath())
 }

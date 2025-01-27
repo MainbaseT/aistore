@@ -1,13 +1,14 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -202,17 +203,17 @@ func (bp *Bprops) Validate(targetCnt int) error {
 	debug.Assert(apc.IsProvider(bp.Provider))
 	if !bp.BackendBck.IsEmpty() {
 		if bp.Provider != apc.AIS {
-			return fmt.Errorf("wrong bucket provider %q: only AIS buckets can have remote backend (%q)",
-				bp.Provider, bp.BackendBck)
+			return fmt.Errorf("invalid provider %q: only ais:// buckets can have remote backend (%q)", bp.Provider, bp.BackendBck.String())
 		}
 		if bp.BackendBck.Provider == "" {
-			return fmt.Errorf("backend bucket %q: provider is empty", bp.BackendBck)
+			// (compare with `ErrEmptyProvider`)
+			return fmt.Errorf("backend bucket %q: provider is empty", bp.BackendBck.String())
 		}
 		if bp.BackendBck.Name == "" {
-			return fmt.Errorf("backend bucket %q name is empty", bp.BackendBck)
+			return fmt.Errorf("backend bucket %q: name is empty", bp.BackendBck.String())
 		}
 		if !bp.BackendBck.IsRemote() {
-			return fmt.Errorf("backend bucket %q must be remote", bp.BackendBck)
+			return fmt.Errorf("backend bucket %q must be remote", bp.BackendBck.String())
 		}
 	}
 
@@ -220,15 +221,16 @@ func (bp *Bprops) Validate(targetCnt int) error {
 	var softErr error
 	for _, pv := range []PropsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy} {
 		var err error
-		if pv == &bp.EC {
+		switch {
+		case pv == &bp.EC:
 			err = bp.EC.ValidateAsProps(targetCnt)
-		} else if pv == &bp.Extra {
+		case pv == &bp.Extra:
 			err = bp.Extra.ValidateAsProps(bp.Provider)
-		} else {
+		default:
 			err = pv.ValidateAsProps()
 		}
 		if err != nil {
-			if !IsErrSoft(err) {
+			if !IsErrWarning(err) {
 				return err
 			}
 			softErr = err
@@ -249,7 +251,7 @@ func (bp *Bprops) Validate(targetCnt int) error {
 }
 
 func (bp *Bprops) Apply(propsToSet *BpropsToSet) {
-	err := copyProps(propsToSet, bp, apc.Daemon)
+	err := CopyProps(propsToSet, bp, apc.Daemon)
 	debug.AssertNoErr(err)
 }
 
@@ -279,7 +281,7 @@ func NewBpropsToSet(nvs cos.StrKVs) (props *BpropsToSet, err error) {
 func (c *ExtraProps) ValidateAsProps(arg ...any) error {
 	provider, ok := arg[0].(string)
 	debug.Assert(ok)
-	if provider == apc.HTTP && c.HTTP.OrigURLBck == "" {
+	if provider == apc.HT && c.HTTP.OrigURLBck == "" {
 		return errors.New("original bucket URL must be set for a bucket with HTTP provider")
 	}
 	return nil
@@ -317,12 +319,8 @@ func (s AllBsummResults) Aggregate(from *BsummResult) AllBsummResults {
 
 // across targets
 func aggr(from, to *BsummResult) {
-	if from.ObjSize.Min < to.ObjSize.Min {
-		to.ObjSize.Min = from.ObjSize.Min
-	}
-	if from.ObjSize.Max > to.ObjSize.Max {
-		to.ObjSize.Max = from.ObjSize.Max
-	}
+	to.ObjSize.Min = min(from.ObjSize.Min, to.ObjSize.Min)
+	to.ObjSize.Max = max(from.ObjSize.Max, to.ObjSize.Max)
 	to.ObjCount.Present += from.ObjCount.Present
 	to.ObjCount.Remote += from.ObjCount.Remote
 	to.TotalSize.OnDisk += from.TotalSize.OnDisk
@@ -334,6 +332,7 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 	var totalDisksSize uint64
 	for _, tsiz := range dsize {
 		totalDisksSize += tsiz
+		// TODO -- FIXME: (local-playground + losetup, etc.)
 		if testingEnv {
 			break
 		}
@@ -342,7 +341,12 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 		if summ.ObjCount.Present > 0 {
 			summ.ObjSize.Avg = int64(cos.DivRoundU64(summ.TotalSize.PresentObjs, summ.ObjCount.Present))
 		}
-		summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		if summ.ObjSize.Min == math.MaxInt64 {
+			summ.ObjSize.Min = 0
+		}
+		if totalDisksSize > 0 {
+			summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		}
 	}
 }
 
@@ -363,9 +367,9 @@ type (
 	}
 
 	//  Multi-object copy & transform (see also: TCBMsg)
-	TCObjsMsg struct {
+	TCOMsg struct {
 		ToBck Bck `json:"tobck"`
-		apc.TCObjsMsg
+		apc.TCOMsg
 	}
 )
 

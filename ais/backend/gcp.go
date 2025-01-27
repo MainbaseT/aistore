@@ -23,6 +23,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tracing"
 	jsoniter "github.com/json-iterator/go"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
@@ -61,16 +63,15 @@ var (
 	_ core.Backend = (*gsbp)(nil)
 )
 
-func NewGCP(t core.TargetPut) (bp core.Backend, err error) {
+func NewGCP(t core.TargetPut, tstats stats.Tracker, startingUp bool) (_ core.Backend, err error) {
 	var (
 		projectID     string
 		credProjectID = readCredFile()
 		envProjectID  = os.Getenv(projectIDEnvVar)
 	)
 	if credProjectID != "" && envProjectID != "" && credProjectID != envProjectID {
-		err = fmt.Errorf("both %q and %q env vars cannot be defined (and not equal %s)",
+		return nil, fmt.Errorf("both %q and %q env vars cannot be defined (and not equal %s)",
 			projectIDEnvVar, credPathEnvVar, projectIDField)
-		return
 	}
 	switch {
 	case credProjectID != "":
@@ -82,17 +83,22 @@ func NewGCP(t core.TargetPut) (bp core.Backend, err error) {
 	default:
 		nlog.Warningln("unauthenticated client")
 	}
-	gsbp := &gsbp{
+
+	bp := &gsbp{
 		t:         t,
 		projectID: projectID,
-		base:      base{apc.GCP},
+		base:      base{provider: apc.GCP},
 	}
-	bp = gsbp
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
 
 	gctx = context.Background()
-	gcpClient, err = gsbp.createClient(gctx)
-	return
+	gcpClient, err = bp.createClient(gctx)
+
+	return bp, err
 }
+
+// TODO: use config.Net.HTTP.IdleConnTimeout and friends
 
 func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 	opts := []option.ClientOption{option.WithScopes(storage.ScopeFullControl)}
@@ -109,7 +115,7 @@ func (gsbp *gsbp) createClient(ctx context.Context) (*storage.Client, error) {
 		}
 		return nil, cmn.NewErrFailedTo(nil, "gcp-backend: create", "http transport", err)
 	}
-	opts = append(opts, option.WithHTTPClient(&http.Client{Transport: transport}))
+	opts = append(opts, option.WithHTTPClient(tracing.NewTraceableClient(&http.Client{Transport: transport})))
 	// create HTTP client
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
@@ -183,12 +189,8 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	lst.ContinuationToken = nextPageToken
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
 	)
-	if wantCustom {
-		custom = make(cos.StrKVs, 3) // reuse
-	}
 	lst.Entries = lst.Entries[:0]
 	for _, attrs := range objs {
 		en := cmn.LsoEnt{Name: attrs.Name, Size: attrs.Size}
@@ -198,7 +200,7 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 			debug.Assert(attrs.Name == "", attrs.Prefix, " vs ", attrs.Name)
 			debug.Assert(query != nil && query.Delimiter != "")
 
-			if msg.IsFlagSet(apc.LsNoDirs) {
+			if msg.IsFlagSet(apc.LsNoDirs) { // do not return virtual subdirectories
 				continue
 			}
 			en.Name = attrs.Prefix
@@ -210,12 +212,10 @@ func (*gsbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 			if v, ok := h.EncodeVersion(attrs.Generation); ok {
 				en.Version = v
 			}
-			// custom
 			if wantCustom {
-				custom[cmn.ETag], _ = h.EncodeCksum(attrs.Etag)
-				custom[cmn.LastModified] = fmtTime(attrs.Updated)
-				custom[cos.HdrContentType] = attrs.ContentType
-				en.Custom = cmn.CustomMD2S(custom)
+				etag, _ := h.EncodeETag(attrs.Etag)
+				en.Custom = cmn.CustomProps2S(cmn.ETag, etag, cmn.LastModified, fmtTime(attrs.Updated),
+					cos.HdrContentType, attrs.ContentType)
 			}
 		}
 		lst.Entries = append(lst.Entries, &en)
@@ -292,7 +292,7 @@ func (*gsbp) HeadObj(ctx context.Context, lom *core.LOM, _ *http.Request) (oa *c
 	if v, ok := h.EncodeCksum(attrs.CRC32C); ok {
 		oa.SetCustomKey(cmn.CRC32CObjMD, v)
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		oa.SetCustomKey(cmn.ETag, v)
 	}
 
@@ -386,7 +386,7 @@ func setCustomGs(lom *core.LOM, attrs *storage.ObjectAttrs) (expCksum *cos.Cksum
 			expCksum = cos.NewCksum(cos.ChecksumCRC32C, v)
 		}
 	}
-	if v, ok := h.EncodeCksum(attrs.Etag); ok {
+	if v, ok := h.EncodeETag(attrs.Etag); ok {
 		lom.SetCustomKey(cmn.ETag, v)
 	}
 	lom.SetCustomKey(cmn.LastModified, fmtTime(attrs.Updated))
@@ -460,7 +460,7 @@ func readCredFile() (projectID string) {
 	if err != nil {
 		return
 	}
-	b, err := io.ReadAll(credFile)
+	b, err := cos.ReadAll(credFile)
 	credFile.Close()
 	if err != nil {
 		return

@@ -1,6 +1,6 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -27,6 +27,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/atomic"
+	"github.com/NVIDIA/aistore/cmn/certloader"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/jsp"
@@ -37,9 +38,9 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tracing"
 	"github.com/NVIDIA/aistore/xact/xreg"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -64,22 +65,22 @@ type htext interface {
 }
 
 type htrun struct {
-	si        *meta.Snode
-	keepalive keepaliver
-	statsT    stats.Tracker
-	owner     struct {
+	owner struct {
 		smap   *smapOwner
-		bmd    bmdOwner // an interface with proxy and target impl-s
+		bmd    bmdOwner // interface with proxy and target impl-s
 		rmd    *rmdOwner
 		config *configOwner
-		etl    etlOwner // ditto
+		etl    etlOwner
 	}
-	startup struct {
+	keepalive keepaliver
+	statsT    stats.Tracker
+	si        *meta.Snode
+	gmm       *memsys.MMSA // system pagesize-based memory manager and slab allocator
+	smm       *memsys.MMSA // small-size allocator (up to 4K)
+	startup   struct {
 		cluster atomic.Int64 // mono.NanoTime() since cluster startup, zero prior to that
-		node    atomic.Int64 // ditto - for the node
+		node    atomic.Int64 // ditto - for this node
 	}
-	gmm *memsys.MMSA // system pagesize-based memory manager and slab allocator
-	smm *memsys.MMSA // system MMSA for small-size allocations
 }
 
 ///////////
@@ -100,10 +101,14 @@ func (h *htrun) Sowner() meta.Sowner { return h.owner.smap }
 func (h *htrun) PageMM() *memsys.MMSA { return h.gmm }
 func (h *htrun) ByteMM() *memsys.MMSA { return h.smm }
 
+func (h *htrun) errStopping() error {
+	return errors.New(h.si.Name() + " is stopping")
+}
+
 // NOTE: currently, only 'resume' (see also: kaSuspendMsg)
 func (h *htrun) smapUpdatedCB(_, _ *smapX, nfl, ofl cos.BitFlags) {
 	if ofl.IsAnySet(meta.SnodeMaintDecomm) && !nfl.IsAnySet(meta.SnodeMaintDecomm) {
-		h.statsT.Flag(stats.NodeStateFlags, 0, cos.MaintenanceMode)
+		h.statsT.ClrFlag(cos.NodeAlerts, cos.MaintenanceMode)
 		h.keepalive.ctrl(kaResumeMsg)
 	}
 }
@@ -164,7 +169,7 @@ func (h *htrun) cluMeta(opts cmetaFillOpt) (*cluMeta, error) {
 			cm.Flags = cm.Flags.Set(cos.RebalanceInterrupted)
 		}
 		if restarted {
-			cm.Flags = cm.Flags.Set(cos.Restarted)
+			cm.Flags = cm.Flags.Set(cos.NodeRestarted)
 		}
 	}
 	if !opts.skipPrimeTime && smap.IsPrimary(h.si) {
@@ -190,10 +195,18 @@ func (h *htrun) cluStartedWithRetry() bool {
 }
 
 func (h *htrun) ClusterStarted() bool { return h.startup.cluster.Load() > 0 } // see also: p.ready()
-func (h *htrun) markClusterStarted()  { h.startup.cluster.Store(mono.NanoTime()) }
+
+func (h *htrun) markClusterStarted() {
+	h.startup.cluster.Store(mono.NanoTime())
+	h.statsT.SetFlag(cos.NodeAlerts, cos.ClusterStarted)
+}
 
 func (h *htrun) NodeStarted() bool { return h.startup.node.Load() > 0 }
-func (h *htrun) markNodeStarted()  { h.startup.node.Store(mono.NanoTime()) }
+
+func (h *htrun) markNodeStarted() {
+	h.startup.node.Store(mono.NanoTime())
+	h.statsT.SetFlag(cos.NodeAlerts, cos.NodeStarted)
+}
 
 func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 	var (
@@ -229,27 +242,35 @@ func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 			continue
 		}
 		// none of the above
-		if !config.HostNet.UseIntraControl && !config.HostNet.UseIntraData {
+		switch {
+		case !config.HostNet.UseIntraControl && !config.HostNet.UseIntraData:
 			// no intra-cluster networks: default to pub net
 			handlePub(path, nh.h)
-		} else if config.HostNet.UseIntraControl && nh.net.isSet(accessNetIntraData) {
+		case config.HostNet.UseIntraControl && nh.net.isSet(accessNetIntraData):
 			// (not configured) data defaults to (configured) control
 			handleControl(path, nh.h)
-		} else {
+		default:
 			debug.Assert(config.HostNet.UseIntraData && nh.net.isSet(accessNetIntraControl))
 			// (not configured) control defaults to (configured) data
 			handleData(path, nh.h)
 		}
 	}
 	// common Prometheus
-	if h.statsT.IsPrometheus() {
-		nh := networkHandler{r: "/" + apc.Metrics, h: promhttp.Handler().ServeHTTP}
+	if handler := h.statsT.PromHandler(); handler != nil {
+		nh := networkHandler{r: "/" + apc.Metrics, h: handler.ServeHTTP}
 		path := nh.r // absolute
 		handlePub(path, nh.h)
 	}
 }
 
 func (h *htrun) init(config *cmn.Config) {
+	// before newTLS() below & before intra-cluster clients
+	if config.Net.HTTP.UseHTTPS {
+		if err := certloader.Init(config.Net.HTTP.Certificate, config.Net.HTTP.CertKey, h.statsT); err != nil {
+			cos.ExitLog(err)
+		}
+	}
+
 	initCtrlClient(config)
 	initDataClient(config)
 
@@ -257,19 +278,24 @@ func (h *htrun) init(config *cmn.Config) {
 	if h.si.IsProxy() {
 		tcpbuf = 0
 	} else if tcpbuf == 0 {
-		tcpbuf = cmn.DefaultSendRecvBufferSize // ditto: targets use AIS default when not configured
+		tcpbuf = cmn.DefaultSndRcvBufferSize // ditto: targets use AIS default when not configured
 	}
 
-	muxers := newMuxers()
+	// PubNet enable tracing when configuration is set.
+	muxers := newMuxers(tracing.IsEnabled())
 	g.netServ.pub = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
 	g.netServ.control = g.netServ.pub // if not separately configured, intra-control net is public
 	if config.HostNet.UseIntraControl {
-		muxers = newMuxers()
-		g.netServ.control = &netServer{muxers: muxers, sndRcvBufSize: 0}
+		// TODO: for now tracing is always disabled for intra-cluster traffic.
+		// Allow enabling through config.
+		muxers = newMuxers(false /*enableTracing*/)
+		g.netServ.control = &netServer{muxers: muxers, sndRcvBufSize: 0, lowLatencyToS: true}
 	}
 	g.netServ.data = g.netServ.control // if not configured, intra-data net is intra-control
 	if config.HostNet.UseIntraData {
-		muxers = newMuxers()
+		// TODO: for now tracing is always disabled for intra-data traffic.
+		// Allow enabling through config.
+		muxers = newMuxers(false /*enableTracing*/)
 		g.netServ.data = &netServer{muxers: muxers, sndRcvBufSize: tcpbuf}
 	}
 
@@ -298,7 +324,20 @@ func (h *htrun) initSnode(config *cmn.Config) {
 		cos.ExitLogf("failed to get local IP addr list: %v", err)
 	}
 
+	if l := len(addrList); l > 1 {
+		if config.HostNet.Hostname == "" || cmn.Rom.FastV(4, cos.SmoduleAIS) {
+			nlog.Infoln(l, "local unicast IPs:")
+			for _, addr := range addrList {
+				nlog.Infoln("\t", addr.String())
+			}
+		}
+	}
+
 	// 1. pub net
+
+	// the "hostname" field can be a single IP address or DNS hostname;
+	// it can also be a comma-separated list of IP addresses (or DNS hostnames), in which case the function
+	// returns pub = list[0] and extra = list[1:]
 	pub, extra := multihome(config.HostNet.Hostname)
 
 	if k8s.IsK8s() && config.HostNet.Hostname != "" {
@@ -317,8 +356,13 @@ func (h *htrun) initSnode(config *cmn.Config) {
 		for i, addr := range extra {
 			pubExtra[i].Init(proto, addr, port)
 		}
+		// already logged (pub, extra)
 	} else {
-		nlog.Infof("%s (user) access: %v (%q)", cmn.NetPublic, pubAddr, config.HostNet.Hostname)
+		var s string
+		if config.HostNet.Hostname != "" {
+			s = " (config: " + config.HostNet.Hostname + ")"
+		}
+		nlog.Infof("%s (user) access: %v%s", cmn.NetPublic, pubAddr, s)
 	}
 
 	// 2. intra-cluster
@@ -401,9 +445,8 @@ func mustDiffer(ip1 meta.NetInfo, port1 int, use1 bool, ip2 meta.NetInfo, port2 
 func (h *htrun) loadSmap() (smap *smapX, reliable bool) {
 	smap = newSmap()
 	loaded, err := h.owner.smap.load(smap)
-
 	if err != nil {
-		nlog.Errorf("Failed to load cluster map (\"Smap\"): %v - reinitializing", err)
+		nlog.Errorln(h.String(), "failed to load Smap:", err, "- reinitializing")
 		return
 	}
 	if !loaded {
@@ -485,6 +528,7 @@ func (h *htrun) run(config *cmn.Config) error {
 		}
 		tlsConf = c
 	}
+
 	if config.HostNet.UseIntraControl {
 		go func() {
 			_ = g.netServ.control.listen(h.si.ControlNet.TCPEndpoint(), logger, tlsConf, config)
@@ -500,12 +544,14 @@ func (h *htrun) run(config *cmn.Config) error {
 	if h.pubAddrAny(config) {
 		ep = ":" + h.si.PubNet.Port
 	} else if len(h.si.PubExtra) > 0 {
-		pubAddr2 := h.si.PubExtra[0]
-		debug.Assert(pubAddr2.Port == h.si.PubNet.Port)
-		g.netServ.pub2 = &netServer{muxers: g.netServ.pub.muxers, sndRcvBufSize: g.netServ.pub.sndRcvBufSize}
-		go func() {
-			_ = g.netServ.pub2.listen(pubAddr2.TCPEndpoint(), logger, tlsConf, config)
-		}()
+		for _, pubExtra := range h.si.PubExtra {
+			debug.Assert(pubExtra.Port == h.si.PubNet.Port, "expecting the same TCP port for all multi-home interfaces")
+			server := &netServer{muxers: g.netServ.pub.muxers, sndRcvBufSize: g.netServ.pub.sndRcvBufSize}
+			go func() {
+				_ = server.listen(pubExtra.TCPEndpoint(), logger, tlsConf, config)
+			}()
+			g.netServ.pubExtra = append(g.netServ.pubExtra, server)
+		}
 	}
 
 	return g.netServ.pub.listen(ep, logger, tlsConf, config) // stay here
@@ -528,7 +574,10 @@ func (h *htrun) stop(wg *sync.WaitGroup, rmFromSmap bool) {
 	const sleep = time.Second >> 1
 
 	if rmFromSmap {
-		h.unregisterSelf(true)
+		smap := h.owner.smap.get()
+		if err := h.rmSelf(smap, true); err != nil && !cos.IsErrConnectionRefused(err) {
+			nlog.Warningln(err)
+		}
 	}
 	nlog.Infoln("Shutting down HTTP")
 
@@ -580,6 +629,8 @@ func (h *htrun) _call(si *meta.Snode, bargs *bcastArgs, results *bcastResults) {
 	freeCargs(cargs)
 }
 
+const lenhdr = 5
+
 func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	var (
 		req    *http.Request
@@ -596,10 +647,6 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	debug.Assert(args.si != nil || args.req.Base != "") // either si or base
 	if args.req.Base == "" && args.si != nil {
 		args.req.Base = args.si.ControlNet.URL // by default, use intra-cluster control network
-	}
-
-	if args.req.Header == nil {
-		args.req.Header = make(http.Header)
 	}
 
 	switch args.timeout {
@@ -639,25 +686,39 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 	if res.err != nil {
 		res.details = fmt.Sprintf("FATAL: failed to create HTTP request %s %s: %v",
 			args.req.Method, args.req.URL(), res.err)
-		return
+		return res
 	}
 
-	req.Header.Set(apc.HdrCallerID, h.SID())
-	req.Header.Set(apc.HdrCallerName, h.si.Name())
+	// req header
+	if args.req.Header == nil {
+		args.req.Header = make(http.Header, lenhdr)
+	}
 	if smap.vstr != "" {
 		if smap.IsPrimary(h.si) {
 			req.Header.Set(apc.HdrCallerIsPrimary, "true")
 		}
 		req.Header.Set(apc.HdrCallerSmapVer, smap.vstr)
 	}
+	req.Header.Set(apc.HdrCallerID, h.SID())
+	req.Header.Set(apc.HdrCallerName, h.si.Name())
 	req.Header.Set(cos.HdrUserAgent, ua)
 
 	resp, res.err = client.Do(req)
 	if res.err != nil {
 		res.details = dfltDetail // tcp level, e.g.: connection refused
-		return
+		return res
 	}
-	defer resp.Body.Close()
+
+	_doResp(args, req, resp, res)
+	resp.Body.Close()
+
+	if sid != unknownDaemonID {
+		h.keepalive.heardFrom(sid)
+	}
+	return res
+}
+
+func _doResp(args *callArgs, req *http.Request, resp *http.Response, res *callResult) {
 	res.status = resp.StatusCode
 	res.header = resp.Header
 
@@ -676,25 +737,14 @@ func (h *htrun) call(args *callArgs, smap *smapX) (res *callResult) {
 		return
 	}
 
-	// read and decode via call result value (`cresv`), if provided
+	// read and decode via call-result-value (`cresv`), if provided;
 	// othwerwise, read and return bytes for the caller to unmarshal
 	if args.cresv != nil {
 		res.v = args.cresv.newV()
 		args.cresv.read(res, resp.Body)
-		if res.err != nil {
-			return
-		}
-	} else {
-		res.read(resp.Body)
-		if res.err != nil {
-			return
-		}
+	} else if args.req.Method != http.MethodHead { // ref: "response to a HEAD method should not have a body"
+		res.read(resp.Body, resp.ContentLength)
 	}
-
-	if sid != unknownDaemonID {
-		h.keepalive.heardFrom(sid)
-	}
-	return
 }
 
 //
@@ -727,7 +777,7 @@ func (h *htrun) _nfy(n core.Notif, err error, upon string, aborted bool) {
 			if si := smap.GetActiveNode(dst); si != nil {
 				nodes = append(nodes, si)
 			} else {
-				nlog.Errorln(&errNodeNotFound{"failed to notify", dst, h.si, smap})
+				nlog.Errorln(&errNodeNotFound{h.si, smap, "failed to notify", dst})
 			}
 		}
 	}
@@ -816,14 +866,6 @@ func (h *htrun) bcastNodes(bargs *bcastArgs) sliceResults {
 			if si.ID() == h.si.ID() {
 				continue
 			}
-
-			// TODO: remove
-			debug.Func(func() {
-				if si.URL(bargs.network) == h.si.URL(bargs.network) {
-					nlog.Errorf(fmtErrNetInfoChanged, h, si.StringEx(), si.URL(bargs.network))
-				}
-			})
-
 			if !bargs.ignoreMaintenance && si.InMaintOrDecomm() {
 				continue
 			}
@@ -854,7 +896,7 @@ func (h *htrun) bcastSelected(bargs *bcastArgs) sliceResults {
 	return results.s
 }
 
-func (h *htrun) bcastAsyncIC(msg *aisMsg) {
+func (h *htrun) bcastAsyncIC(msg *actMsgExt) {
 	var (
 		wg   = &sync.WaitGroup{}
 		smap = h.owner.smap.get()
@@ -944,11 +986,14 @@ func (h *htrun) writeJS(w http.ResponseWriter, r *http.Request, v any, tag strin
 }
 
 func _writejs(w http.ResponseWriter, r *http.Request, v any) (err error) {
-	w.Header().Set(cos.HdrContentType, cos.ContentJSONCharsetUTF)
+	hdr := w.Header()
+	hdr.Set(cos.HdrContentType, cos.ContentJSONCharsetUTF)
 	if isBrowser(r.Header.Get(cos.HdrUserAgent)) {
 		var out []byte
 		if out, err = jsoniter.MarshalIndent(v, "", "    "); err == nil {
-			w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(out)))
+			hdr.Set(cos.HdrContentLength, strconv.Itoa(len(out)))
+			// NOTE: Strict-Transport-Security
+			hdr.Set(cos.HdrHSTS, "max-age=31536000; includeSubDomains")
 			_, err = w.Write(out)
 		}
 	} else { // previously: new-encoder(w).encode(v) (non-browser client)
@@ -957,7 +1002,7 @@ func _writejs(w http.ResponseWriter, r *http.Request, v any) (err error) {
 		j.WriteRaw("\n")
 		if err = j.Error; err == nil {
 			b := j.Buffer()
-			w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(b)))
+			hdr.Set(cos.HdrContentLength, strconv.Itoa(len(b)))
 			_, err = w.Write(b)
 
 			// NOTE: consider http.NewResponseController(w).Flush()
@@ -1005,7 +1050,7 @@ func (h *htrun) logerr(tag string, v any, err error) {
 	} else {
 		nlog.Errorln(msg)
 	}
-	h.statsT.IncErr(stats.ErrHTTPWriteCount)
+	h.statsT.Inc(stats.ErrHTTPWriteCount)
 }
 
 func _parseNCopies(value any) (copies int64, err error) {
@@ -1035,6 +1080,8 @@ func _checkAction(msg *apc.ActMsg, expectedActions ...string) (err error) {
 // common cplane cont-d
 //
 
+// see related "GET(what)" set of APIs: api/cluster and api/daemon
+// the enum itself in api/apc/query
 func (h *htrun) httpdaeget(w http.ResponseWriter, r *http.Request, query url.Values, htext htext) {
 	var (
 		body any
@@ -1043,13 +1090,13 @@ func (h *htrun) httpdaeget(w http.ResponseWriter, r *http.Request, query url.Val
 	switch what {
 	case apc.WhatNodeConfig:
 		var (
-			c      cmn.Config
+			out    cmn.Config
 			config = cmn.GCO.Get()
 		)
 		// hide secret
-		c = *config
-		c.Auth.Secret = "**********"
-		body = &c
+		out = *config
+		out.Auth.Secret = "**********"
+		body = &out
 	case apc.WhatSmap:
 		body = h.owner.smap.get()
 	case apc.WhatBMD:
@@ -1058,7 +1105,7 @@ func (h *htrun) httpdaeget(w http.ResponseWriter, r *http.Request, query url.Val
 		var err error
 		body, err = h.cluMeta(cmetaFillOpt{htext: htext, skipPrimeTime: true})
 		if err != nil {
-			nlog.Errorf("failed to fetch cluster config, err: %v", err)
+			nlog.Errorln("clu-meta failure:", err)
 		}
 	case apc.WhatSnode:
 		body = h.si
@@ -1088,8 +1135,10 @@ func (h *htrun) httpdaeget(w http.ResponseWriter, r *http.Request, query url.Val
 		daeStats := h.statsT.GetStatsV322()
 		ds.Tracker = daeStats.Tracker
 		body = ds
+	case apc.WhatCertificate: // (see also: daeLoadX509, cluLoadX509)
+		body = certloader.Props()
 	default:
-		h.writeErrf(w, r, "invalid GET /daemon request: unrecognized what=%s", what)
+		h.writeErrf(w, r, "invalid '%s' request: unrecognized 'what=%s' query", r.URL.Path, what)
 		return
 	}
 	h.writeJSON(w, r, body, "httpdaeget-"+what)
@@ -1101,12 +1150,15 @@ func (h *htrun) statsAndStatus() (ds *stats.NodeStatus) {
 		Node: stats.Node{
 			Snode: h.si,
 		},
+		Cluster: cos.NodeStateInfo{
+			Flags: cos.NodeStateFlags(h.statsT.Get(cos.NodeAlerts)),
+		},
 		SmapVersion:    smap.Version,
 		MemCPUInfo:     apc.GetMemCPU(),
 		DeploymentType: deploymentType(),
 		Version:        daemon.version,
 		BuildTime:      daemon.buildTime,
-		K8sPodName:     os.Getenv(env.AIS.K8sPod),
+		K8sPodName:     os.Getenv(env.AisK8sPod),
 		Status:         h._status(smap),
 	}
 	return ds
@@ -1124,7 +1176,7 @@ func (h *htrun) statsAndStatusV322() (ds *stats.NodeStatusV322) {
 		DeploymentType: deploymentType(),
 		Version:        daemon.version,
 		BuildTime:      daemon.buildTime,
-		K8sPodName:     os.Getenv(env.AIS.K8sPod),
+		K8sPodName:     os.Getenv(env.AisK8sPod),
 		Status:         h._status(smap),
 	}
 	return ds
@@ -1332,14 +1384,14 @@ func (h *htrun) writeErrf(w http.ResponseWriter, r *http.Request, format string,
 
 func (h *htrun) writeErrURL(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Scheme != "" {
-		h.writeErrf(w, r, "request '%s %s://%s': invalid URL path", r.Method, r.URL.Scheme, r.URL.Path)
+		h.writeErrf(w, r, "request '%s %s://%s' from %s: invalid URL path", r.Method, r.URL.Scheme, r.URL.Path, r.RemoteAddr)
 		return
 	}
 	// ignore GET /favicon.ico by Browsers
 	if r.URL.Path == "/favicon.ico" || r.URL.Path == "favicon.ico" {
 		return
 	}
-	h.writeErrf(w, r, "invalid request URI: '%s %s'", r.Method, r.RequestURI)
+	h.writeErrf(w, r, "invalid request URI: '%s %s' from %s", r.Method, r.RequestURI, r.RemoteAddr)
 }
 
 func (h *htrun) writeErrAct(w http.ResponseWriter, r *http.Request, action string) {
@@ -1348,25 +1400,8 @@ func (h *htrun) writeErrAct(w http.ResponseWriter, r *http.Request, action strin
 	cmn.FreeHterr(err)
 }
 
-func (h *htrun) writeErrActf(w http.ResponseWriter, r *http.Request, action string,
-	format string, a ...any) {
-	detail := fmt.Sprintf(format, a...)
-	err := cmn.InitErrHTTP(r, fmt.Errorf("invalid action %q: %s", action, detail), 0)
-	h.writeErr(w, r, err)
-	cmn.FreeHterr(err)
-}
-
-// also, validatePrefix
-func (h *htrun) isValidObjname(w http.ResponseWriter, r *http.Request, name string) bool {
-	if err := cmn.ValidateObjName(name); err != nil {
-		h.writeErr(w, r, err)
-		return false
-	}
-	return true
-}
-
 // health client
-func (h *htrun) reqHealth(si *meta.Snode, timeout time.Duration, query url.Values, smap *smapX) (b []byte, status int, err error) {
+func (h *htrun) reqHealth(si *meta.Snode, tout time.Duration, q url.Values, smap *smapX, retry bool) ([]byte, int, error) {
 	var (
 		path  = apc.URLPathHealth.S
 		url   = si.URL(cmn.NetIntraControl)
@@ -1374,14 +1409,38 @@ func (h *htrun) reqHealth(si *meta.Snode, timeout time.Duration, query url.Value
 	)
 	{
 		cargs.si = si
-		cargs.req = cmn.HreqArgs{Method: http.MethodGet, Base: url, Path: path, Query: query}
-		cargs.timeout = timeout
+		cargs.req = cmn.HreqArgs{Method: http.MethodGet, Base: url, Path: path, Query: q}
+		cargs.timeout = tout
 	}
 	res := h.call(cargs, smap)
-	b, status, err = res.bytes, res.status, res.err
-	freeCargs(cargs)
+	b, status, err := res.bytes, res.status, res.err
 	freeCR(res)
-	return
+
+	if err != nil {
+		ni, no := h.si.String(), si.StringEx()
+		if cmn.Rom.FastV(5, cos.SmoduleKalive) {
+			nlog.Warningln(ni, "failed req-health:", no, "tout", tout, "err: [", err, status, "]")
+		}
+		if retry {
+			// - retrying when about to remove node 'si' from the cluster map, or
+			// - about to elect a new primary;
+			// - not checking `IsErrDNSLookup` and similar
+			// - ie., not trying to narrow down (compare w/ slow-keepalive)
+			if si.PubNet.Hostname != si.ControlNet.Hostname {
+				u := si.URL(cmn.NetPublic)
+				cargs.req.Base = u
+				res = h.call(cargs, smap)
+				b, status, err = res.bytes, res.status, res.err
+				freeCR(res)
+				if err != nil {
+					nlog.Warningln(ni, "failed req-health retry:", no, "via pub", u, "tout", tout, "err: [", err, status, "]")
+				}
+			}
+		}
+	}
+
+	freeCargs(cargs)
+	return b, status, err
 }
 
 // - utilizes reqHealth (above) to discover a _better_ Smap, if exists
@@ -1406,7 +1465,13 @@ func (h *htrun) bcastHealth(smap *smapX, checkAll bool) (*cos.NodeStateInfo, int
 	if checkAll || (c.cnt < maxVerConfirmations && smap.CountActiveTs() > 0) {
 		h._bch(&c, smap, apc.Target)
 	}
-	nlog.Infoln(h.String()+":", c.maxNsti.String())
+
+	// log
+	b, err := jsoniter.MarshalIndent(c.maxNsti.Smap, "", "    ")
+	debug.AssertNoErr(err)
+	nlog.Infoln(string(b))
+	nlog.Infoln("flags:", c.maxNsti.Flags.String())
+
 	return c.maxNsti, c.cnt
 }
 
@@ -1448,33 +1513,77 @@ func (h *htrun) _bch(c *getMaxCii, smap *smapX, nodeTy string) {
 // metasync Rx
 //
 
-func logmsync(ver int64, revs revs, msg *aisMsg, opts ...string) {
+// TODO: reinforce - make it another `ensure*` method
+func (h *htrun) warnMsync(r *http.Request, smap *smapX) {
+	const (
+		tag = "metasync-recv"
+	)
+	if !smap.isValid() {
+		return
+	}
+	pid := r.Header.Get(apc.HdrCallerID)
+	psi := smap.GetNode(pid)
+	if psi == nil {
+		err := &errNodeNotFound{msg: tag + " warning:", id: pid, si: h.si, smap: smap}
+		nlog.Warningln(err)
+	} else if !smap.isPrimary(psi) {
+		nlog.Warningln(h.String(), tag, "expecting primary, got", psi.StringEx(), smap.StringEx())
+	}
+}
+
+func logmsync(lver int64, revs revs, msg *actMsgExt, opts ...string) { // caller [, what, luuid]
 	const tag = "msync Rx:"
 	var (
 		what   string
 		caller = opts[0]
-		lv     = strconv.FormatInt(ver, 10)
+		uuid   = revs.uuid()
+		lv     = "v" + strconv.FormatInt(lver, 10)
+		luuid  string
 	)
-	if len(opts) == 1 {
+	switch len(opts) {
+	case 1:
 		what = revs.String()
-	} else {
+		if uuid := revs.uuid(); uuid != "" {
+			what += "[" + uuid + "]"
+		}
+	case 2:
 		what = opts[1]
+		if strings.IndexByte(what, '[') < 0 {
+			if uuid != "" {
+				what += "[" + uuid + "]"
+			}
+		}
+	case 3:
+		what = opts[1]
+		luuid := opts[2]
+		lv += "[" + luuid + "]"
 	}
+	// different uuids (clusters) - versions cannot be compared
+	if luuid != "" && uuid != "" && uuid != luuid {
+		nlog.InfoDepth(1, "Warning", tag, what, "( different cluster", lv, msg.String(), "<--", caller, msg.String(), ")")
+		return
+	}
+
+	// compare l(ocal) and newly received
 	switch {
-	case ver == revs.version():
-		nlog.InfoDepth(1, tag, what, "(same v"+lv+",", msg.String(), "<--", caller+")")
-	case ver > revs.version():
-		nlog.InfoDepth(1, "Warning", tag, what, "(down from v"+lv+",", msg.String(), "<--", caller+")")
+	case lver == revs.version():
+		s := "( same"
+		if lver == 0 {
+			s = "( initial"
+		}
+		nlog.InfoDepth(1, tag, what, s, lv, msg.String(), "<--", caller, ")")
+	case lver > revs.version():
+		nlog.InfoDepth(1, "Warning", tag, what, "( down from", lv, msg.String(), "<--", caller, msg.String(), ")")
 	default:
-		nlog.InfoDepth(1, tag, "new", what, "(have v"+lv+",", msg.String(), "<--", caller+")")
+		nlog.InfoDepth(1, tag, "new", what, "( have", lv, msg.String(), "<--", caller, ")")
 	}
 }
 
-func (h *htrun) extractConfig(payload msPayload, caller string) (newConfig *globalConfig, msg *aisMsg, err error) {
+func (h *htrun) extractConfig(payload msPayload, caller string) (newConfig *globalConfig, msg *actMsgExt, err error) {
 	if _, ok := payload[revsConfTag]; !ok {
 		return
 	}
-	newConfig, msg = &globalConfig{}, &aisMsg{}
+	newConfig, msg = &globalConfig{}, &actMsgExt{}
 	confValue := payload[revsConfTag]
 	reader := bytes.NewBuffer(confValue)
 	if _, err1 := jsp.Decode(io.NopCloser(reader), newConfig, newConfig.JspOpts(), "extractConfig"); err1 != nil {
@@ -1489,9 +1598,9 @@ func (h *htrun) extractConfig(payload msPayload, caller string) (newConfig *glob
 	}
 	config := cmn.GCO.Get()
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		logmsync(config.Version, newConfig, msg, caller)
+		logmsync(config.Version, newConfig, msg, caller, newConfig.String(), config.UUID)
 	}
-	if newConfig.version() <= config.Version {
+	if newConfig.version() <= config.Version && msg.Action != apc.ActPrimaryForce {
 		if newConfig.version() < config.Version {
 			err = newErrDowngrade(h.si, config.String(), newConfig.String())
 		}
@@ -1500,11 +1609,11 @@ func (h *htrun) extractConfig(payload msPayload, caller string) (newConfig *glob
 	return
 }
 
-func (h *htrun) extractEtlMD(payload msPayload, caller string) (newMD *etlMD, msg *aisMsg, err error) {
+func (h *htrun) extractEtlMD(payload msPayload, caller string) (newMD *etlMD, msg *actMsgExt, err error) {
 	if _, ok := payload[revsEtlMDTag]; !ok {
 		return
 	}
-	newMD, msg = newEtlMD(), &aisMsg{}
+	newMD, msg = newEtlMD(), &actMsgExt{}
 	etlMDValue := payload[revsEtlMDTag]
 	reader := bytes.NewBuffer(etlMDValue)
 	if _, err1 := jsp.Decode(io.NopCloser(reader), newMD, newMD.JspOpts(), "extractEtlMD"); err1 != nil {
@@ -1521,7 +1630,7 @@ func (h *htrun) extractEtlMD(payload msPayload, caller string) (newMD *etlMD, ms
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
 		logmsync(etlMD.Version, newMD, msg, caller)
 	}
-	if newMD.version() <= etlMD.version() {
+	if newMD.version() <= etlMD.version() && msg.Action != apc.ActPrimaryForce {
 		if newMD.version() < etlMD.version() {
 			err = newErrDowngrade(h.si, etlMD.String(), newMD.String())
 		}
@@ -1530,14 +1639,15 @@ func (h *htrun) extractEtlMD(payload msPayload, caller string) (newMD *etlMD, ms
 	return
 }
 
-func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation bool) (newSmap *smapX, msg *aisMsg, err error) {
+func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation bool) (newSmap *smapX, msg *actMsgExt, err error) {
+	const act = "extract-smap"
 	if _, ok := payload[revsSmapTag]; !ok {
 		return
 	}
-	newSmap, msg = &smapX{}, &aisMsg{}
+	newSmap, msg = &smapX{}, &actMsgExt{}
 	smapValue := payload[revsSmapTag]
 	reader := bytes.NewBuffer(smapValue)
-	if _, err1 := jsp.Decode(io.NopCloser(reader), newSmap, newSmap.JspOpts(), "extractSmap"); err1 != nil {
+	if _, err1 := jsp.Decode(io.NopCloser(reader), newSmap, newSmap.JspOpts(), act); err1 != nil {
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, h, "new Smap", cos.BHead(smapValue), err1)
 		return
 	}
@@ -1547,7 +1657,7 @@ func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation boo
 			return
 		}
 	}
-	if skipValidation {
+	if skipValidation || (msg.Action == apc.ActPrimaryForce && newSmap.isValid()) {
 		return
 	}
 
@@ -1564,15 +1674,23 @@ func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation boo
 		err = cmn.NewErrFailedTo(h, "extract", newSmap, newSmap.validate())
 		return
 	}
+
 	if !newSmap.isPresent(h.si) {
-		err = fmt.Errorf("%s: not finding ourselves in %s", h, newSmap)
+		err = &errSelfNotFound{act: act, si: h.si, tag: "new", smap: newSmap}
+
+		if msg.Action != apc.ActPrimaryForce {
+			return
+		}
+		nlog.Warningln(err, "- proceeding with force")
+		err = nil
 		return
 	}
+
 	if err = smap.validateUUID(h.si, newSmap, caller, 50 /* ciError */); err != nil {
 		return // FATAL: cluster integrity error
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		logmsync(smap.Version, newSmap, msg, caller)
+		logmsync(smap.Version, newSmap, msg, caller, newSmap.String(), smap.UUID)
 	}
 	_, sameOrigin, _, eq := smap.Compare(&newSmap.Smap)
 	debug.Assert(sameOrigin)
@@ -1587,11 +1705,11 @@ func (h *htrun) extractSmap(payload msPayload, caller string, skipValidation boo
 	return
 }
 
-func (h *htrun) extractRMD(payload msPayload, caller string) (newRMD *rebMD, msg *aisMsg, err error) {
+func (h *htrun) extractRMD(payload msPayload, caller string) (newRMD *rebMD, msg *actMsgExt, err error) {
 	if _, ok := payload[revsRMDTag]; !ok {
 		return
 	}
-	newRMD, msg = &rebMD{}, &aisMsg{}
+	newRMD, msg = &rebMD{}, &actMsgExt{}
 	rmdValue := payload[revsRMDTag]
 	if err1 := jsoniter.Unmarshal(rmdValue, newRMD); err1 != nil {
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, h, "new RMD", cos.BHead(rmdValue), err1)
@@ -1605,16 +1723,18 @@ func (h *htrun) extractRMD(payload msPayload, caller string) (newRMD *rebMD, msg
 	}
 
 	rmd := h.owner.rmd.get()
+	logmsync(rmd.Version, newRMD, msg, caller, newRMD.String(), rmd.CluID)
+
+	if msg.Action == apc.ActPrimaryForce {
+		return
+	}
+
 	if newRMD.CluID != "" && newRMD.CluID != rmd.CluID && rmd.CluID != "" {
-		logmsync(rmd.Version, newRMD, msg, caller)
 		err = h.owner.rmd.newClusterIntegrityErr(h.String(), newRMD.CluID, rmd.CluID, rmd.Version)
 		cos.ExitLog(err) // FATAL
 	}
 
-	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		logmsync(rmd.Version, newRMD, msg, caller)
-	}
-	if newRMD.version() <= rmd.version() {
+	if newRMD.version() <= rmd.version() && msg.Action != apc.ActPrimaryForce {
 		if newRMD.version() < rmd.version() {
 			err = newErrDowngrade(h.si, rmd.String(), newRMD.String())
 		}
@@ -1623,11 +1743,11 @@ func (h *htrun) extractRMD(payload msPayload, caller string) (newRMD *rebMD, msg
 	return
 }
 
-func (h *htrun) extractBMD(payload msPayload, caller string) (newBMD *bucketMD, msg *aisMsg, err error) {
+func (h *htrun) extractBMD(payload msPayload, caller string) (newBMD *bucketMD, msg *actMsgExt, err error) {
 	if _, ok := payload[revsBMDTag]; !ok {
 		return
 	}
-	newBMD, msg = &bucketMD{}, &aisMsg{}
+	newBMD, msg = &bucketMD{}, &actMsgExt{}
 	bmdValue := payload[revsBMDTag]
 	reader := bytes.NewBuffer(bmdValue)
 	if _, err1 := jsp.Decode(io.NopCloser(reader), newBMD, newBMD.JspOpts(), "extractBMD"); err1 != nil {
@@ -1642,13 +1762,13 @@ func (h *htrun) extractBMD(payload msPayload, caller string) (newBMD *bucketMD, 
 	}
 	bmd := h.owner.bmd.get()
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		logmsync(bmd.Version, newBMD, msg, caller)
+		logmsync(bmd.Version, newBMD, msg, caller, newBMD.String(), bmd.UUID)
 	}
 	// skip older iff not transactional - see t.receiveBMD()
 	if h.si.IsTarget() && msg.UUID != "" {
 		return
 	}
-	if newBMD.version() <= bmd.version() {
+	if newBMD.version() <= bmd.version() && msg.Action != apc.ActPrimaryForce {
 		if newBMD.version() < bmd.version() {
 			err = newErrDowngrade(h.si, bmd.StringEx(), newBMD.StringEx())
 		}
@@ -1657,20 +1777,20 @@ func (h *htrun) extractBMD(payload msPayload, caller string) (newBMD *bucketMD, 
 	return
 }
 
-func (h *htrun) receiveSmap(newSmap *smapX, msg *aisMsg, payload msPayload, caller string, cb smapUpdatedCB) error {
+func (h *htrun) receiveSmap(newSmap *smapX, msg *actMsgExt, payload msPayload, caller string, cb smapUpdatedCB) error {
 	if newSmap == nil {
 		return nil
 	}
 	smap := h.owner.smap.get()
-	logmsync(smap.Version, newSmap, msg, caller, newSmap.StringEx())
+	logmsync(smap.Version, newSmap, msg, caller, newSmap.StringEx(), smap.UUID)
 
 	if !newSmap.isPresent(h.si) {
-		return fmt.Errorf("%s: not finding self in the new %s", h, newSmap)
+		return &errSelfNotFound{act: "receive-smap", si: h.si, tag: "new", smap: newSmap}
 	}
 	return h.owner.smap.synchronize(h.si, newSmap, payload, cb)
 }
 
-func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload, caller string, cb func(ne, oe *etlMD)) (err error) {
+func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *actMsgExt, payload msPayload, caller string, cb func(ne, oe *etlMD)) (err error) {
 	if newEtlMD == nil {
 		return
 	}
@@ -1679,7 +1799,7 @@ func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload, ca
 
 	h.owner.etl.Lock()
 	etlMD = h.owner.etl.get()
-	if newEtlMD.version() <= etlMD.version() {
+	if newEtlMD.version() <= etlMD.version() && msg.Action != apc.ActPrimaryForce {
 		h.owner.etl.Unlock()
 		if newEtlMD.version() < etlMD.version() {
 			err = newErrDowngrade(h.si, etlMD.String(), newEtlMD.String())
@@ -1697,26 +1817,30 @@ func (h *htrun) receiveEtlMD(newEtlMD *etlMD, msg *aisMsg, payload msPayload, ca
 }
 
 // under lock
-func (h *htrun) _recvCfg(newConfig *globalConfig, payload msPayload) (err error) {
+func (h *htrun) _recvCfg(newConfig *globalConfig, msg *actMsgExt, payload msPayload) (err error) {
 	config := cmn.GCO.Get()
-	if newConfig.version() <= config.Version {
+	if newConfig.version() <= config.Version && msg.Action != apc.ActPrimaryForce {
 		if newConfig.version() == config.Version {
 			return
 		}
 		return newErrDowngrade(h.si, config.String(), newConfig.String())
 	}
+	if config.UUID != "" && config.UUID != newConfig.UUID {
+		err = fmt.Errorf("%s: cluster configs have different UUIDs: (curr %q vs new %q)", ciError(110), config.UUID, newConfig.UUID)
+		if msg.Action != apc.ActPrimaryForce {
+			return err
+		}
+		nlog.Warningln(err, "- proceeding with force")
+	}
 	if err = h.owner.config.persist(newConfig, payload); err != nil {
-		return
+		return err
 	}
-	if err = cmn.GCO.Update(&newConfig.ClusterConfig); err != nil {
-		return
-	}
-	return
+	return cmn.GCO.Update(&newConfig.ClusterConfig)
 }
 
 func (h *htrun) extractRevokedTokenList(payload msPayload, caller string) (*tokenList, error) {
 	var (
-		msg       aisMsg
+		msg       actMsgExt
 		bytes, ok = payload[revsTokenTag]
 	)
 	if !ok {
@@ -1768,21 +1892,29 @@ func (h *htrun) extractRevokedTokenList(payload msPayload, caller string) (*toke
 //   - if these fails we try the candidates provided by the caller.
 //
 // ================================== Background =========================================
-func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res *callResult) {
+func (h *htrun) join(htext htext, contactURLs ...string) (res *callResult, err error) {
 	var (
-		config                   = cmn.GCO.Get()
+		config             = cmn.GCO.Get()
+		_, primaryURL, psi = h._primus(nil, config)
+	)
+	if psi != nil && psi.ID() == h.SID() {
+		debug.Assert(h.si.IsProxy())
+		return nil, fmt.Errorf("%s (self) - not joining, am primary [%q]", h, primaryURL) // (unlikely)
+	}
+
+	var (
 		candidates               = make([]string, 0, 4+len(contactURLs))
 		selfPublicURL, pubValid  = cos.ParseURL(h.si.URL(cmn.NetPublic))
 		selfIntraURL, intraValid = cos.ParseURL(h.si.URL(cmn.NetIntraControl))
 		resPrev                  *callResult
 	)
-	debug.Assert(pubValid && intraValid)
+	debug.Assertf(pubValid && intraValid, "%q (%t), %q (%t)", selfPublicURL, pubValid, selfIntraURL, intraValid)
 
-	// env goes first
+	// env first
 	if daemon.EP != "" {
 		candidates = _addCan(daemon.EP, selfPublicURL.Host, selfIntraURL.Host, candidates)
 	}
-	primaryURL, psi := h.getPrimaryURLAndSI(nil, config)
+
 	candidates = _addCan(primaryURL, selfPublicURL.Host, selfIntraURL.Host, candidates)
 	if psi != nil {
 		candidates = _addCan(psi.URL(cmn.NetPublic), selfPublicURL.Host, selfIntraURL.Host, candidates)
@@ -1798,13 +1930,13 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 	for range 4 { // retry
 		for _, candidateURL := range candidates {
 			if nlog.Stopping() {
-				return
+				return res, h.errStopping()
 			}
 			if resPrev != nil {
 				freeCR(resPrev)
 				resPrev = nil //nolint:ineffassign // readability
 			}
-			res = h.regTo(candidateURL, nil, apc.DefaultTimeout, query, htext, false /*keepalive*/)
+			res = h.regTo(candidateURL, nil, apc.DefaultTimeout, htext, false /*keepalive*/)
 			if res.err == nil {
 				nlog.Infoln(h.String()+": primary responded Ok via", candidateURL)
 				return // ok
@@ -1818,22 +1950,26 @@ func (h *htrun) join(query url.Values, htext htext, contactURLs ...string) (res 
 	}
 
 	smap := h.owner.smap.get()
-	if smap.validate() != nil {
-		return
+	if err := smap.validate(); err != nil {
+		return res, fmt.Errorf("%s: invalid Smap, err: %v", h.si, err)
 	}
 
 	// Failed to join cluster using config, try getting primary URL using existing smap.
 	nsti, _ := h.bcastHealth(smap, false /*checkAll*/)
-	if nsti == nil || nsti.Smap.Version < smap.version() {
-		return
+	if nsti == nil {
+		return res, fmt.Errorf("%s: failed to discover new Smap", h)
+	}
+	if nsti.Smap.Version < smap.version() {
+		return res, fmt.Errorf("%s: current %s version is newer than %d from the primary (%s)",
+			h, smap, nsti.Smap.Version, nsti.Smap.Primary.ID)
 	}
 	primaryURL = nsti.Smap.Primary.PubURL
 
 	// Daemon is stopping skip register
 	if nlog.Stopping() {
-		return
+		return res, h.errStopping()
 	}
-	res = h.regTo(primaryURL, nil, apc.DefaultTimeout, query, htext, false /*keepalive*/)
+	res = h.regTo(primaryURL, nil, apc.DefaultTimeout, htext, false /*keepalive*/)
 	if res.err == nil {
 		nlog.Infoln(h.String()+": joined cluster via", primaryURL)
 	}
@@ -1850,18 +1986,19 @@ func _addCan(url, selfPub, selfCtrl string, candidates []string) []string {
 	return append(candidates, url)
 }
 
-func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, q url.Values, htext htext, keepalive bool) *callResult {
+func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, htext htext, keepalive bool) *callResult {
 	var (
 		path          string
 		skipPrxKalive = h.si.IsProxy() || keepalive
 		opts          = cmetaFillOpt{
-			htext:         htext,
-			skipSmap:      skipPrxKalive,
-			skipBMD:       skipPrxKalive,
-			skipRMD:       keepalive,
-			skipConfig:    keepalive,
-			skipEtlMD:     keepalive,
-			fillRebMarker: !keepalive,
+			htext:      htext,
+			skipSmap:   skipPrxKalive, // when targets self- or admin-join
+			skipBMD:    skipPrxKalive, // ditto
+			skipRMD:    true,          // NOTE: not used yet
+			skipConfig: true,          // ditto
+			skipEtlMD:  true,          // ditto
+
+			fillRebMarker: !keepalive && htext != nil,
 			skipPrimeTime: true,
 		}
 	)
@@ -1880,7 +2017,7 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, q url.Val
 	cargs := allocCargs()
 	{
 		cargs.si = psi
-		cargs.req = cmn.HreqArgs{Method: http.MethodPost, Base: url, Path: path, Query: q, Body: cos.MustMarshal(cm)}
+		cargs.req = cmn.HreqArgs{Method: http.MethodPost, Base: url, Path: path, Body: cos.MustMarshal(cm)}
 		cargs.timeout = tout
 	}
 	smap := cm.Smap
@@ -1892,46 +2029,75 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, q url.Val
 	return res
 }
 
-func (h *htrun) sendKalive(smap *smapX, htext htext, timeout time.Duration, fast bool) (pid string, status int, err error) {
+// (fast path: nodes => primary)
+func (h *htrun) fastKalive(smap *smapX, timeout time.Duration, ecActive bool) (string /*pid*/, http.Header, error) {
 	if nlog.Stopping() {
-		err = errors.New(h.String() + " is stopping")
-		return
+		return "", http.Header{}, h.errStopping()
 	}
-	primaryURL, psi := h.getPrimaryURLAndSI(smap, nil)
-	pid = psi.ID()
+	debug.Assert(h.ClusterStarted())
 
-	if fast {
-		// fast path
-		debug.Assert(h.ClusterStarted())
-		path := apc.URLPathCluKalive.Join(h.SID())
-		cargs := allocCargs()
-		{
-			cargs.si = psi
-			cargs.req = cmn.HreqArgs{Method: http.MethodPost, Base: primaryURL, Path: path}
-			cargs.timeout = timeout
-		}
-		res := h.call(cargs, smap)
-		freeCargs(cargs)
-		err = res.err
-		freeCR(res)
-		return
+	pid, primaryURL, psi := h._primus(smap, nil)
+
+	cargs := allocCargs()
+	{
+		cargs.si = psi
+		cargs.req = cmn.HreqArgs{Method: http.MethodPost, Base: primaryURL, Path: apc.URLPathCluKalive.Join(h.SID())}
+		cargs.timeout = timeout
+	}
+	if ecActive {
+		// (target => primary)
+		hdr := make(http.Header, lenhdr)
+		hdr.Set(apc.HdrActiveEC, "true")
+		cargs.req.Header = hdr
 	}
 
-	// slow path
-	res := h.regTo(primaryURL, psi, timeout, nil, htext, true /*keepalive*/)
-	if res.err != nil {
-		if strings.Contains(res.err.Error(), ciePrefix) {
-			cos.ExitLog(res.err) // FATAL: cluster integrity error (cie)
-		}
-		status, err = res.status, res.err
-		freeCR(res)
-		return
-	}
+	res := h.call(cargs, smap)
+	freeCargs(cargs)
+	err, hdr := res.err, res.header
+
 	freeCR(res)
-	return
+	return pid, hdr, err
 }
 
-func (h *htrun) getPrimaryURLAndSI(smap *smapX, config *cmn.Config) (string, *meta.Snode) {
+// (slow path: nodes => primary)
+func (h *htrun) slowKalive(smap *smapX, htext htext, timeout time.Duration) (string /*pid*/, int, error) {
+	if nlog.Stopping() {
+		return "", 0, h.errStopping()
+	}
+	pid, primaryURL, psi := h._primus(smap, nil)
+
+	res := h.regTo(primaryURL, psi, timeout, htext, true /*keepalive*/)
+	if res.err == nil {
+		freeCR(res)
+		return pid, 0, nil
+	}
+
+	s := res.err.Error()
+	if strings.Contains(s, ciePrefix) {
+		cos.ExitLog(res.err) // FATAL: cluster integrity error (cie)
+	}
+
+	if psi == nil || pid == "" || psi.PubNet.Hostname == psi.ControlNet.Hostname {
+		status, err := res.status, res.err
+		freeCR(res)
+		return pid, status, err
+	}
+
+	// intermittent DNS failure? (compare with h.reqHealth)
+	if psi.PubNet.Hostname != psi.ControlNet.Hostname {
+		primaryURL = psi.URL(cmn.NetPublic)
+		nlog.Warningln("retrying via pub addr", primaryURL, "[", s, pid, "]")
+
+		freeCR(res)
+		res = h.regTo(primaryURL, psi, timeout, htext, true /*keepalive*/)
+	}
+
+	status, err := res.status, res.err
+	freeCR(res)
+	return pid, status, err
+}
+
+func (h *htrun) _primus(smap *smapX, config *cmn.Config) (string /*pid*/, string /*url*/, *meta.Snode) {
 	if smap == nil {
 		smap = h.owner.smap.get()
 	}
@@ -1939,9 +2105,9 @@ func (h *htrun) getPrimaryURLAndSI(smap *smapX, config *cmn.Config) (string, *me
 		if config == nil {
 			config = cmn.GCO.Get()
 		}
-		return config.Proxy.PrimaryURL, nil
+		return "", config.Proxy.PrimaryURL, nil
 	}
-	return smap.Primary.URL(cmn.NetIntraControl), smap.Primary
+	return smap.Primary.ID(), smap.Primary.URL(cmn.NetIntraControl), smap.Primary
 }
 
 func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxNsti *cos.NodeStateInfo) {
@@ -1966,7 +2132,7 @@ func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxNsti
 			nlog.Warningln(h.String(), "started as a non-primary and got _elected_ during startup")
 			return
 		}
-		if _, _, err := h.reqHealth(smap.Primary, healthTimeout, query /*ask primary*/, smap); err == nil {
+		if _, _, err := h.reqHealth(smap.Primary, healthTimeout, query /*ask primary*/, smap, false /*retry pub-addr*/); err == nil {
 			// log
 			s := fmt.Sprintf("%s via primary health: cluster startup Ok, %s", h.si, smap.StringEx())
 			if self := smap.GetNode(h.si.ID()); self == nil {
@@ -2013,11 +2179,10 @@ func (h *htrun) pollClusterStarted(config *cmn.Config, psi *meta.Snode) (maxNsti
 	}
 }
 
-func (h *htrun) unregisterSelf(ignoreErr bool) (err error) {
-	var status int
-	smap := h.owner.smap.get()
+func (h *htrun) rmSelf(smap *smapX, ignoreErr bool) error {
 	if smap == nil || smap.validate() != nil {
-		return
+		nlog.Warningln("cannot remove", h.String(), "(self): local copy of Smap is invalid")
+		return nil
 	}
 	cargs := allocCargs()
 	{
@@ -2026,50 +2191,55 @@ func (h *htrun) unregisterSelf(ignoreErr bool) (err error) {
 		cargs.timeout = apc.DefaultTimeout
 	}
 	res := h.call(cargs, smap)
-	status, err = res.status, res.err
+	status, err := res.status, res.err
 	if err != nil {
 		f := nlog.Errorf
 		if ignoreErr {
 			f = nlog.Infof
 		}
-		f("%s: failed to unreg self, err: %v(%d)", h.si, err, status)
+		f("%s: failed to remove %s (self) from %s: %v(%d)", apc.ActSelfRemove, h.si, smap, err, status)
+	} else {
+		nlog.Infoln(apc.ActSelfRemove+":", h.String(), "(self) from", smap.StringEx())
 	}
 	freeCargs(cargs)
 	freeCR(res)
-	return
+	return err
 }
 
 // via /health handler
 func (h *htrun) externalWD(w http.ResponseWriter, r *http.Request) (responded bool) {
-	callerID := r.Header.Get(apc.HdrCallerID)
-	caller := r.Header.Get(apc.HdrCallerName)
-	// external call
+	var (
+		callerID = r.Header.Get(apc.HdrCallerID)
+		caller   = r.Header.Get(apc.HdrCallerName)
+	)
+	// external WD
+	// TODO: check receiving on PubNet
+	// NOTE: always ready for K8s
 	if callerID == "" && caller == "" {
-		readiness := cos.IsParseBool(r.URL.Query().Get(apc.QparamHealthReadiness))
-		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
-			nlog.Infof("%s: external health-ping from %s (readiness=%t)", h.si, r.RemoteAddr, readiness)
+		if cmn.Rom.FastV(5, cos.SmoduleKalive) {
+			readiness := strings.Contains(r.URL.RawQuery, apc.QparamHealthReady)
+			nlog.Infoln(h.String(), "external health-probe:", r.RemoteAddr, readiness, "[", r.URL.RawQuery, "]")
 		}
-		// respond with 503 as per https://tools.ietf.org/html/rfc7231#section-6.6.4
-		// see also:
-		// * https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes
-		if !readiness && !h.ClusterStarted() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		// NOTE: for "readiness" check always return true; otherwise, true if cluster started
+		w.WriteHeader(http.StatusOK)
 		return true
 	}
+
 	// intra-cluster health ping
-	if !h.ensureIntraControl(w, r, false /* from primary */) {
+	// - pub addr permitted (see reqHealth)
+	// - compare w/ h.ensureIntraControl
+	err := h.checkIntraCall(r.Header, false /* from primary */)
+	if err != nil {
+		h.writeErr(w, r, err)
 		responded = true
 	}
-	return
+	return responded
 }
 
 //
 // intra-cluster request validations and helpers
 //
 
-func (h *htrun) isIntraCall(hdr http.Header, fromPrimary bool) (err error) {
+func (h *htrun) checkIntraCall(hdr http.Header, fromPrimary bool) (err error) {
 	debug.Assert(hdr != nil)
 	var (
 		smap       = h.owner.smap.get()
@@ -2080,7 +2250,7 @@ func (h *htrun) isIntraCall(hdr http.Header, fromPrimary bool) (err error) {
 		erP        error
 	)
 	if ok := callerID != "" && callerName != ""; !ok {
-		return fmt.Errorf("%s: expected %s request", h, cmn.NetIntraControl)
+		return errIntraControl
 	}
 	if !smap.isValid() {
 		return
@@ -2099,7 +2269,9 @@ func (h *htrun) isIntraCall(hdr http.Header, fromPrimary bool) (err error) {
 		// we still trust the request when the sender's Smap is more current
 		if callerVer > smap.version() {
 			if h.ClusterStarted() {
-				nlog.Errorf("%s: %s < Smap(v%s) from %s - proceeding anyway...", h, smap, callerSver, callerName)
+				// (exception: setting primary w/ force)
+				warn := h.String() + ": local " + smap.String() + " is older than (caller's) " + callerName + " Smap v" + callerSver
+				nlog.ErrorDepth(1, warn, "- proceeding anyway...")
 			}
 			runtime.Gosched()
 			return
@@ -2116,7 +2288,7 @@ func (h *htrun) isIntraCall(hdr http.Header, fromPrimary bool) (err error) {
 }
 
 func (h *htrun) ensureIntraControl(w http.ResponseWriter, r *http.Request, onlyPrimary bool) (isIntra bool) {
-	err := h.isIntraCall(r.Header, onlyPrimary)
+	err := h.checkIntraCall(r.Header, onlyPrimary)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -2168,16 +2340,16 @@ func ptLatency(tts int64, ptime, isPrimary string) (dur int64) {
 }
 
 //
-// aisMsg reader & constructors
+// actMsgExt reader & constructors
 //
 
-func (*htrun) readAisMsg(w http.ResponseWriter, r *http.Request) (msg *aisMsg, err error) {
-	msg = &aisMsg{}
+func (*htrun) readAisMsg(w http.ResponseWriter, r *http.Request) (msg *actMsgExt, err error) {
+	msg = &actMsgExt{}
 	err = cmn.ReadJSON(w, r, msg)
 	return
 }
 
-func (msg *aisMsg) String() string {
+func (msg *actMsgExt) String() string {
 	s := "aism[" + msg.Action
 	if msg.UUID != "" {
 		s += "[" + msg.UUID + "]"
@@ -2188,7 +2360,7 @@ func (msg *aisMsg) String() string {
 	return s + "]"
 }
 
-func (msg *aisMsg) StringEx() (s string) {
+func (msg *actMsgExt) StringEx() (s string) {
 	s = msg.String()
 	vs, err := jsoniter.Marshal(msg.Value)
 	debug.AssertNoErr(err)
@@ -2196,16 +2368,16 @@ func (msg *aisMsg) StringEx() (s string) {
 	return
 }
 
-func (h *htrun) newAmsgStr(msgStr string, bmd *bucketMD) *aisMsg {
+func (h *htrun) newAmsgStr(msgStr string, bmd *bucketMD) *actMsgExt {
 	return h.newAmsg(&apc.ActMsg{Value: msgStr}, bmd)
 }
 
-func (h *htrun) newAmsgActVal(act string, val any) *aisMsg {
+func (h *htrun) newAmsgActVal(act string, val any) *actMsgExt {
 	return h.newAmsg(&apc.ActMsg{Action: act, Value: val}, nil)
 }
 
-func (h *htrun) newAmsg(actionMsg *apc.ActMsg, bmd *bucketMD, uuid ...string) *aisMsg {
-	msg := &aisMsg{ActMsg: *actionMsg}
+func (h *htrun) newAmsg(amsg *apc.ActMsg, bmd *bucketMD, uuid ...string) *actMsgExt {
+	msg := &actMsgExt{ActMsg: *amsg}
 	if bmd != nil {
 		msg.BMDVersion = bmd.Version
 	} else {

@@ -26,7 +26,7 @@ RUN wget https://bootstrap.pypa.io/get-pip.py &&\
   pip install awscli s3cmd
 
 # Setting ENV variables
-ENV GOLANG_VERSION="1.22.3"
+ENV GOLANG_VERSION="1.23.4"
 
 # Reassign arguments to environment variables so run.sh can use them
 ENV GOPATH /go
@@ -50,6 +50,7 @@ ENV STATSD_CONF_FILE ${AIS_CONF_DIR}/statsd.conf
 
 ENV MOUNTPATH /tmp/ais
 
+COPY utils.sh utils.sh
 COPY aisnode_config.sh aisnode_config.sh
 COPY entrypoint/entrypoint.sh entrypoint.sh
 COPY limits.conf /etc/security/limits.conf

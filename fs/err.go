@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -28,12 +28,7 @@ type (
 		Msg  string
 		Code int // Sie* enum above
 	}
-	ErrMountpathNoDisks struct {
-		Mi *Mountpath
-	}
 )
-
-func (e *ErrMountpathNoDisks) Error() string { return fmt.Sprintf("%s has no disks", e.Mi) }
 
 func (sie *ErrStorageIntegrity) Error() string {
 	err := fmt.Errorf(cmn.FmtErrIntegrity, siePrefix, sie.Code, cmn.GitHubHome)

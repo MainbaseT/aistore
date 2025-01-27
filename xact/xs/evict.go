@@ -6,6 +6,7 @@
 package xs
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -26,7 +27,7 @@ type (
 		kind string
 	}
 	evictDelete struct {
-		lriterator
+		lrit
 		xact.Base
 		config *cmn.Config
 	}
@@ -57,24 +58,29 @@ func (*evdFactory) WhenPrevIsRunning(xreg.Renewable) (xreg.WPR, error) {
 
 func newEvictDelete(xargs *xreg.Args, kind string, bck *meta.Bck, msg *apc.ListRange) (ed *evictDelete, err error) {
 	ed = &evictDelete{config: cmn.GCO.Get()}
-	if err = ed.lriterator.init(ed, msg, bck); err != nil {
+	if err = ed.lrit.init(ed, msg, bck, lrpWorkersDflt); err != nil {
 		return nil, err
 	}
-	ed.InitBase(xargs.UUID, kind, bck)
+
+	var sb strings.Builder
+	sb.Grow(80)
+	msg.Str(&sb, ed.lrp == lrpPrefix)
+	ed.InitBase(xargs.UUID, kind, sb.String() /*ctlmsg*/, bck)
+
 	return ed, nil
 }
 
 func (r *evictDelete) Run(wg *sync.WaitGroup) {
 	wg.Done()
-	err := r.lriterator.run(r, core.T.Sowner().Get())
+	err := r.lrit.run(r, core.T.Sowner().Get())
 	if err != nil {
 		r.AddErr(err, 5, cos.SmoduleXs) // duplicated?
 	}
-	r.lriterator.wait()
+	r.lrit.wait()
 	r.Finish()
 }
 
-func (r *evictDelete) do(lom *core.LOM, lrit *lriterator) {
+func (r *evictDelete) do(lom *core.LOM, lrit *lrit) {
 	ecode, err := core.T.DeleteObject(lom, r.Kind() == apc.ActEvictObjects)
 	if err == nil { // done
 		r.ObjsAdd(1, lom.Lsize(true))

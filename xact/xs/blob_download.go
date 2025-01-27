@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -21,6 +22,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/feat"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
@@ -41,7 +43,9 @@ const (
 	dfltNumWorkers = 4
 
 	maxInitialSizeSGL = 128           // vec length
-	maxTotalChunks    = 128 * cos.MiB // max mem per blob downloader
+	maxTotalChunksMem = 128 * cos.MiB // max mem per blob downloader
+
+	minBlobDlPrefetch = cos.MiB // size threshold for x-prefetch
 )
 
 type (
@@ -104,7 +108,7 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 	if oa == nil {
 		// backend.HeadObj(), unless already done via prior (e.g. latest-ver or prefetch-threshold) check
 		// (in the latter case, oa.Size must be present)
-		oah, ecode, err := core.T.Backend(lom.Bck()).HeadObj(context.Background(), lom, nil /*origReq*/)
+		oah, ecode, err := core.T.HeadCold(lom, nil /*origReq*/)
 		if err != nil {
 			return xreg.RenewRes{Err: err}
 		}
@@ -125,18 +129,21 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 		return xreg.RenewRes{Err: err}
 	}
 
-	// validate, assign defaults (tune-up below)
-	if pre.chunkSize == 0 {
+	// validate, assign defaults (further tune-up below)
+	switch {
+	case pre.chunkSize == 0:
 		pre.chunkSize = dfltChunkSize
-	} else if pre.chunkSize < minChunkSize {
+	case pre.chunkSize < minChunkSize:
 		nlog.Infoln("Warning: chunk size", cos.ToSizeIEC(pre.chunkSize, 1), "is below permitted minimum",
 			cos.ToSizeIEC(minChunkSize, 0))
 		pre.chunkSize = minChunkSize
-	} else if pre.chunkSize > maxChunkSize {
+	case pre.chunkSize > maxChunkSize:
 		nlog.Infoln("Warning: chunk size", cos.ToSizeIEC(pre.chunkSize, 1), "exceeds permitted maximum",
 			cos.ToSizeIEC(maxChunkSize, 0))
 		pre.chunkSize = maxChunkSize
 	}
+
+	// [NOTE] factor in num CPUs and num chunks to tuneup num workers (heuristic)
 	if pre.numWorkers == 0 {
 		pre.numWorkers = dfltNumWorkers
 	}
@@ -149,6 +156,7 @@ func RenewBlobDl(xid string, params *core.BlobParams, oa *cmn.ObjAttrs) xreg.Ren
 	if a := cmn.MaxParallelism(); a < pre.numWorkers {
 		pre.numWorkers = a
 	}
+
 	return xreg.RenewBucketXact(apc.ActBlobDl, lom.Bck(), xreg.Args{UUID: xid, Custom: pre})
 }
 
@@ -168,7 +176,7 @@ func (*blobFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 func (p *blobFactory) Start() error {
 	// reuse the same args-carrying structure and keep filling-in
 	r := p.pre
-	r.InitBase(p.Args.UUID, p.Kind(), r.args.Lom.Bck())
+	r.InitBase(p.Args.UUID, p.Kind(), r.args.Lom.Cname(), r.args.Lom.Bck())
 
 	// 2nd (just in time) tune-up
 	var (
@@ -177,13 +185,14 @@ func (p *blobFactory) Start() error {
 		pressure = mm.Pressure()
 	)
 	if pressure >= memsys.PressureExtreme {
+		oom.FreeToOS(true)
 		return errors.New(r.Name() + ": extreme memory pressure - not starting")
 	}
 	switch pressure {
 	case memsys.PressureHigh:
 		slabSize = memsys.DefaultBufSize
 		r.numWorkers = 1
-		nlog.Warningln(r.Name() + ": high memory pressure detected...")
+		nlog.Warningln(r.Name(), "high memory pressure detected...")
 	case memsys.PressureModerate:
 		slabSize >>= 1
 		r.numWorkers = min(3, r.numWorkers)
@@ -196,12 +205,16 @@ func (p *blobFactory) Start() error {
 		cnt = maxInitialSizeSGL
 	}
 
-	// add a reader, if possible
 	nr := int64(r.numWorkers)
-	if pressure == memsys.PressureLow && r.numWorkers < cmn.MaxParallelism() &&
-		nr < (r.fullSize+r.chunkSize-1)/r.chunkSize &&
-		nr*r.chunkSize < maxTotalChunks-r.chunkSize {
-		r.numWorkers++
+	nc := (r.fullSize + r.chunkSize - 1) / r.chunkSize
+	if pressure == memsys.PressureLow && r.numWorkers < cmn.MaxParallelism() {
+		if nr < nc && nr*r.chunkSize < maxTotalChunksMem {
+			r.numWorkers++ // add a reader
+		}
+		if r.numWorkers == 1 && r.chunkSize > minChunkSize<<1 {
+			r.numWorkers = 2
+			r.chunkSize >>= 1
+		}
 	}
 
 	// open channels
@@ -272,6 +285,22 @@ func (p *blobFactory) WhenPrevIsRunning(prev xreg.Renewable) (xreg.WPR, error) {
 //
 
 func (r *XactBlobDl) Name() string { return r.Base.Name() + "/" + r.args.Lom.ObjName }
+func (r *XactBlobDl) Size() int64  { return r.fullSize }
+
+func (r *XactBlobDl) String() string {
+	var sb strings.Builder
+	sb.Grow(len(r.args.Lom.ObjName) + 3*16)
+	sb.WriteString("-[")
+	sb.WriteString(r.args.Lom.ObjName)
+	sb.WriteByte('-')
+	sb.WriteString(strconv.FormatInt(r.fullSize, 10))
+	sb.WriteByte('-')
+	sb.WriteString(strconv.FormatInt(r.chunkSize, 10))
+	sb.WriteByte('-')
+	sb.WriteString(strconv.Itoa(r.numWorkers))
+	sb.WriteByte(']')
+	return r.Base.String() + sb.String()
+}
 
 func (r *XactBlobDl) Run(*sync.WaitGroup) {
 	var (
@@ -279,7 +308,7 @@ func (r *XactBlobDl) Run(*sync.WaitGroup) {
 		pending []chunkDone
 		eof     bool
 	)
-	nlog.Infoln(r.Name()+": chunk-size", cos.ToSizeIEC(r.chunkSize, 0)+", num-concurrent-readers", r.numWorkers)
+	nlog.Infoln(r.String())
 	r.start()
 outer:
 	for {

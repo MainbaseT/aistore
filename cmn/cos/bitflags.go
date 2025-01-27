@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -26,6 +26,7 @@ func (f BitFlags) IsAnySet(flags BitFlags) bool {
 
 // atomic
 
+// "set" as in: "add"
 func SetfAtomic(f *uint64, flags uint64) (ok bool) {
 	return atomic.CompareAndSwapUint64(f, *f, *f|flags)
 }

@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -12,6 +12,7 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/urfave/cli"
@@ -24,6 +25,17 @@ const (
 	roleTargetShort = "t"
 )
 
+// (compare with getLogUsage)
+const getCluLogsUsage = "Download log archives from all clustered nodes (one TAR.GZ per node), e.g.:\n" +
+	indent4 + "\t - 'download-logs /tmp/www' - save log archives to /tmp/www directory\n" +
+	indent4 + "\t - 'download-logs --severity w' - errors and warnings to /tmp directory\n" +
+	indent4 + "\t   (see related: 'ais log show', 'ais log get')"
+
+const shutdownUsage = "Shutdown a node, gracefully or immediately;\n" +
+	indent4 + "\tnote: upon shutdown the node won't be decommissioned - it'll remain in the cluster map\n" +
+	indent4 + "\tand can be manually restarted to rejoin the cluster at any later time;\n" +
+	indent4 + "\tsee also: 'ais advanced " + cmdRmSmap + "'"
+
 var (
 	clusterCmdsFlags = map[string][]cli.Flag{
 		cmdCluAttach: {},
@@ -34,9 +46,12 @@ var (
 		cmdShutdown: {
 			yesFlag,
 		},
-		cmdPrimary: {},
+		cmdPrimary: {
+			forceFlag,
+		},
 		cmdJoin: {
 			roleFlag,
+			nonElectableFlag,
 		},
 		cmdStartMaint: {
 			noRebalanceFlag,
@@ -74,48 +89,49 @@ var (
 	}
 
 	startRebalance = cli.Command{
-		Name:   commandStart,
-		Usage:  "rebalance ais cluster",
-		Flags:  clusterCmdsFlags[commandStart],
-		Action: startClusterRebalanceHandler,
+		Name:      commandStart,
+		Usage:     jobStartRebalance.Usage,
+		ArgsUsage: jobStartRebalance.ArgsUsage,
+		Flags:     sortFlags(jobStartRebalance.Flags),
+		Action:    jobStartRebalance.Action,
 	}
 	stopRebalance = cli.Command{
 		Name:   commandStop,
-		Usage:  "stop rebalancing ais cluster",
-		Flags:  clusterCmdsFlags[commandStop],
-		Action: stopClusterRebalanceHandler,
+		Usage:  "Stop rebalancing ais cluster",
+		Flags:  sortFlags(clusterCmdsFlags[commandStop]),
+		Action: stopRebHandler,
 	}
 
 	clusterCmd = cli.Command{
 		Name:  commandCluster,
-		Usage: "monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc.",
+		Usage: "Monitor and manage AIS cluster: add/remove nodes, change primary gateway, etc.",
 		Subcommands: []cli.Command{
 			makeAlias(showCmdCluster, "", true, commandShow), // alias for `ais show`
 			{
 				Name:      cmdCluAttach,
-				Usage:     "attach remote ais cluster",
+				Usage:     "Attach remote ais cluster",
 				ArgsUsage: attachRemoteAISArgument,
-				Flags:     clusterCmdsFlags[cmdAttach],
+				Flags:     sortFlags(clusterCmdsFlags[cmdAttach]),
 				Action:    attachRemoteAISHandler,
 			},
 			{
 				Name:         cmdCluDetach,
-				Usage:        "detach remote ais cluster",
+				Usage:        "Detach remote ais cluster",
 				ArgsUsage:    detachRemoteAISArgument,
-				Flags:        clusterCmdsFlags[cmdDetach],
+				Flags:        sortFlags(clusterCmdsFlags[cmdDetach]),
 				Action:       detachRemoteAISHandler,
 				BashComplete: suggestRemote,
 			},
 			{
 				Name:  cmdRebalance,
-				Usage: "administratively start and stop global rebalance; show global rebalance",
+				Usage: "Administratively start and stop global rebalance; show global rebalance",
 				Subcommands: []cli.Command{
 					startRebalance,
 					stopRebalance,
 					{
 						Name:         commandShow,
-						Usage:        "show global rebalance",
-						Flags:        clusterCmdsFlags[commandShow],
+						Usage:        "Show global rebalance",
+						Flags:        sortFlags(clusterCmdsFlags[commandShow]),
 						BashComplete: rebalanceCompletions,
 						Action:       showClusterRebalanceHandler,
 					},
@@ -123,80 +139,74 @@ var (
 			},
 			{
 				Name:         cmdPrimary,
-				Usage:        "select a new primary proxy/gateway",
-				ArgsUsage:    nodeIDArgument,
-				Flags:        clusterCmdsFlags[cmdPrimary],
+				Usage:        "Select a new primary proxy/gateway",
+				ArgsUsage:    nodeIDArgument + " [URL]",
+				Flags:        sortFlags(clusterCmdsFlags[cmdPrimary]),
 				Action:       setPrimaryHandler,
 				BashComplete: suggestProxies,
 			},
 			{
-				Name: cmdDownloadLogs,
-				Usage: "download log archives from all clustered nodes (one TAR.GZ per node), e.g.:\n" +
-					indent4 + "\t - 'download-logs /tmp/www' - save log archives to /tmp/www directory\n" +
-					indent4 + "\t - 'download-logs --severity w' - errors and warnings to system temporary directory\n" +
-					indent4 + "\t   (see related: 'ais log show', 'ais log get')",
+				Name:      cmdDownloadLogs,
+				Usage:     getCluLogsUsage,
 				ArgsUsage: "[OUT_DIR]",
-				Flags:     []cli.Flag{logSevFlag},
+				Flags:     sortFlags([]cli.Flag{logSevFlag}),
 				Action:    downloadAllLogs,
 			},
 
 			// cluster level (compare with the below)
 			{
 				Name:   cmdShutdown,
-				Usage:  "shut down entire cluster",
-				Flags:  clusterCmdsFlags[cmdShutdown],
+				Usage:  "Shut down entire cluster",
+				Flags:  sortFlags(clusterCmdsFlags[cmdShutdown]),
 				Action: clusterShutdownHandler,
 			},
 			{
 				Name:   cmdClusterDecommission,
-				Usage:  "decommission entire cluster",
-				Flags:  clusterCmdsFlags[cmdClusterDecommission],
+				Usage:  "Decommission entire cluster",
+				Flags:  sortFlags(clusterCmdsFlags[cmdClusterDecommission]),
 				Action: clusterDecommissionHandler,
 			},
 			// node level
 			{
 				Name:  cmdMembership,
-				Usage: "manage cluster membership (add/remove nodes, temporarily or permanently)",
+				Usage: "Manage cluster membership (add/remove nodes, temporarily or permanently)",
 				Subcommands: []cli.Command{
 					{
 						Name:      cmdJoin,
-						Usage:     "add a node to the cluster",
+						Usage:     "Add a node to the cluster",
 						ArgsUsage: joinNodeArgument,
-						Flags:     clusterCmdsFlags[cmdJoin],
+						Flags:     sortFlags(clusterCmdsFlags[cmdJoin]),
 						Action:    joinNodeHandler,
 					},
 					{
 						Name:         cmdStartMaint,
-						Usage:        "put node in maintenance mode, temporarily suspend its operation",
+						Usage:        "Put node in maintenance mode, temporarily suspend its operation",
 						ArgsUsage:    nodeIDArgument,
-						Flags:        clusterCmdsFlags[cmdStartMaint],
+						Flags:        sortFlags(clusterCmdsFlags[cmdStartMaint]),
 						Action:       nodeMaintShutDecommHandler,
 						BashComplete: suggestAllNodes,
 					},
 					{
 						Name:         cmdStopMaint,
-						Usage:        "take node out of maintenance mode - activate",
+						Usage:        "Take node out of maintenance mode - activate",
 						ArgsUsage:    nodeIDArgument,
-						Flags:        clusterCmdsFlags[cmdStopMaint],
+						Flags:        sortFlags(clusterCmdsFlags[cmdStopMaint]),
 						Action:       nodeMaintShutDecommHandler,
 						BashComplete: suggestNodesInMaint,
 					},
 					{
 						Name:         cmdNodeDecommission,
-						Usage:        "safely and permanently remove node from the cluster",
+						Usage:        "Safely and permanently remove node from the cluster",
 						ArgsUsage:    nodeIDArgument,
-						Flags:        clusterCmdsFlags[cmdNodeDecommission+".node"],
+						Flags:        sortFlags(clusterCmdsFlags[cmdNodeDecommission+".node"]),
 						Action:       nodeMaintShutDecommHandler,
 						BashComplete: suggestAllNodes,
 					},
 					{
-						Name: cmdShutdown,
-						Usage: "shutdown a node, gracefully or immediately;\n" +
-							indent4 + "\tnote: upon shutdown the node won't be decommissioned - it'll remain in the cluster map\n" +
-							indent4 + "\tand can be manually restarted to rejoin the cluster at any later time;\n" +
-							indent4 + "\tsee also: 'ais advanced " + cmdRmSmap + "'",
+						Name:         cmdShutdown,
+						Usage:        shutdownUsage,
 						ArgsUsage:    nodeIDArgument,
-						Flags:        clusterCmdsFlags[cmdShutdown+".node"],
+						Flags:        sortFlags(clusterCmdsFlags[cmdShutdown+".node"]),
 						Action:       nodeMaintShutDecommHandler,
 						BashComplete: suggestAllNodes,
 					},
@@ -204,11 +214,18 @@ var (
 			},
 			{
 				Name:         cmdResetStats,
-				Usage:        "reset cluster or node stats (all cumulative metrics or only errors)",
+				Usage:        "Reset cluster or node stats (all cumulative metrics or only errors)",
 				ArgsUsage:    optionalNodeIDArgument,
-				Flags:        clusterCmdsFlags[cmdResetStats],
+				Flags:        sortFlags(clusterCmdsFlags[cmdResetStats]),
 				Action:       resetStatsHandler,
 				BashComplete: suggestAllNodes,
+			},
+			{
+				Name:         cmdReloadCreds,
+				Usage:        "Reload (updated) backend credentials",
+				ArgsUsage:    "[PROVIDER]",
+				Action:       reloadCredsHandler,
+				BashComplete: suggestProvider,
 			},
 		},
 	}
@@ -252,13 +269,26 @@ func clusterShutdownHandler(c *cli.Context) (err error) {
 		warn := fmt.Sprintf("shutting down cluster (UUID=%s, primary=[%s, %s])",
 			smap.UUID, smap.Primary.ID(), smap.Primary.PubNet.URL)
 		actionWarn(c, warn)
-		if ok := confirm(c, "Proceed?"); !ok {
+		if !confirm(c, "Proceed?") {
 			return nil
 		}
+		// on the off-chance anything changed during 'confirm' interaction
+		curSmap = nil
+		smap, err = getClusterMap(c)
+		if err != nil {
+			return err
+		}
 	}
-	if err := api.ShutdownCluster(apiBP); err != nil {
+
+	// [NOTE]
+	// - cluster (shutdown|decommission) via non-primary works as well
+	// - still, _primary_ would be a better choice
+	bp := apiBP
+	bp.URL = smap.Primary.PubNet.URL
+	if err := api.ShutdownCluster(bp); err != nil {
 		return V(err)
 	}
+
 	actionDone(c, "Cluster successfully shut down")
 	return
 }
@@ -272,12 +302,22 @@ func clusterDecommissionHandler(c *cli.Context) error {
 		warn := fmt.Sprintf("about to permanently decommission cluster (UUID=%s, primary=[%s, %s]).",
 			smap.UUID, smap.Primary.ID(), smap.Primary.PubNet.URL)
 		actionWarn(c, warn)
-		if ok := confirm(c, "The operation cannot be undone. Proceed?"); !ok {
+		if !confirm(c, "The operation cannot be undone. Proceed?") {
 			return nil
+		}
+		curSmap = nil
+		smap, err = getClusterMap(c)
+		if err != nil {
+			return err
 		}
 	}
 	rmUserData := flagIsSet(c, rmUserDataFlag)
-	if err := api.DecommissionCluster(apiBP, rmUserData); err != nil {
+
+	// [NOTE] ditto (see above)
+	bp := apiBP
+	bp.URL = smap.Primary.PubNet.URL
+
+	if err := api.DecommissionCluster(bp, rmUserData); err != nil {
 		return V(err)
 	}
 	actionDone(c, "Cluster successfully decommissioned")
@@ -327,7 +367,15 @@ func joinNodeHandler(c *cli.Context) (err error) {
 		// for the primary to perform initial handshake, validation, and the rest of it (NOTE: control-net)
 		ControlNet: netInfo,
 	}
-	if rebID, nodeInfo.DaeID, err = api.JoinCluster(apiBP, nodeInfo); err != nil {
+
+	var flags cos.BitFlags
+	if flagIsSet(c, nonElectableFlag) {
+		if daemonType == apc.Target {
+			return fmt.Errorf("option %s does not apply - targets are non-electable", qflprn(nonElectableFlag))
+		}
+		flags = meta.SnodeNonElectable
+	}
+	if rebID, nodeInfo.DaeID, err = api.JoinCluster(apiBP, nodeInfo, flags); err != nil {
 		return
 	}
 
@@ -397,7 +445,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	case cmdStartMaint:
 		if !flagIsSet(c, yesFlag) {
 			warn := fmt.Sprintf("about to put %s in maintenance mode", sname)
-			if ok := confirm(c, "Proceed?", warn); !ok {
+			if !confirm(c, "Proceed?", warn) {
 				return nil
 			}
 		}
@@ -405,7 +453,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	case cmdStopMaint:
 		if !flagIsSet(c, yesFlag) {
 			prompt := fmt.Sprintf("Take %s out of maintenance mode", sname)
-			if ok := confirm(c, prompt); !ok {
+			if !confirm(c, prompt) {
 				return nil
 			}
 		}
@@ -413,7 +461,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	case cmdNodeDecommission:
 		if !flagIsSet(c, yesFlag) {
 			warn := "about to permanently decommission " + sname + ". The operation cannot be undone!"
-			if ok := confirm(c, "Proceed?", warn); !ok {
+			if !confirm(c, "Proceed?", warn) {
 				return nil
 			}
 		}
@@ -421,7 +469,7 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	case cmdShutdown:
 		if !flagIsSet(c, yesFlag) {
 			prompt := "Shut down " + sname
-			if ok := confirm(c, prompt); !ok {
+			if !confirm(c, prompt) {
 				return nil
 			}
 		}
@@ -462,7 +510,24 @@ func setPrimaryHandler(c *cli.Context) error {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
 	}
-	node, sname, err := getNode(c, c.Args().Get(0))
+	var (
+		toID  = c.Args().Get(0)
+		toURL = c.Args().Get(1)
+		force = flagIsSet(c, forceFlag)
+	)
+	if force {
+		err := api.SetPrimary(apiBP, toID, toURL, force)
+		if err == nil {
+			var s string
+			if toURL != "" {
+				s = " (at " + toURL + ")"
+			}
+			actionDone(c, fmt.Sprintf("%s%s is now a new primary", toID, s))
+		}
+		return err
+	}
+
+	node, sname, err := getNode(c, toID)
 	if err != nil {
 		return err
 	}
@@ -479,18 +544,56 @@ func setPrimaryHandler(c *cli.Context) error {
 		return fmt.Errorf("%s is non-electable", sname)
 	}
 
-	err = api.SetPrimaryProxy(apiBP, node.ID(), false /*force*/)
+	err = api.SetPrimary(apiBP, toID, toURL, force)
 	if err == nil {
 		actionDone(c, sname+" is now a new primary")
 	}
 	return err
 }
 
-func startClusterRebalanceHandler(c *cli.Context) (err error) {
-	return startXactionKind(c, apc.ActRebalance)
+func startRebHandler(c *cli.Context) (err error) {
+	var (
+		extra, prefix string
+		xargs         = xact.ArgsMsg{Kind: apc.ActRebalance}
+	)
+	if flagIsSet(c, verbObjPrefixFlag) {
+		prefix = parseStrFlag(c, verbObjPrefixFlag)
+	}
+	if c.NArg() > 0 {
+		uri := preparseBckObjURI(c.Args().Get(0))
+		bck, pref, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
+		if err != nil {
+			return err
+		}
+		if _, err := headBucket(bck, false /* don't add */); err != nil {
+			return err
+		}
+		xargs.Bck = bck
+
+		// embedded prefix vs '--prefix'
+		switch {
+		case pref != "" && prefix != "":
+			s := fmt.Sprintf(": via '%s' and %s option", uri, qflprn(verbObjPrefixFlag))
+			if pref != prefix {
+				return errors.New("two different prefix values" + s)
+			}
+			actionWarn(c, "redundant and duplicated prefix assignment"+s)
+		case pref != "":
+			prefix = pref
+		}
+	}
+	if xargs.Bck.IsEmpty() && prefix != "" {
+		return missingArgumentsError(c, c.Command.ArgsUsage)
+	}
+	if !xargs.Bck.IsEmpty() {
+		extra = prefix
+		actionWarn(c, "limiting the scope of rebalance to only '"+xargs.Bck.Cname(extra)+"' is not recommended!")
+		briefPause(2)
+	}
+	return startXaction(c, &xargs, extra)
 }
 
-func stopClusterRebalanceHandler(c *cli.Context) error {
+func stopRebHandler(c *cli.Context) error {
 	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, OnlyRunning: true}
 	_, snap, err := getAnyXactSnap(&xargs)
 	if err != nil {
@@ -499,12 +602,15 @@ func stopClusterRebalanceHandler(c *cli.Context) error {
 	if snap == nil {
 		return errors.New("rebalance is not running")
 	}
+	return stopReb(c, snap.ID)
+}
 
-	xargs.ID, xargs.OnlyRunning = snap.ID, false
-	if err := api.AbortXaction(apiBP, &xargs); err != nil {
+func stopReb(c *cli.Context, xid string) error {
+	xargs := xact.ArgsMsg{Kind: apc.ActRebalance, ID: xid, Force: flagIsSet(c, forceFlag)}
+	if err := xstop(&xargs); err != nil {
 		return V(err)
 	}
-	fmt.Fprintf(c.App.Writer, "Stopped %s[%s]\n", apc.ActRebalance, snap.ID)
+	actionDone(c, fmt.Sprintf("Stopped %s[%s]\n", apc.ActRebalance, xid))
 	return nil
 }
 
@@ -564,6 +670,14 @@ func resetStatsHandler(c *cli.Context) error {
 	msg := fmt.Sprintf("Cluster %s successfully reset", tag)
 	actionDone(c, msg)
 	return nil
+}
+
+func reloadCredsHandler(c *cli.Context) error {
+	p := c.Args().Get(0)
+	if p == scopeAll {
+		p = ""
+	}
+	return api.ReloadBackendCreds(apiBP, p)
 }
 
 func downloadAllLogs(c *cli.Context) error {

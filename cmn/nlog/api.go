@@ -6,7 +6,6 @@
 package nlog
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/NVIDIA/aistore/cmn/mono"
@@ -24,13 +23,18 @@ var MaxSize int64 = 4 * 1024 * 1024 // usually, config.log.max_size
 func InfoDepth(depth int, args ...any)    { log(sevInfo, depth, "", args...) }
 func Infoln(args ...any)                  { log(sevInfo, 0, "", args...) }
 func Infof(format string, args ...any)    { log(sevInfo, 0, format, args...) }
+func WarningDepth(depth int, args ...any) { log(sevWarn, depth, "", args...) }
 func Warningln(args ...any)               { log(sevWarn, 0, "", args...) }
 func Warningf(format string, args ...any) { log(sevWarn, 0, format, args...) }
 func ErrorDepth(depth int, args ...any)   { log(sevErr, depth, "", args...) }
 func Errorln(args ...any)                 { log(sevErr, 0, "", args...) }
 func Errorf(format string, args ...any)   { log(sevErr, 0, format, args...) }
 
-func Setup(logToStderr bool, maxSize int64) {
+func SetPre(dir, role string) {
+	logDir, aisrole = dir, role
+}
+
+func SetPost(logToStderr bool, maxSize int64) {
 	LogToStderr = logToStderr
 	MaxSize = maxSize
 	if MaxSize > 1024*1024*1024 {
@@ -39,16 +43,9 @@ func Setup(logToStderr bool, maxSize int64) {
 	}
 }
 
-func SetLogDirRole(dir, role string) {
-	if logDir != "" && logDir != dir && unitTests.Load() {
-		msg := fmt.Sprintf("log dir %q != %q (using nlog _prior_ to loading config?)", logDir, dir)
-		assert(false, msg)
-	}
-	logDir, aisrole = dir, role
-}
-
 func SetTitle(s string) { title = s }
 
+// see also: `logtypes` in stats/common
 func InfoLogName() string { return sname() + ".INFO" }
 func ErrLogName() string  { return sname() + ".ERROR" }
 
@@ -85,8 +82,7 @@ func Flush(action int) {
 	}
 }
 
-func Since() time.Duration {
-	now := mono.NanoTime()
+func Since(now int64) time.Duration {
 	a, b := nlogs[sevInfo].since(now), nlogs[sevErr].since(now)
 	if a > b {
 		return a

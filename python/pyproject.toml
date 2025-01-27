@@ -11,6 +11,7 @@ include = ["aistore"]
 [tool.pytest.ini_options]
 markers = [
     "etl: marks tests as using etl and therefore requiring k8s cluster",
+    "authn: marks tests as using AuthN and therefore requiring AIStore cluster to be deployed with AuthN",
 ]
 
 [tool.hatch.version]
@@ -24,7 +25,7 @@ authors = [
 ]
 description = "A (growing) set of client-side APIs to access and utilize clusters, buckets, and objects on AIStore."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = {text = "MIT License"}
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,12 +40,13 @@ classifiers = [
 dependencies = [
     "requests",
     "packaging",
-    "pydantic==1.10.14",
-    "cloudpickle==2.2.0",
+    "overrides",
+    "PyYAML",
+    "pydantic>=1.10.17",
+    "cloudpickle>=2.2.0",
     "humanize>=4.6.0",
     "braceexpand>=0.1.7",
     "msgspec>=0.15.1",
-    "webdataset==0.2.86"
 ]
 
 keywords = [
@@ -59,7 +61,7 @@ keywords = [
 ]
 
 [project.optional-dependencies]
-pytorch = ["torch", "torchdata"]
+pytorch = ["torch", "torchdata", "webdataset==0.2.86"]
 botocore = ["wrapt"]
 
 [project.urls]

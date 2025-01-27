@@ -9,7 +9,27 @@ redirect_from:
 
 # `ais show` command
 
-AIS CLI `show` command can universally be used to view summaries and details on a cluster and its nodes, buckets and objects, running and finished jobs - in short, _all_ managed entities (see below). The command is a "hub" for all information-viewing commands that are currently supported.
+AIS CLI `show` command can universally be used to view summaries and details on a cluster and its nodes, buckets and objects, running and finished jobs - in short, _all_ managed entities (see below).
+
+The command is a "hub" for all information-viewing commands that are currently supported:
+
+```console
+$ ais show --help
+
+COMMANDS:
+   auth            show entity in authn
+   object          show object properties
+   bucket          show bucket properties
+   cluster         main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
+   performance     show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
+   storage         show storage usage and utilization, disks and mountpaths
+   rebalance       show rebalance status and stats
+   config          show CLI, cluster, or node configurations (nodes inherit cluster and have local)
+   remote-cluster  show attached AIS clusters
+   job             show running and finished jobs ('--all' for all, or press <TAB-TAB> to select, '--help' for more options)
+   log             for a given node: show its current log (use '--refresh' to update, '--help' for details)
+   tls             show TLS certificate: version, issuer's common name, from/to validity bounds
+```
 
 For easy usage, all `show` commands have been aliased to their respective top-level counterparts:
 
@@ -21,7 +41,7 @@ is equivalent to:
 $ ais <command> show
 ```
 
-> For instance, `ais performance show` is an alias for `ais show performance` - both can be used interchangeably.
+> For instance, `ais show performance` is an alias for `ais performance` - both can be used interchangeably.
 
 > As a general rule, instead of remembering any of the above (as well as any of the below), type (e.g.) `ais perf<TAB-TAB>` and press `Enter`.
 
@@ -35,8 +55,9 @@ As far as `ais show`, the command currently extends as follows:
 
 ```console
 $ ais show <TAB-TAB>
+
 auth             bucket           performance      rebalance        remote-cluster   log
-object           cluster          storage          config           job
+object           cluster          storage          config           job              tls
 ```
 
 In other words, there are currently 11 subcommands that are briefly described in the rest of this text.
@@ -70,7 +91,7 @@ The command's help screen follows below - notice the command-line options (aka f
 ```console
 $ ais show performance --help
 NAME:
-   ais show performance - show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   ais show performance - show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 USAGE:
    ais show performance command [command options] [TARGET_ID]
@@ -79,7 +100,7 @@ COMMANDS:
    counters    show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
                - numbers of list-objects requests;
                - (GET, PUT, etc.) cumulative and average sizes;
-               - associated error counters, if any, and more.
+               - associated error counters, if any.
    throughput  show GET and PUT throughput, associated (cumulative, average) sizes and counters
    latency     show GET, PUT, and APPEND latencies and average sizes
    capacity    show target mountpaths, disks, and used/available capacity
@@ -130,6 +151,47 @@ Use `ais show performance` and its variations in combination with `ais show job`
 * [Prometheus](/docs/prometheus.md)
 
 ## `ais show job`
+
+```console
+$ ais show job --help
+NAME:
+   ais show job - show running and/or finished jobs
+     - 'show job tco-cysbohAGL'              - show a given (multi-object copy/transform) job identified by its unique ID;
+     - 'show job copy-listrange'             - show all running multi-object copies;
+     - 'show job copy-objects'               - same as above (using display name);
+     - 'show job copy-objects --all'         - show both running and already finished (or stopped) multi-object copies;
+     - 'show job list'                       - show all running list-objects jobs;
+     - 'show job ls'                         - same as above;
+     - 'show job ls --refresh 10'            - same as above with periodic _refreshing_ every 10 seconds;
+     - 'show job ls --refresh 10 --count 4'  - same as above but only for the first four 10-seconds intervals;
+     - 'show job prefetch-listrange'         - show all running prefetch jobs;
+     - 'show job prefetch'                   - same as above;
+     - 'show job prefetch --refresh 1m'      - show all running prefetch jobs at 1 minute intervals (until Ctrl-C);
+     - 'show job --all'                      - show absolutely all jobs, running and already finished
+   press <TAB-TAB> to select, '--help' for more options.
+
+USAGE:
+   ais show job [command options] [NAME] [JOB_ID] [NODE_ID] [BUCKET]
+
+OPTIONS:
+   --refresh value   time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --count value     used together with '--refresh' to limit the number of generated reports, e.g.:
+                      '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
+   --json, -j        json input/output
+   --all             all jobs, including finished and aborted
+   --regex value     regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   --no-headers, -H  display tables without headers
+   --verbose, -v     show extended statistics
+   --units value     show statistics and/or parse command-line specified sizes using one of the following _units of measurement_:
+                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                     si  - SI (metric) format, e.g.: KB, MB, GB
+                     raw - do not convert to (or from) human-readable format
+   --date-time       override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well
+   --progress        show progress bar(s) and progress of execution in real time
+   --log value       filename to log metrics (statistics)
+   --help, -h        show help
+```
 
 The command has no statically defined subcommands. When you type `ais show job <TAB-TAB>`, the resulting set of shell completions will only include job names (aka "kinds") that are **currently running**. Example:
 
@@ -306,9 +368,9 @@ qVJt8087         g15     rebalance       694             1.02MiB         13:40:5
 - [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
 - [CLI: `download` from any remote source](/docs/cli/download.md)
 - [built-in `rebalance`](/docs/rebalance.md)
-- [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges)
+- [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 - [reading, writing, and listing archives](/docs/cli/object.md)
-- [copying buckets](/docs/cli/bucket.md#copy-bucket)
+- [copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 ## `ais show cluster`
 
@@ -322,16 +384,16 @@ proxy    target   smap     bmd      config   stats
 ```console
 $ ais show cluster --help
 NAME:
-   ais show cluster - show cluster nodes and utilization
+   ais show cluster - main dashboard: show cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
 
 USAGE:
    ais show cluster command [command options] [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] | [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]
 
 COMMANDS:
-   smap    show Smap (cluster map)
-   bmd     show BMD (bucket metadata)
+   smap    show cluster map (Smap)
+   bmd     show bucket metadata (BMD)
    config  show cluster and node configuration
-   stats   (alias for "ais show performance") show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   stats   (alias for "ais show performance") show performance counters, throughput, latency, disks, used/available capacities (press <TAB-TAB> to select specific view)
 
 OPTIONS:
    --refresh value   interval for continuous monitoring;

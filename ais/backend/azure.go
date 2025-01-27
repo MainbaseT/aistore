@@ -39,6 +39,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 type (
@@ -75,11 +76,7 @@ var (
 var _ core.Backend = (*azbp)(nil)
 
 func azProto() string {
-	proto := os.Getenv(azProtoEnvVar)
-	if proto == "" {
-		proto = azDefaultProto
-	}
-	return proto
+	return cos.Right(azDefaultProto, os.Getenv(azProtoEnvVar))
 }
 
 func azAccName() string { return os.Getenv(azAccNameEnvVar) }
@@ -101,7 +98,7 @@ func asEndpoint() string {
 	}
 }
 
-func NewAzure(t core.TargetPut) (core.Backend, error) {
+func NewAzure(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
 	blurl := asEndpoint()
 
 	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
@@ -109,13 +106,16 @@ func NewAzure(t core.TargetPut) (core.Backend, error) {
 	if err != nil {
 		return nil, cmn.NewErrFailedTo(nil, azErrPrefix+": init]", "credentials", err)
 	}
-
-	return &azbp{
+	bp := &azbp{
 		t:     t,
 		creds: creds,
 		u:     blurl,
-		base:  base{apc.Azure},
-	}, nil
+		base:  base{provider: apc.Azure},
+	}
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
+
+	return bp, nil
 }
 
 // (compare w/ cmn/backend)
@@ -275,11 +275,11 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 	}
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
+		custom     []string
 	)
 	if wantCustom {
-		custom = make(cos.StrKVs, 4) // reuse
+		custom = make([]string, 0, 8)
 	}
 	lst.Entries = lst.Entries[:0]
 	for _, blob := range resp.Segment.BlobItems {
@@ -297,18 +297,18 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 		etag := azEncodeEtag(*blob.Properties.ETag)
 		en.Version = etag // (TODO a the top)
 		if wantCustom {
-			clear(custom)
-			custom[cmn.ETag] = etag
+			custom = custom[:0]
+			custom = append(custom, cmn.ETag, etag)
 			if !blob.Properties.LastModified.IsZero() {
-				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
+				custom = append(custom, cmn.LastModified, fmtTime(*blob.Properties.LastModified))
 			}
 			if blob.Properties.ContentType != nil {
-				custom[cos.HdrContentType] = *blob.Properties.ContentType
+				custom = append(custom, cos.HdrContentType, *blob.Properties.ContentType)
 			}
 			if blob.VersionID != nil {
-				custom[cmn.VersionObjMD] = *blob.VersionID
+				custom = append(custom, cmn.VersionObjMD, *blob.VersionID)
 			}
-			en.Custom = cmn.CustomMD2S(custom)
+			en.Custom = cmn.CustomProps2S(custom...)
 		}
 		lst.Entries = append(lst.Entries, &en)
 	}

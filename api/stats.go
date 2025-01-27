@@ -9,8 +9,8 @@ import (
 	"net/url"
 
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -69,7 +69,7 @@ func anyStats(bp BaseParams, sid, what string, out any) (err error) {
 	reqParams := AllocRp()
 	{
 		reqParams.BaseParams = bp
-		reqParams.Path = apc.URLPathReverseDae.S
+		reqParams.Path = apc.URLPathReverseDae.S // NOTE: reverse, via p.reverseHandler
 		reqParams.Query = url.Values{apc.QparamWhat: []string{what}}
 		reqParams.Header = http.Header{apc.HdrNodeID: []string{sid}}
 	}
@@ -78,6 +78,7 @@ func anyStats(bp BaseParams, sid, what string, out any) (err error) {
 	return err
 }
 
+// NOTE: direct call used only in tests (remove?)
 func GetDaemonStats(bp BaseParams, node *meta.Snode) (ds *stats.Node, err error) {
 	ds = &stats.Node{}
 	err = anyStats(bp, node.ID(), apc.WhatNodeStats, ds)
@@ -97,9 +98,24 @@ func GetStatsAndStatusV322(bp BaseParams, node *meta.Snode) (ds *stats.NodeStatu
 	return ds, err
 }
 
-func GetDiskStats(bp BaseParams, tid string) (res ios.AllDiskStats, err error) {
-	err = anyStats(bp, tid, apc.WhatDiskStats, &res)
-	return res, err
+func GetAnyStats(bp BaseParams, sid, what string) (out []byte, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathReverseDae.S // NOTE: reverse, via p.reverseHandler
+		reqParams.Query = url.Values{apc.QparamWhat: []string{what}}
+		reqParams.Header = http.Header{apc.HdrNodeID: []string{sid}}
+	}
+	resp, err := reqParams.do()
+	if err != nil {
+		return nil, err
+	}
+	out, err = cos.ReadAllN(resp.Body, resp.ContentLength)
+	cos.DrainReader(resp.Body)
+	resp.Body.Close()
+	FreeRp(reqParams)
+	return out, err
 }
 
 //

@@ -1,4 +1,26 @@
-image: aistorage/ci:latest
+variables:
+  MODE: debug # run aistore and tests with debug asserts enabled
+  CI_IMAGE: aistorage/ci:latest
+  RUNNER_TAG: "ais"
+  RUNNER_TAG_K8s: "ais-k8s"
+  SCRIPTS_DIR: "./scripts"
+  NUM_TARGET:
+    value: "6"
+    description: "Number of targets."
+  NUM_PROXY:
+    value: "6"
+    description: "Number of proxies."
+  FS_CNT:
+    value: "4"
+    description: "Number of mountpaths (disks) in each target."
+  CLOUD_BCKS:
+    value: "aws://ais-blossom gs://ais-ci-kube" # NOTE: additionally used: aws://ais-cicd and aws://ais-ci-python
+    description: "Set of buckets used when running cloud tests."
+  GOOGLE_APPLICATION_CREDENTIALS:
+    value: "$GCP_JSON_FILE"
+    description: "Gitlab file variable containing credentials for GCP"
+
+image: $CI_IMAGE
 
 stages:
   - build
@@ -10,25 +32,6 @@ include:
   - project: pstooling/gitlab-templates
     ref: main
     file: /templates/static-analysis/Checkmarx-main-csv.gitlab-ci.yml
-
-variables:
-  MODE: debug # run aistore and tests with debug asserts enabled
-  SCRIPTS_DIR: "./scripts"
-  NUM_TARGET:
-    value: "5"
-    description: "Number of targets deployed."
-  NUM_PROXY:
-    value: "5"
-    description: "Number of proxies deployed."
-  FS_CNT:
-    value: "6"
-    description: "Number of disks defined for each target."
-  CLOUD_BCKS:
-    value: "aws://ais-blossom gs://ais-ci-kube" # NOTE: additionally used: aws://ais-cicd and aws://ais-ci-python
-    description: "Set of buckets used when running cloud tests."
-  GOOGLE_APPLICATION_CREDENTIALS:
-    value: "$GCP_JSON_FILE"
-    description: "Gitlab file variable containing credentials for GCP"
 
 
 # Templates
@@ -53,8 +56,8 @@ variables:
 .test_short_template: &test_short_def
   stage: test-short
   tags:
-    - ais
-  timeout: 30m
+    - $RUNNER_TAG
+  timeout: 35m
   <<: *default_only_def
   except:
     variables:
@@ -65,8 +68,8 @@ variables:
 .test_short_skip_scheduled_template: &test_short_skip_scheduled_def
   stage: test-short
   tags:
-    - ais
-  timeout: 30m
+    - $RUNNER_TAG
+  timeout: 35m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual
@@ -77,8 +80,8 @@ variables:
 .test_short_optional_template: &test_short_optional_def
   stage: test-short
   tags:
-    - ais
-  timeout: 30m
+    - $RUNNER_TAG
+  timeout: 35m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
@@ -89,7 +92,7 @@ variables:
 .test_long_template: &test_long_def
   stage: test-long
   tags:
-    - ais
+    - $RUNNER_TAG
   # NOTE: when changing, make sure to update $SCRIPTS_DIR/bootstrap.sh and GitLab /settings/ci_cd
   timeout: 4h
   rules:
@@ -102,7 +105,7 @@ variables:
 .test_long_skip_scheduled_template: &test_long_skip_scheduled_def
   stage: test-long
   tags:
-    - ais
+    - $RUNNER_TAG
   # NOTE: when changing, make sure to update $SCRIPTS_DIR/bootstrap.sh and GitLab /settings/ci_cd
   timeout: 4h
   rules:
@@ -116,16 +119,17 @@ variables:
 build:linux:
   stage: build
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 10m
   <<: *default_only_def
   script:
     - MODE="" make node # Build node without backends in production mode.
     - MODE="debug" make node # Build node without backends in debug mode.
-    - AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="" make node # Build with all backends (production mode).
-    - AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="debug" make node # Build with all backends (debug mode).
+    - AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="" make node # Build with all Cloud backends (production mode).
+    - AIS_BACKEND_PROVIDERS="aws azure gcp ht" MODE="debug" make node # Build with all backends (debug mode).
     - MEM_PROFILE="/tmp/mem" CPU_PROFILE="/tmp/cpu" make node # Build with profile.
     - TAGS="nethttp" make node # Build with net/http transport support (fasthttp is used by default).
+    - TAGS="oteltracing" make node # Build with oteltracing (disabled by default).
     - make authn
     - make cli
     - make aisloader
@@ -144,7 +148,7 @@ build:k8s:
   before_script:
     - buildah login -u $CI_REGISTRY_USER -p $CI_REGISTRY_TOKEN $CI_REGISTRY
   script:
-    - buildah images 
+    - buildah images
     - buildah build -t $FQ_IMAGE_NAME -f deploy/dev/k8s/Dockerfile --build-arg MODE="debug" --build-arg providers="gcp"
     - buildah images
     - buildah push $FQ_IMAGE_NAME
@@ -161,11 +165,12 @@ build:k8s:
 lint:linux:
   stage: build
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 10m
   <<: *default_only_def
   script:
     - make lint
+    - TAGS="oteltracing statsd ht" make lint
     - make fmt-check
     - make spell-check
 
@@ -178,6 +183,7 @@ test:short:
     - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
     - make test-short
     - FLAGS="--duration=10s" make test-aisloader
+    - make test-tracing-unit
 
 # Runs cluster with 5 proxies and 5 targets (each with 6 mountpaths).
 test:short:python:
@@ -221,7 +227,7 @@ test:short:minimal:
 test:short:s3-compat:
   <<: *test_short_def
   tags:
-    - ais
+    - $RUNNER_TAG
   variables:
     # Run only s3 compat tests we know should pass
     S3_COMPAT_RUN_ALL:
@@ -232,7 +238,7 @@ test:short:s3-compat:
 
   script:
     - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --deployment all
-    - ais config cluster features Provide-S3-API-via-Root
+    - ais config cluster features S3-API-via-Root
     - ais config cluster checksum.type=md5
     - cd python
     - make python_s3_compat_test
@@ -305,46 +311,58 @@ test:short:azure:
     - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
     - make test-short
 
+test:short:oci:
+  <<: *test_short_def
+  variables:
+    BUCKET: "oc://ais-ci"
+  script:
+    - . ais/test/oci/mp_tuning.env && ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --oci
+    - . ais/test/oci/mp_tuning.env && make test-short
+
 test:long:
   <<: *test_long_skip_scheduled_def
   variables:
-    NUM_PROXY: 6
     BUCKET: "ais://ais-ci"
   script:
-    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --ht
     - make test-long
 
 test:long:aws:
   <<: *test_long_def
   variables:
-    NUM_PROXY: 6
     BUCKET: "aws://ais-cicd"
   script:
-    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --aws --ht
     - make test-long
 
 test:long:gcp:
   <<: *test_long_def
   variables:
-    NUM_PROXY: 6
     BUCKET: "gs://ais-ci"
   script:
-    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --gcp --ht
     - make test-long
 
 test:long:azure:
   <<: *test_long_def
   variables:
-    NUM_PROXY: 6
     BUCKET: "az://ais-ci"
   script:
-    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --azure --ht
     - make test-long
+
+test:long:oci:
+  <<: *test_long_def
+  variables:
+    BUCKET: "oc://ais-ci"
+  script:
+    - . ais/test/oci/mp_tuning.env && ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT --oci --ht
+    - . ais/test/oci/mp_tuning.env && make test-long
 
 test:long:aisloader:
   stage: test-long
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 15m
   variables:
     AIS_ENDPOINT: "http://localhost:8080"
@@ -360,7 +378,7 @@ test:long:aisloader:
 test:long:pyaisloader:
   stage: test-long
   tags:
-    - ais
+    - $RUNNER_TAG
   timeout: 15m
   variables:
     AIS_ENDPOINT: "http://localhost:8080"
@@ -373,13 +391,29 @@ test:long:pyaisloader:
       when: manual
       allow_failure: true
 
+test:long:ishard:
+  stage: test-long
+  tags:
+    - $RUNNER_TAG
+  timeout: 1h
+  variables:
+    AIS_ENDPOINT: "http://localhost:8080"
+  script:
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - sleep 10 # make sure that cluster properly starts
+    - cd ./cmd/ishard/ishard; go test -v -timeout=10h -run=^TestIshard
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
 #
 # Kubernetes stages
 #
 
 .test_k8s:
   tags:
-    - ais-k8s
+    - $RUNNER_TAG_K8s
   variables:
     BUCKET: "gs://ais-ci-kube"
     TESTS_DIR: "ais/test"
@@ -434,6 +468,36 @@ test:short:k8s:
   script:
     - make test-short
 
+test:short:python-authn:
+  stage: test-short
+  tags:
+    - $RUNNER_TAG
+  timeout: 20m
+  <<: *gather_logs_def
+  variables:
+    AIS_AUTHN_ENABLED: "true"
+    AIS_AUTHN_SU_NAME: "admin"
+    AIS_AUTHN_SU_PASS: "admin"
+    AIS_AUTHN_URL: "http://localhost:52001"
+  script:
+    - ${SCRIPTS_DIR}/clean_deploy.sh --target-cnt $NUM_TARGET --proxy-cnt $NUM_PROXY --mountpath-cnt $FS_CNT
+    - cd python/
+    - make python_authn_tests
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*authn.*/'
+      changes:
+        - python/aistore/sdk/authn/**/*
+        - python/tests/integration/sdk/authn/**/*
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      changes:
+        - python/aistore/sdk/authn/**/*
+        - python/tests/integration/sdk/authn/**/*
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
 test:short:python-etl:
   extends: .test_k8s_short_template
   <<: *default_only_def
@@ -452,12 +516,12 @@ test:short:python-etl:
   script:
     - cd python
     - make python_etl_tests
-    
+
 
 #  e.g. RE: "ETLBucket|ETLConnectionError|ETLInitCode" (or any other regex to select tests)
 test:short:assorted:k8s:
   extends: .test_k8s_short_template
-  timeout: 30m
+  timeout: 35m
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "main"'
       when: manual

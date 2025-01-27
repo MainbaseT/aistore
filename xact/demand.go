@@ -56,7 +56,7 @@ func (r *DemandBase) IsIdle() bool {
 	return last != 0 && mono.Since(last) >= max(cmn.Rom.MaxKeepalive(), 2*time.Second)
 }
 
-func (r *DemandBase) Init(uuid, kind string, bck *meta.Bck, idleDur time.Duration) {
+func (r *DemandBase) Init(uuid, kind, ctlmsg string, bck *meta.Bck, idleDur time.Duration) {
 	r.hkName = kind + "/" + uuid
 	if idleDur > 0 {
 		r.idle.d.Store(int64(idleDur))
@@ -64,7 +64,7 @@ func (r *DemandBase) Init(uuid, kind string, bck *meta.Bck, idleDur time.Duratio
 		r.idle.d.Store(int64(IdleDefault))
 	}
 	r.idle.ticks.Init()
-	r.InitBase(uuid, kind, bck)
+	r.InitBase(uuid, kind, ctlmsg, bck)
 
 	r.idle.last.Store(mono.NanoTime())
 	r.hkReg.Store(true)
@@ -74,10 +74,10 @@ func (r *DemandBase) Init(uuid, kind string, bck *meta.Bck, idleDur time.Duratio
 // (e.g. usage: listed last page)
 func (r *DemandBase) Reset(idleTime time.Duration) { r.idle.d.Store(int64(idleTime)) }
 
-func (r *DemandBase) hkcb() time.Duration {
+func (r *DemandBase) hkcb(now int64) time.Duration {
 	last := r.idle.last.Load()
 	idle := r.idle.d.Load()
-	if last != 0 && mono.SinceNano(last) >= idle {
+	if last != 0 && now-last >= idle { // mono.SinceNano(last)
 		// signal parent xaction to finish and exit (via `IdleTimer` chan)
 		r.idle.ticks.Close()
 	}

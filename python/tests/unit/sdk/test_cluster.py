@@ -3,13 +3,13 @@ from typing import List, Optional
 from unittest.mock import Mock, patch
 
 from aistore.sdk.bucket import Bucket
+from aistore.sdk.provider import Provider
 from aistore.sdk.cluster import Cluster
 from aistore.sdk.const import (
     HTTP_METHOD_GET,
     QPARAM_WHAT,
     QPARAM_PROVIDER,
     ACT_LIST,
-    PROVIDER_AIS,
     WHAT_SMAP,
     URL_PATH_DAEMON,
     URL_PATH_BUCKETS,
@@ -38,7 +38,7 @@ from aistore.sdk.types import (
     NodeThroughput,
 )
 
-from tests.utils import test_cases
+from tests.utils import cases
 
 
 class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
@@ -58,13 +58,13 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
             params={QPARAM_WHAT: WHAT_SMAP},
         )
 
-    def test_list_buckets(self):
-        provider = "any-provider"
-        expected_params = {QPARAM_PROVIDER: provider}
+    @cases(*Provider)
+    def test_list_buckets(self, provider):
+        expected_params = {QPARAM_PROVIDER: provider.value}
         self.list_buckets_exec_assert(expected_params, provider=provider)
 
     def test_list_buckets_default_param(self):
-        expected_params = {QPARAM_PROVIDER: PROVIDER_AIS}
+        expected_params = {QPARAM_PROVIDER: Provider.AIS.value}
         self.list_buckets_exec_assert(expected_params)
 
     def list_buckets_exec_assert(self, expected_params, **kwargs):
@@ -86,7 +86,7 @@ class TestCluster(unittest.TestCase):  # pylint: disable=unused-variable
         self.mock_client.request.side_effect = Exception
         self.assertFalse(self.cluster.is_ready())
 
-    @test_cases(True, False)
+    @cases(True, False)
     def test_is_ready(self, test_case):
         expected_params = {QPARAM_PRIMARY_READY_REB: "true"}
         primary_proxy_endpoint = "primary_proxy_url"

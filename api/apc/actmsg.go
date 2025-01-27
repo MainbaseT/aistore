@@ -1,6 +1,6 @@
 // Package apc: API constant and control messages
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -50,7 +50,6 @@ const (
 	ActStoreCleanup = "cleanup-store"
 
 	ActEvictRemoteBck = "evict-remote-bck" // evict remote bucket's data
-	ActInvalListCache = "inval-listobj-cache"
 	ActList           = "list"
 	ActLoadLomCache   = "load-lom-cache"
 	ActNewPrimary     = "new-primary"
@@ -63,6 +62,8 @@ const (
 	ActSetConfig   = "set-config"
 
 	ActRotateLogs = "rotate-logs"
+
+	ActReloadBackendCreds = "reload-creds"
 
 	ActShutdownCluster = "shutdown" // see also: ActShutdownNode
 
@@ -95,7 +96,6 @@ const (
 	ActKeepaliveUpdate = "keepalive-update"
 
 	// IC
-	ActSendOwnershipTbl  = "ic-send-own-tbl"
 	ActListenToNotif     = "watch-xaction"
 	ActMergeOwnershipTbl = "ic-merge-own-tbl"
 	ActRegGlobalXaction  = "reg-global-xaction"
@@ -103,11 +103,13 @@ const (
 
 // internal use
 const (
-	ActAddRemoteBck   = "add-remote-bck" // add to BMD existing remote bucket, usually on the fly
-	ActRmNodeUnsafe   = "rm-unsafe"      // primary => the node to be removed
-	ActStartGFN       = "start-gfn"      // get-from-neighbor
-	ActStopGFN        = "stop-gfn"       // off
-	ActCleanupMarkers = "cleanup-markers"
+	ActAddRemoteBck = "add-remote-bck"         // add to BMD existing remote bucket, usually on the fly
+	ActRmNodeUnsafe = "rm-unsafe"              // primary => the node to be removed
+	ActStartGFN     = "start-gfn"              // get-from-neighbor
+	ActStopGFN      = "stop-gfn"               // off
+	ActSelfRemove   = "self-initiated-removal" // e.g., when losing last mountpath
+	ActPrimaryForce = "primary-force"          // set primary with force (BEWARE! advanced usage only)
+	ActBumpMetasync = "bump-metasync"          // when executing ActPrimaryForce - the final step
 )
 
 const (
@@ -117,6 +119,9 @@ const (
 	ActMountpathDetach  = "detach-mp"
 	ActMountpathDisable = "disable-mp"
 
+	ActMountpathRescan = "rescan-mp"
+	ActMountpathFSHC   = "fshc-mp"
+
 	// Actions on xactions
 	ActXactStop  = Stop
 	ActXactStart = Start
@@ -125,7 +130,7 @@ const (
 	ActTransient = "transient" // transient - in-memory only
 )
 
-// xaction begin-commit phases and related control
+// xaction 2-phase commit and related control (compare w/ QparamPrepare)
 const (
 	ActBegin  = "begin"
 	ActCommit = "commit"
@@ -139,12 +144,18 @@ const (
 	NodeDecommission = "decommission"
 )
 
+const (
+	ActEcOpen    = "open-ec-streams"
+	ActEcClose   = "close-ec-streams"
+	ActEcRecover = "recover" // check and recover missing or corrupted EC metadata and/or slices, if any
+)
+
 // ActMsg is a JSON-formatted control structures used in a majority of API calls
 type (
 	ActMsg struct {
 		Value  any    `json:"value"`  // action-specific and optional
 		Action string `json:"action"` // ActShutdown, ActRebalance, and many more (see apc/const.go)
-		Name   string `json:"name"`   // action-specific name (e.g., bucket name)
+		Name   string `json:"name"`   // action-specific info of any kind (not necessarily "name")
 	}
 	ActValRmNode struct {
 		DaemonID          string `json:"sid"`

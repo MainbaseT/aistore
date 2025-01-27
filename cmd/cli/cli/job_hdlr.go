@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -15,6 +15,7 @@ import (
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/ext/dload"
@@ -25,22 +26,44 @@ import (
 	"github.com/urfave/cli"
 )
 
-const (
-	prefetchUsage = "prefetch one remote bucket, multiple remote buckets, or\n" +
-		indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
-		indent1 + "\t- 'prefetch gs://abc'\t- prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);\n" +
-		indent1 + "\t- 'prefetch gs:'\t- prefetch all visible/accessible GCP buckets;\n" +
-		indent1 + "\t- 'prefetch gs://abc --template images/'\t- prefetch all objects from the virtual subdirectory \"images\";\n" +
-		indent1 + "\t- 'prefetch gs://abc/images/'\t- same as above;\n" +
-		indent1 + "\t- 'prefetch gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- prefetch the matching range (prefix + brace expansion);\n" +
-		indent1 + "\t- 'prefetch \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
-)
+const prefetchUsage = "Prefetch one remote bucket, multiple remote buckets, or\n" +
+	indent1 + "selected objects in a given remote bucket or buckets, e.g.:\n" +
+	indent1 + "\t- 'prefetch gs://abc'\t- prefetch entire bucket (all gs://abc objects that are _not_ in-cluster);\n" +
+	indent1 + "\t- 'prefetch gs://abc --num-workers 32'\t- same as above with 32 concurrent (prefetching) workers;\n" +
+	indent1 + "\t- 'prefetch gs:'\t- prefetch all visible/accessible GCP buckets;\n" +
+	indent1 + "\t- 'prefetch gs: --num-workers=48'\t- same as above employing 48 workers;\n" +
+	indent1 + "\t- 'prefetch gs://abc --prefix images/'\t- prefetch all objects from the virtual subdirectory \"images\";\n" +
+	indent1 + "\t- 'prefetch gs://abc --template images/'\t- same as above;\n" +
+	indent1 + "\t- 'prefetch gs://abc/images/'\t- same as above;\n" +
+	indent1 + "\t- 'prefetch gs://abc --template \"shard-{0000..9999}.tar.lz4\"'\t- prefetch the matching range (prefix + brace expansion);\n" +
+	indent1 + "\t- 'prefetch \"gs://abc/shard-{0000..9999}.tar.lz4\"'\t- same as above (notice double quotes)"
+
+const blobDownloadUsage = "Run a job to download large object(s) from remote storage to aistore cluster, e.g.:\n" +
+	indent1 + "\t- 'blob-download s3://ab/largefile --chunk-size=2mb --progress'\t- download one blob at a given chunk size\n" +
+	indent1 + "\t- 'blob-download s3://ab --list \"f1, f2\" --num-workers=4 --progress'\t- run 4 concurrent readers to download 2 (listed) blobs\n" +
+	indent1 + "When _not_ using '--progress' option, run 'ais show job' to monitor."
+
+const resilverUsage = "Resilver user data on a given target (or all targets in the cluster); entails:\n" +
+	indent1 + "\t- fix data redundancy with respect to bucket configuration;\n" +
+	indent1 + "\t- remove migrated objects and old/obsolete workfiles."
+
+const stopUsage = "Terminate a single batch job or multiple jobs, e.g.:\n" +
+	indent1 + "\t- 'stop tco-cysbohAGL'\t- terminate a given (multi-object copy/transform) job identified by its unique ID;\n" +
+	indent1 + "\t- 'stop copy-listrange'\t- terminate all multi-object copies;\n" +
+	indent1 + "\t- 'stop copy-objects'\t- same as above (using display name);\n" +
+	indent1 + "\t- 'stop list'\t- stop all list-objects jobs;\n" +
+	indent1 + "\t- 'stop ls'\t- same as above;\n" +
+	indent1 + "\t- 'stop prefetch-listrange'\t- stop all prefetch jobs;\n" +
+	indent1 + "\t- 'stop prefetch'\t- same as above;\n" +
+	indent1 + "\t- 'stop g731 --force'\t- forcefully abort global rebalance g731 (advanced usage only);\n" +
+	indent1 + "\t- 'stop --all'\t- terminate all running jobs\n" +
+	indent1 + tabHelpOpt + "."
 
 // top-level job command
 var (
 	jobCmd = cli.Command{
 		Name:        commandJob,
-		Usage:       "monitor, query, start/stop and manage jobs and eXtended actions (xactions)",
+		Usage:       "Monitor, query, start/stop and manage jobs and eXtended actions (xactions)",
 		Subcommands: jobSub,
 	}
 	// NOTE: `appendJobSub` (below) expects jobSub[0] to be the `jobStartSub`
@@ -61,6 +84,9 @@ var (
 		nonverboseFlag,
 	}
 	startSpecialFlags = map[string][]cli.Flag{
+		commandRebalance: {
+			verbObjPrefixFlag,
+		},
 		cmdDownload: {
 			dloadTimeoutFlag,
 			descJobFlag,
@@ -81,16 +107,20 @@ var (
 		commandPrefetch: append(
 			listRangeProgressWaitFlags,
 			dryRunFlag,
-			verbObjPrefixFlag, // to disambiguate bucket/prefix vs bucket/objName
+			verbObjPrefixFlag,
 			latestVerFlag,
+			noRecursFlag, // (embedded prefix dopOLTP)
 			blobThresholdFlag,
+			yesFlag,
+			numListRangeWorkersFlag,
+			dontHeadRemoteFlag,
 		),
 		cmdBlobDownload: {
 			refreshFlag,
 			progressFlag,
 			listFlag,
 			chunkSizeFlag,
-			numWorkersFlag,
+			numBlobWorkersFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 			latestVerFlag,
@@ -103,12 +133,18 @@ var (
 		},
 	}
 
+	jobStartRebalance = cli.Command{
+		Name:      commandRebalance,
+		Usage:     "Rebalance ais cluster",
+		ArgsUsage: bucketEmbeddedPrefixArg,
+		Flags:     sortFlags(startSpecialFlags[commandRebalance]),
+		Action:    startRebHandler,
+	}
 	jobStartResilver = cli.Command{
-		Name: commandResilver,
-		Usage: "resilver user data on a given target (or all targets in the cluster): fix data redundancy\n" +
-			indent4 + "\twith respect to bucket configuration, remove migrated objects and old/obsolete workfiles",
+		Name:         commandResilver,
+		Usage:        resilverUsage,
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        startCommonFlags,
+		Flags:        sortFlags(startCommonFlags),
 		Action:       startResilverHandler,
 		BashComplete: suggestTargets,
 	}
@@ -117,60 +153,55 @@ var (
 		Name:         commandPrefetch,
 		Usage:        prefetchUsage,
 		ArgsUsage:    bucketObjectOrTemplateMultiArg,
-		Flags:        startSpecialFlags[commandPrefetch],
+		Flags:        sortFlags(startSpecialFlags[commandPrefetch]),
 		Action:       startPrefetchHandler,
 		BashComplete: bucketCompletions(bcmplop{multiple: true}),
 	}
 	blobDownloadCmd = cli.Command{
-		Name: cmdBlobDownload,
-		Usage: "run a job to download large object(s) from remote storage to aistore cluster, e.g.:\n" +
-			indent1 + "\t- 'blob-download s3://ab/largefile --chunk-size=2mb --progress'\t- download one blob at a given chunk size\n" +
-			indent1 + "\t- 'blob-download s3://ab --list \"f1, f2\" --num-workers=4 --progress'\t- use 4 concurrent readers to download each of the 2 blobs\n" +
-			indent1 + "When _not_ using '--progress' option, run 'ais show job' to monitor.",
+		Name:         cmdBlobDownload,
+		Usage:        blobDownloadUsage,
 		ArgsUsage:    objectArgument,
-		Flags:        startSpecialFlags[cmdBlobDownload],
+		Flags:        sortFlags(startSpecialFlags[cmdBlobDownload]),
 		Action:       blobDownloadHandler,
 		BashComplete: remoteBucketCompletions(bcmplop{multiple: true}),
 	}
 
 	jobStartSub = cli.Command{
 		Name:  commandStart,
-		Usage: "run batch job",
+		Usage: "Run batch job",
 		Subcommands: []cli.Command{
 			prefetchStartCmd,
 			blobDownloadCmd,
 			{
 				Name:      cmdDownload,
-				Usage:     "download files and objects from remote sources",
+				Usage:     "Download files and objects from remote sources",
 				ArgsUsage: startDownloadArgument,
-				Flags:     startSpecialFlags[cmdDownload],
+				Flags:     sortFlags(startSpecialFlags[cmdDownload]),
 				Action:    startDownloadHandler,
 			},
 			dsortStartCmd,
 			{
 				Name:         cmdLRU,
-				Usage:        "run LRU eviction",
-				Flags:        startSpecialFlags[cmdLRU],
+				Usage:        "Run LRU eviction",
+				Flags:        sortFlags(startSpecialFlags[cmdLRU]),
 				Action:       startLRUHandler,
 				BashComplete: bucketCompletions(bcmplop{}),
 			},
 			{
 				Name:  commandETL,
-				Usage: "start ETL",
+				Usage: "Start ETL",
 				Subcommands: []cli.Command{
 					initCmdETL,
 					objCmdETL,
 					bckCmdETL,
 				},
 			},
-			{
-				Name:   commandRebalance,
-				Usage:  "rebalance ais cluster",
-				Flags:  clusterCmdsFlags[commandStart],
-				Action: startClusterRebalanceHandler,
-			},
-			cleanupCmd,
+
+			jobStartRebalance,
 			jobStartResilver,
+
+			cleanupCmd,
+
 			// NOTE: append all `startableXactions`
 		},
 	}
@@ -181,18 +212,14 @@ var (
 	stopCmdsFlags = []cli.Flag{
 		allRunningJobsFlag,
 		regexJobsFlag,
+		forceFlag,
 		yesFlag,
 	}
 	jobStopSub = cli.Command{
-		Name: commandStop,
-		Usage: "terminate a single batch job or multiple jobs, e.g.:\n" +
-			indent1 + "\t- 'stop tco-cysbohAGL'\t- terminate a given job identified by its unique ID;\n" +
-			indent1 + "\t- 'stop copy-listrange'\t- terminate all multi-object copies;\n" +
-			indent1 + "\t- 'stop copy-objects'\t- same as above (using display name);\n" +
-			indent1 + "\t- 'stop --all'\t- terminate all running jobs\n" +
-			indent1 + strToSentence(tabHelpOpt),
+		Name:         commandStop,
+		Usage:        stopUsage,
 		ArgsUsage:    jobAnyArg,
-		Flags:        stopCmdsFlags,
+		Flags:        sortFlags(stopCmdsFlags),
 		Action:       stopJobHandler,
 		BashComplete: runningJobCompletions,
 	}
@@ -209,7 +236,7 @@ var (
 		Name:         commandWait,
 		Usage:        "wait for a specific batch job to complete (" + tabHelpOpt + ")",
 		ArgsUsage:    jobAnyArg,
-		Flags:        waitCmdsFlags,
+		Flags:        sortFlags(waitCmdsFlags),
 		Action:       waitJobHandler,
 		BashComplete: runningJobCompletions,
 	}
@@ -229,7 +256,7 @@ var (
 				Name:         cmdDownload,
 				Usage:        "remove finished download job(s)",
 				ArgsUsage:    optionalJobIDArgument,
-				Flags:        removeCmdsFlags,
+				Flags:        sortFlags(removeCmdsFlags),
 				Action:       removeDownloadHandler,
 				BashComplete: downloadIDFinishedCompletions,
 			},
@@ -237,15 +264,13 @@ var (
 				Name:         cmdDsort,
 				Usage:        "remove finished dsort job(s)",
 				ArgsUsage:    optionalJobIDArgument,
-				Flags:        removeCmdsFlags,
+				Flags:        sortFlags(removeCmdsFlags),
 				Action:       removeDsortHandler,
 				BashComplete: dsortIDFinishedCompletions,
 			},
 		},
 	}
 )
-
-func jobName(xname, xid string) string { return xname + "[" + xid + "]" }
 
 func appendJobSub(jobcmd *cli.Command) {
 	debug.Assert(jobcmd.Subcommands[0].Name == commandStart)
@@ -285,7 +310,7 @@ outer:
 		cmd := cli.Command{
 			Name:   xname,
 			Usage:  "start " + xname,
-			Flags:  startCommonFlags,
+			Flags:  sortFlags(startCommonFlags),
 			Action: startXactionHandler,
 		}
 		if xact.IsSameScope(xname, xact.ScopeB) { // with a single arg: bucket
@@ -365,9 +390,9 @@ func startXaction(c *cli.Context, xargs *xact.ArgsMsg, extra string) error {
 		return fmt.Errorf("%q requires bucket to run", xargs.Kind)
 	}
 
-	xid, err := api.StartXaction(apiBP, xargs, extra)
+	xid, err := xstart(c, xargs, extra)
 	if err != nil {
-		return V(err)
+		return err
 	}
 	if xid == "" {
 		warn := fmt.Sprintf("The operation returned an empty UUID (a no-op?). %s\n",
@@ -456,18 +481,21 @@ func startDownloadHandler(c *cli.Context) error {
 
 	// Heuristics to determine the download type.
 	var dlType dload.Type
-	if objectsListPath != "" {
+	switch {
+	case objectsListPath != "":
 		dlType = dload.TypeMulti
-	} else if strings.Contains(source.link, "{") && strings.Contains(source.link, "}") {
+	case strings.Contains(source.link, "{") && strings.Contains(source.link, "}"):
 		dlType = dload.TypeRange
-	} else if source.backend.bck.IsEmpty() {
+	case source.backend.bck.IsEmpty():
 		dlType = dload.TypeSingle
-	} else {
-		cfg, err := getRandTargetConfig(c)
+	default:
+		backends, err := api.GetConfiguredBackends(apiBP)
 		if err != nil {
 			return err
 		}
-		if _, ok := cfg.Backend.Providers[source.backend.bck.Provider]; ok { // backend is configured
+
+		switch {
+		case cos.StringInSlice(source.backend.bck.Provider, backends):
 			dlType = dload.TypeBackend
 
 			p, err := api.HeadBucket(apiBP, basePayload.Bck, false /* don't add */)
@@ -476,16 +504,16 @@ func startDownloadHandler(c *cli.Context) error {
 			}
 			if !p.BackendBck.Equal(&source.backend.bck) {
 				warn := fmt.Sprintf("%s does not have Cloud bucket %s as its *backend* - proceeding to download anyway.",
-					basePayload.Bck, source.backend.bck)
+					basePayload.Bck.String(), source.backend.bck.String())
 				actionWarn(c, warn)
 				dlType = dload.TypeSingle
 			}
-		} else if source.backend.prefix == "" {
+		case source.backend.prefix == "":
 			return fmt.Errorf(
 				"cluster is not configured with %q provider: cannot download remote bucket",
 				source.backend.bck.Provider,
 			)
-		} else {
+		default:
 			if source.link == "" {
 				return fmt.Errorf(
 					"cluster is not configured with %q provider: cannot download bucket's objects",
@@ -619,16 +647,18 @@ func bgDownload(c *cli.Context, id string) (err error) {
 		}
 	}
 
-	if resp.ErrorCnt != 0 {
+	switch {
+	case resp.ErrorCnt != 0:
 		msg := toShowMsg(c, id, "For details", true)
 		warn := fmt.Sprintf("%d of %d download jobs failed. %s", resp.ErrorCnt, resp.ScheduledCnt, msg)
 		actionWarn(c, warn)
-	} else if resp.FinishedTime.UnixNano() != 0 {
+	case resp.FinishedTime.UnixNano() != 0:
 		actionDownloaded(c, resp.FinishedCnt)
-	} else {
+	default:
 		msg := toMonitorMsg(c, id, flprn(progressFlag)+"'")
 		actionDone(c, msg)
 	}
+
 	return err
 }
 
@@ -664,7 +694,7 @@ func waitDownload(c *cli.Context, id string) (err error) {
 	return nil
 }
 
-func startLRUHandler(c *cli.Context) (err error) {
+func startLRUHandler(c *cli.Context) error {
 	if !flagIsSet(c, lruBucketsFlag) {
 		return startXactionHandler(c)
 	}
@@ -672,8 +702,8 @@ func startLRUHandler(c *cli.Context) (err error) {
 	if flagIsSet(c, forceFlag) {
 		warn := fmt.Sprintf("LRU eviction with %s option will evict buckets _ignoring_ their respective `lru.enabled` properties.",
 			qflprn(forceFlag))
-		if ok := confirm(c, "Would you like to continue?", warn); !ok {
-			return
+		if !confirm(c, "Would you like to continue?", warn) {
+			return nil
 		}
 	}
 
@@ -688,16 +718,14 @@ func startLRUHandler(c *cli.Context) (err error) {
 		buckets[idx] = bck
 	}
 
-	var (
-		id    string
-		xargs = xact.ArgsMsg{Kind: apc.ActLRU, Buckets: buckets, Force: flagIsSet(c, forceFlag)}
-	)
-	if id, err = api.StartXaction(apiBP, &xargs, ""); err != nil {
-		return
+	xargs := xact.ArgsMsg{Kind: apc.ActLRU, Buckets: buckets, Force: flagIsSet(c, forceFlag)}
+	xid, err := xstart(c, &xargs, "")
+	if err != nil {
+		return err
 	}
 
-	actionX(c, &xact.ArgsMsg{Kind: apc.ActLRU, ID: id}, "")
-	return
+	actionX(c, &xact.ArgsMsg{Kind: apc.ActLRU, ID: xid}, "")
+	return nil
 }
 
 //
@@ -722,25 +750,27 @@ func stopJobHandler(c *cli.Context) error {
 		actionWarn(c, warn)
 	}
 
-	regex := parseStrFlag(c, regexJobsFlag)
-
-	if xid != "" && (flagIsSet(c, allRunningJobsFlag) || regex != "") {
-		warn := fmt.Sprintf("in presence of %s argument ('%s') flags %s and %s will be ignored",
-			jobIDArgument, xid, qflprn(allRunningJobsFlag), qflprn(regexJobsFlag))
-		actionWarn(c, warn)
-	} else if xid == "" && (flagIsSet(c, allRunningJobsFlag) || regex != "") {
-		switch name {
-		case cmdDownload, cmdDsort:
-			// regex supported
-		case commandRebalance:
-			warn := fmt.Sprintf("global rebalance is global (ignoring %s and %s flags)",
-				qflprn(allRunningJobsFlag), qflprn(regexJobsFlag))
-			actionWarn(c, warn)
-		default:
-			if regex != "" {
-				warn := fmt.Sprintf("ignoring flag %s - "+NIY, qflprn(regexJobsFlag))
-				actionWarn(c, warn)
-			}
+	// warn
+	var (
+		warn  string
+		regex = parseStrFlag(c, regexJobsFlag)
+	)
+	switch {
+	case flagIsSet(c, allRunningJobsFlag) && regex != "":
+		warn = fmt.Sprintf("flags %s and %s", qflprn(allRunningJobsFlag), qflprn(regexJobsFlag))
+	case flagIsSet(c, allRunningJobsFlag):
+		warn = "flag " + qflprn(allRunningJobsFlag)
+	case regex != "":
+		warn = "option " + qflprn(regexJobsFlag)
+	}
+	if warn != "" {
+		switch {
+		case xid != "":
+			actionWarn(c, fmt.Sprintf("ignoring %s in presence of %s argument ('%s')", warn, jobIDArgument, xid))
+		case name == commandRebalance:
+			actionWarn(c, "global rebalance is _global_ - ignoring"+warn)
+		case regex != "" && name != cmdDownload && name != cmdDsort:
+			actionWarn(c, "ignoring "+warn+" -"+NIY)
 		}
 	}
 
@@ -763,7 +793,7 @@ func stopJobHandler(c *cli.Context) error {
 	if xactID == "" && name != "" {
 		if name != commandRebalance && !flagIsSet(c, yesFlag) && !flagIsSet(c, allRunningJobsFlag) {
 			prompt := fmt.Sprintf("Stop all '%s' jobs?", name)
-			if ok := confirm(c, prompt); !ok {
+			if !confirm(c, prompt) {
 				return nil
 			}
 		}
@@ -784,7 +814,11 @@ func stopJobHandler(c *cli.Context) error {
 	case commandETL:
 		return stopETLs(c, otherID /*etl name*/)
 	case commandRebalance:
-		return stopClusterRebalanceHandler(c)
+		if xid == "" {
+			return stopRebHandler(c)
+		} else {
+			return stopReb(c, xid)
+		}
 	}
 
 	// generic xstop
@@ -820,8 +854,8 @@ func stopJobHandler(c *cli.Context) error {
 
 	// call to abort
 	args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: bck}
-	if err := api.AbortXaction(apiBP, &args); err != nil {
-		return V(err)
+	if err := xstop(&args); err != nil {
+		return err
 	}
 	actionDone(c, fmt.Sprintf("Stopped %s\n", msg))
 	return nil
@@ -849,7 +883,7 @@ func stopXactionKindOrAll(c *cli.Context, xactKind, xname string, bck cmn.Bck) e
 			continue
 		}
 		args := xact.ArgsMsg{ID: xactID, Kind: xactKind, Bck: bck}
-		if err := api.AbortXaction(apiBP, &args); err != nil {
+		if err := xstop(&args); err != nil {
 			actionWarn(c, fmt.Sprintf("failed to stop %s: %v", cname, err))
 		} else {
 			actionDone(c, "Stopped "+cname)
@@ -1232,11 +1266,20 @@ func jobArgs(c *cli.Context, shift int, ignoreDaemonID bool) (name, xid, daemonI
 	daemonID = c.Args().Get(shift + 2)
 
 	// validate and reassign
-	if name != "" && name != apc.ActDsort {
-		if xactKind, _ := xact.GetKindName(name); xactKind == "" {
+	if name == commandCopy {
+		err = fmt.Errorf("'%s' is ambiguous and may correspond to copying multiple objects (%s) or entire bucket (%s)",
+			commandCopy, apc.ActCopyObjects, apc.ActCopyBck)
+		return
+	}
+	if name == commandList {
+		name = apc.ActList
+	} else if name != "" && name != apc.ActDsort {
+		if xactKind, xactName := xact.GetSimilar(name); xactKind == "" {
 			daemonID = xid
 			xid = name
 			name = ""
+		} else {
+			name = cos.Left(xactName, xactKind)
 		}
 	}
 	if xid != "" {

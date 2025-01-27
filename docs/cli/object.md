@@ -44,16 +44,19 @@ ls           promote      concat       evict        mv           cat
   - [Put a range of files](#put-a-range-of-files)
   - [Put a list of files](#put-a-list-of-files)
   - [Dry-Run option](#dry-run-option)
-  - [Put multiple directories](#put-multiple-directories)
+  - [Put multiple directories using Bash range notation](#put-multiple-directories-using-bash-range-notation)
+  - [Put multiple directories using filename-matching pattern (wildcard)](#put-multiple-directories-using-filename-matching-pattern-wildcard)
   - [Put multiple directories with the `--skip-vc` option](#put-multiple-directories-with-the-skip-vc-option)
+- [Tips for copying files from Lustre (NFS)](#tips-for-copying-files-from-lustre-nfs)
+- [Promote files and directories](#promote-files-and-directories)
 - [APPEND object](#append-object)
 - [Delete object](#delete-object)
+  - [Disambiguating multi-object operation](#disambiguating-multi-object-operation)
 - [Evict object](#evict-object)
-- [Promote files and directories](#promote-files-and-directories)
 - [Move object](#move-object)
 - [Concat objects](#concat-objects)
 - [Set custom properties](#set-custom-properties)
-- [Operations on Lists and Ranges](#operations-on-lists-and-ranges)
+- [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets)
   - [Prefetch objects](#prefetch-objects)
   - [Delete multiple objects](#delete-multiple-objects)
   - [Evict multiple objects](#evict-multiple-objects)
@@ -93,12 +96,18 @@ OPTIONS:
    --yes, -y            assume 'yes' to all questions
    --check-cached       check whether a given named object is present in cluster
                         (applies only to buckets with remote backend)
-   --latest             check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
-                        from the associated remote bucket:
-                        - provides operation-level control over object versioning (and version synchronization)
-                          without requiring to change bucket configuration
-                        - the latter can be done using 'ais bucket props set BUCKET versioning'
-                        - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
+
+   --latest             check in-cluster metadata and, possibly, GET, download, prefetch, or otherwise copy the latest object version
+                        from the associated remote bucket;
+                        the option provides operation-level control over object versioning (and version synchronization)
+                        without requiring to change the corresponding bucket configuration: 'versioning.validate_warm_get';
+                        see also:
+                          - 'ais show bucket BUCKET versioning'
+                          - 'ais bucket props set BUCKET versioning'
+                          - 'ais ls --check-versions'
+                        supported commands include:
+                          - 'ais cp', 'ais prefetch', 'ais get'
+
    --refresh value      interval for continuous monitoring;
                         valid time units: ns, us (or µs), ms, s (default), m, h
    --progress           show progress bar(s) and progress of execution in real time
@@ -510,9 +519,13 @@ OPTIONS:
    --refresh value     interval for continuous monitoring;
                        valid time units: ns, us (or µs), ms, s (default), m, h
    --chunk-size value  chunk size in IEC or SI units, or "raw" bytes (e.g.: 1MiB or 1048576; see '--units')
-   --conc value        limits number of concurrent put requests and number of concurrent shards created (default: 10)
+   --num-workers value number of concurrent client-side workers (to execute PUT or append requests);
+                       use (-1) to indicate single-threaded serial execution (ie., no workers);
+                       any positive value will be adjusted _not_ to exceed twice the number of client CPUs (default: 10)
+
    --dry-run           preview the results without really running the action
    --recursive, -r     recursive operation
+   --include-src-dir   prefix destination object names with the source directory
    --verbose, -v       verbose output
    --yes, -y           assume 'yes' to all questions
    --cont-on-err       keep running archiving xaction (job) in presence of errors in a any given multi-object transaction
@@ -853,16 +866,20 @@ $ ais put "~/dir/test{0..2}{0..2}.txt" ais://mybucket -y
 9 objects put into "ais://mybucket" bucket
 ```
 
-### Example 2. PUT a range of files into virtial directory
+### Example 2. PUT a range of files into a virtual directory
 
 Same as above but in addition destination object names will have additional prefix `subdir/` (notice the trailing `/`)
 
 In other words, this PUT in affect creates a **virtual directory** inside destination `ais://mybucket`
 
 ```bash
-# prep test files
+# first, prepare test files
 $ for d1 in {0..2}; do for d2 in {0..2}; do echo "0" > ~/dir/test${d1}${d2}.txt; done; done
+```
 
+Next, PUT:
+
+```console
 $ ais put "~/dir/test{0..2}{0..2}.txt" ais://mybucket/subdir/ -y
 ```
 
@@ -963,15 +980,69 @@ PUT /tmp/w/111 -> ais://nnn/fff111
 
 > Note: to PUT files into a virtual destination directory, use trailing '/', e.g.: `ais put ais://nnn/fff/ ...`
 
-## Put multiple directories
+## Put multiple directories using Bash range notation
 
-Put multiple directories into the cluster with range syntax.
+First, let's generate some files and directories (strictly for illustration purposes):
 
 ```bash
-$ for d1 in {0..10}; do mkdir dir$d1 && for d2 in {0..2}; do echo "0" > dir$d1/test${d2}.txt; done; done
-$ ais put "dir{0..10}" ais://mybucket -y
-33 objects put into "ais://mybucket" bucket
-# PUT "/home/user/dir0/test0.txt" => b/dir0/test0.txt and 32 more
+$ for d1 in {0..10}; do mkdir /tmp/testdir_$d1 && for d2 in {0..2}; do echo "0" > /tmp/testdir_$d1/test${d2}.txt; done; done
+```
+
+Next, PUT them all in one shot (notice quotation marks!):
+
+```bash
+$ ais put "/tmp/testdir_{0..10}" ais://nnn
+Files to upload:
+EXTENSION        COUNT   SIZE
+.txt             33      66B
+TOTAL            33      66B
+
+PUT 33 files (11 directories, non-recursive) => ais://nnn? [Y/N]:
+```
+
+Let's now take a look at the result - and observe a PROBLEM:
+
+```console
+$ ais ls ais://nnn --summary
+NAME             PRESENT         OBJECTS         SIZE (apparent, objects, remote)        USAGE(%)
+ais://nnn        yes             3 0             112.01KiB 6B 0B                         0%
+```
+
+So Yes, the problem is that by default destination object names are _sourced_ from the source file basenames.
+
+In this examples, we happen to have only **3** basenames: `test0.txt`, `test1.txt`, and `test2.txt`.
+
+The **workaround** is to include respective parent directories in the destination naming:
+
+> As always, see `ais put --help` for usage examples and more options.
+
+```console
+$ ais put "/tmp/testdir_{0..10}" ais://nnn --include-src-dir
+Files to upload:
+EXTENSION        COUNT   SIZE
+.txt             33      66B
+TOTAL            33      66B
+
+PUT 33 files (11 directories, non-recursive) => ais://nnn? [Y/N]: y
+Done
+
+$ ais ls ais://nnn --summary
+NAME             PRESENT         OBJECTS         SIZE (apparent, objects, remote)        USAGE(%)
+ais://nnn        yes             33 0            320.06KiB 66B 0B                        0%
+```
+
+## Put multiple directories using filename-matching pattern (wildcard)
+
+Same as above, but **note**: alternative syntax, which is maybe more conventional:
+
+```bash
+$ ais put "/tmp/testdir_*" ais://nnn --include-src-dir
+Files to upload:
+EXTENSION        COUNT   SIZE
+.txt             33      66B
+TOTAL            33      66B
+
+PUT 33 files (11 directories, non-recursive) => ais://nnn? [Y/N]:
 ```
 
 ## Put multiple directories with the `--skip-vc` option
@@ -979,14 +1050,126 @@ $ ais put "dir{0..10}" ais://mybucket -y
 > The `--skip-vc` option allows AIS to skip loading existing object's metadata to perform metadata-associated processing (such as comparing source and destination checksums, for instance). In certain scenarios (e.g., massive uploading of new files that cannot be present in the bucket) this can help reduce PUT latency.
 
 ```bash
-$ for d1 in {0..10}; do mkdir dir$d1 && for d2 in {0..2}; do echo "0" > dir$d1/test${d2}.txt; done; done
-$ ais put "dir{0..10}" ais://mybucket -y --skip-vc
+## prepare testing content
+$ for d1 in {0..10}; do mkdir /tmp/testdir_$d1 && for d2 in {0..2}; do echo "0" > /tmp/testdir_$d1/test${d2}.txt; done; done
+
+## PUT
+$ ais put ""/tmp/testdir_{0..10}"" ais://mybucket -y --skip-vc
 
 Files to upload:
 EXTENSION        COUNT   SIZE
 .txt             33      66B
 TOTAL            33      66B
 ```
+
+# Tips for Copying Files from Lustre (NFS)
+
+Yes, `ais put` can be used to copy remote files - usage tips follow below. Buf first, disclaimer.
+
+## Disclaimer
+
+> Copying large amounts of data from remote (NFS, SMB) locations is not exactly an exercise for a single client machine. There are alternative designed-in [ways](https://aistore.nvidia.com/blog/2022/03/17/promote), whereby all AIStore nodes _partition_ remote source between themselves and do the copying - in parallel.
+
+Performance-wise, the difference from copying via client (or by client) - is two-fold:
+
+1. many orders of magnitude greater horsepower that AIStore can contribute to the effort, and
+2. avoidance of the (client <= NFS) and (client => AIStore) roundtrips.
+
+Needless to say, _promoting_ files to objects, as it were, requires that all AIS nodes have connectivity and permissions to access the remote source.
+
+Further references:
+
+* [`ais promote` command](#promote-files-and-directories)
+* [blog: promoting local and shared files](https://aistore.nvidia.com/blog/2022/03/17/promote)
+
+## Tips
+
+1. **Use `--retries` option**
+
+Including `--retries` in your command will help resolve an occasional timeout and other intermittent failures. For example, `--retries 5` will retry a failed requests up to 5 (five) times.
+
+```console
+$ ais put --help
+...
+
+   --retries value      when failing to PUT retry the operation up to so many times (with increasing timeout if timed out) (default: 1)
+```
+
+2. **Use `--num-workers` option**
+
+In other words, take advantage of the client side multi-threading. If you have sufficient resources, increase this number to allow more workers to transfer data in parallel.
+
+```console
+$ ais put --help
+...
+
+   --num-workers value  number of concurrent client-side workers (to execute PUT or append requests);
+                        use (-1) to indicate single-threaded serial execution (ie., no workers);
+                        any positive value will be adjusted _not_ to exceed twice the number of client CPUs (default: 10)
+```
+
+### Example 1
+
+Recursively copy the contents of (NFS-mounted) `target_dir/` to the `ais://nnn/target_dir/` bucket, using 64 client workers (OS threads) and retrying failed requests up to 3 times.
+
+```console
+$ ais object put -r -y --num-workers 64 --retries 3 target_dir/ ais://nnn/target_dir/
+```
+
+### Example 2
+
+Same as above (and notice `ais put` shortcut and `--include-src-dir` option):
+
+```console
+$ ais put target_dir ais://nnn -r -y --num-workers 64 --retries 3 --include-src-dir
+```
+
+### Example 3
+
+Same as above, but with additional capability to "continue on error" - skip errors that may arise when traversing the source tree:
+
+```console
+$ ais put target_dir ais://nnn --recursive --yes --num-workers 64 --retries 3 --include-src-dir --cont-on-err
+```
+
+### Example 4
+
+Same as above, but in addition ask CLI to report all errors that may be skipped or ignored due to the `--cont-on-err` flag:
+
+```console
+$ ais config cli verbose
+PROPERTY         VALUE
+verbose          false
+
+$ ais config cli set verbose true
+"verbose" set to: "true" (was: "false")
+
+$ ais put target_dir ais://nnn --recursive --yes --num-workers 64 --retries 3 --include-src-dir --cont-on-err
+```
+
+
+3. **Patience**
+
+Be patient: copying from remote locations is subject to network and remote servers' delays, both.
+
+Also and separately, note that at the time of this writing AIS CLI does not support _pagination_ of the remote directories that _may_ contain millions of entries. Listing of the entire remote source is (currently) done in one shot, and prior to copying.
+
+If `ais put` process seems to have paused, there's a good chance it is still listing remote files or copying in the background.
+
+Refrain from pressing `Ctrl-C` to interrupt it.
+
+4. **When your destination bucket is S3 or similar**
+
+Waiting time may be even greater if you are copying data to an AIStore `s3://`, `gs://`, or `az://` bucket. AIS uses write-through, so the same data is written to the remote backend and locally as one atomic transaction.
+
+5. Finally, try to transition to **WebDataset formatting**
+
+Copying, or generally, working in any shape and form with many (millions of) small files comes with significant and unavoidable overhead, both networking and storage-wise.
+
+Use our `ishard` tool to convert and serialize your data using the preferred formatting (a.k.a. WebDataset convention):
+
+* [`ishard` readme](https://github.com/NVIDIA/aistore/blob/main/cmd/ishard/README.md)
+* [`ishard` blog](https://aistore.nvidia.com/blog/2024/08/16/ishard)
 
 # Promote files and directories
 
@@ -1137,11 +1320,92 @@ version          3
 
 # Delete object
 
-`ais object rm BUCKET/[OBJECT_NAME]...`
-
 Delete an object or list/range of objects from the bucket.
 
-* For multi-object delete operation, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+```console
+NAME:
+   ais object rm - remove object or selected objects from the specified bucket, or buckets - e.g.:
+     - 'rm ais://nnn --all'                                   - remove all objects from the bucket ais://nnn;
+     - 'rm s3://abc' --all                                    - remove all objects including those that are not _present_ in the cluster;
+     - 'rm gs://abc --prefix images/'                         - remove all objects from the virtual subdirectory "images";
+     - 'rm gs://abc/images/'                                  - same as above;
+     - 'rm gs://abc --template images/'                       - same as above;
+     - 'rm gs://abc --template "shard-{0000..9999}.tar.lz4"'  - remove the matching range (prefix + brace expansion);
+     - 'rm "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes)
+
+USAGE:
+   ais object rm [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
+
+OPTIONS:
+   --list value           comma-separated list of object or file names, e.g.:
+                          --list 'o1,o2,o3'
+                          --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                          or, when listing files and/or directories:
+                          --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value       template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                          (with optional steps and gaps), e.g.:
+                          --template "" # (an empty or '*' template matches eveything)
+                          --template 'dir/subdir/'
+                          --template 'shard-{1000..9999}.tar'
+                          --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                          and similarly, when specifying files and directories:
+                          --template '/home/dir/subdir/'
+                          --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait                 wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value        maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                          valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress             show progress bar(s) and progress of execution in real time
+   --refresh value        time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                          valid time units: ns, us (or µs), ms, s (default), m, h
+   --prefix value         select objects that have names starting with the specified prefix, e.g.:
+                          '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+   --all                  remove all objects (use it with extreme caution!)
+   --verbose, -v          verbose output
+   --non-verbose, --nv    non-verbose (quiet) output, minimized reporting, fewer warnings
+   --non-recursive, --nr  list objects without including nested virtual subdirectories
+   --yes, -y              assume 'yes' to all questions
+   --help, -h             show help
+```
+
+> For multi-object delete operation, see also [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
+
+## Disambiguating multi-object operation
+
+Let's say, in its initial state the bucket consists of:
+
+```console
+$ ais ls s3://mybucket
+NAME                                     SIZE            CACHED
+README.md                                16.26KiB        no
+aaa                                      16.26KiB        yes
+aaa/bbb/111                              16.26KiB        no
+aaa/bbb/ccc/README.md                    5.09KiB         no
+...
+```
+
+**Notice** that `aaa` here is both an object and a virtual directory.
+
+That's why:
+
+```console
+$ ais rmo s3://mybucket/aaa
+Error: part of the URI "aaa" can be interpreted as an object name and/or mutli-object matching prefix
+(Tip:  to disambiguate, use either '--non-recursive' or '--prefix')
+```
+
+And so, as per the Tip (above), we can go ahead and disambiguate one way or another, e.g.:
+
+```console
+$ ais rmo s3://mybucket/aaa --nr
+deleted "aaa" from s3://mybucket
+
+$ ais ls s3://mybucket
+NAME                                     SIZE            CACHED
+README.md                                16.26KiB        no
+aaa/bbb/111                              16.26KiB        no
+aaa/bbb/ccc/README.md                    5.09KiB         no
+...
+```
 
 ## Delete a single object
 
@@ -1163,16 +1427,63 @@ obj2.tgz deleted from aws://cloudbck bucket
 ```
 
 * NOTE: for each space-separated object name CLI sends a separate request.
-* For multi-object delete that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+* For multi-object delete that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
 
 # Evict object
 
-`ais bucket evict BUCKET/[OBJECT_NAME]...`
+```console
+NAME:
+   ais object evict - evict one remote bucket, multiple remote buckets, or
+   selected objects in a given remote bucket or buckets, e.g.:
+     - 'evict gs://abc'                                          - evict entire bucket (all gs://abc objects in aistore);
+     - 'evict gs:'                                               - evict all GCP buckets from the cluster;
+     - 'evict gs://abc --prefix images/'                         - evict all gs://abc objects from the virtual subdirectory "images";
+     - 'evict gs://abc/images/'                                  - same as above;
+     - 'evict gs://abc --template images/'                       - same as above;
+     - 'evict gs://abc --template "shard-{0000..9999}.tar.lz4"'  - evict the matching range (prefix + brace expansion);
+     - 'evict "gs://abc/shard-{0000..9999}.tar.lz4"'             - same as above (notice double quotes)
+
+USAGE:
+   ais object evict [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
+
+OPTIONS:
+   --list value           comma-separated list of object or file names, e.g.:
+                          --list 'o1,o2,o3'
+                          --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                          or, when listing files and/or directories:
+                          --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value       template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                          (with optional steps and gaps), e.g.:
+                          --template "" # (an empty or '*' template matches eveything)
+                          --template 'dir/subdir/'
+                          --template 'shard-{1000..9999}.tar'
+                          --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                          and similarly, when specifying files and directories:
+                          --template '/home/dir/subdir/'
+                          --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait                 wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value        maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                          valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress             show progress bar(s) and progress of execution in real time
+   --refresh value        time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                          valid time units: ns, us (or µs), ms, s (default), m, h
+   --keep-md              keep bucket metadata
+   --prefix value         select objects that have names starting with the specified prefix, e.g.:
+                          '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+                          '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+   --dry-run              preview the results without really running the action
+   --non-recursive, --nr  list objects without including nested virtual subdirectories
+   --verbose, -v          verbose output
+   --non-verbose, --nv    non-verbose (quiet) output, minimized reporting, fewer warnings
+   --help, -h             show help
+
+```
 
 [Evict](/docs/bucket.md#prefetchevict-objects) object(s) from a bucket that has [remote backend](/docs/bucket.md).
 
 * NOTE: for each space-separated object name CLI sends a separate request.
-* For multi-object eviction that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges](#operations-on-lists-and-ranges) below.
+* For multi-object eviction that operates on a `--list` or `--template`, please see: [Operations on Lists and Ranges (and entire buckets)](#operations-on-lists-and-ranges-and-entire-buckets) below.
+* Similar to delete, prefetch and copy operations, `evict` also supports embedded prefix - see [disambiguating multi-object operation](#disambiguating-multi-object-operation)
 
 ## Evict a single object
 
@@ -1286,7 +1597,7 @@ version          1
 
 Note the flag `--props=all` used to show _all_ object's properties including the custom ones, if available.
 
-# Operations on Lists and Ranges
+# Operations on Lists and Ranges (and entire buckets)
 
 Generally, multi-object operations are supported in 2 different ways:
 
@@ -1309,8 +1620,10 @@ $ ais prefetch --help
 NAME:
    ais prefetch - (alias for "object prefetch") prefetch one remote bucket, multiple remote buckets, or
    selected objects in a given remote bucket or buckets, e.g.:
-     - 'prefetch gs://abc'                                          - prefetch entire bucket (all gs://abc objects that are _not_ present in the cluster);
+     - 'prefetch gs://abc'                                          - prefetch entire bucket (all gs://abc objects that are _not_ in-cluster);
+     - 'prefetch gs://abc --num-workers 32'                         - same as above with 32 concurrent (prefetching) workers;
      - 'prefetch gs:'                                               - prefetch all visible/accessible GCP buckets;
+     - 'prefetch gs: --num-workers=48'                              - same as above employing 48 workers;
      - 'prefetch gs://abc --template images/'                       - prefetch all objects from the virtual subdirectory "images";
      - 'prefetch gs://abc/images/'                                  - same as above;
      - 'prefetch gs://abc --template "shard-{0000..9999}.tar.lz4"'  - prefetch the matching range (prefix + brace expansion);
@@ -1320,43 +1633,56 @@ USAGE:
    ais prefetch [command options] BUCKET[/OBJECT_NAME_or_TEMPLATE] [BUCKET[/OBJECT_NAME_or_TEMPLATE] ...]
 
 OPTIONS:
-   --list value      comma-separated list of object or file names, e.g.:
-                     --list 'o1,o2,o3'
-                     --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
-                     or, when listing files and/or directories:
-                     --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
-   --template value  template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
-                     (with optional steps and gaps), e.g.:
-                     --template "" # (an empty or '*' template matches eveything)
-                     --template 'dir/subdir/'
-                     --template 'shard-{1000..9999}.tar'
-                     --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
-                     and similarly, when specifying files and directories:
-                     --template '/home/dir/subdir/'
-                     --template "/abc/prefix-{0010..9999..2}-suffix"
-   --wait            wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
-   --timeout value   maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --progress        show progress bar(s) and progress of execution in real time
-   --refresh value   interval for continuous monitoring;
-                     valid time units: ns, us (or µs), ms, s (default), m, h
-   --dry-run         preview the results without really running the action
-   --prefix value    select objects that have names starting with the specified prefix, e.g.:
-                     '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
-                     '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
-   --latest          check in-cluster metadata and, possibly, GET, download, prefetch, or copy the latest object version
-                     from the associated remote bucket:
-                      - provides operation-level control over object versioning (and version synchronization)
-                        without requiring to change bucket configuration
-                      - the latter can be done using 'ais bucket props set BUCKET versioning'
-                      - see also: 'ais ls --check-versions', 'ais cp', 'ais prefetch', 'ais get'
-   --help, -h        show help
+   --list value            comma-separated list of object or file names, e.g.:
+                           --list 'o1,o2,o3'
+                           --list "abc/1.tar, abc/1.cls, abc/1.jpeg"
+                           or, when listing files and/or directories:
+                           --list "/home/docs, /home/abc/1.tar, /home/abc/1.jpeg"
+   --template value        template to match object or file names; may contain prefix (that could be empty) with zero or more ranges
+                           (with optional steps and gaps), e.g.:
+                           --template "" # (an empty or '*' template matches eveything)
+                           --template 'dir/subdir/'
+                           --template 'shard-{1000..9999}.tar'
+                           --template "prefix-{0010..0013..2}-gap-{1..2}-suffix"
+                           and similarly, when specifying files and directories:
+                           --template '/home/dir/subdir/'
+                           --template "/abc/prefix-{0010..9999..2}-suffix"
+   --wait                  wait for an asynchronous operation to finish (optionally, use '--timeout' to limit the waiting time)
+   --timeout value         maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                           valid time units: ns, us (or µs), ms, s (default), m, h
+   --progress              show progress bar(s) and progress of execution in real time
+   --refresh value         time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                           valid time units: ns, us (or µs), ms, s (default), m, h
+   --dry-run               preview the results without really running the action
+
+   --prefix value          select objects that have names starting with the specified prefix, e.g.:
+                           '--prefix a/b/c'   - matches names 'a/b/c/d', 'a/b/cdef', and similar;
+                           '--prefix a/b/c/'  - only matches objects from the virtual directory a/b/c/
+
+   --latest                check in-cluster metadata and, possibly, GET, download, prefetch, or otherwise copy the latest object version
+                           from the associated remote bucket;
+                           the option provides operation-level control over object versioning (and version synchronization)
+                           without requiring to change the corresponding bucket configuration: 'versioning.validate_warm_get';
+                           see also:
+                             - 'ais show bucket BUCKET versioning'
+                             - 'ais bucket props set BUCKET versioning'
+                             - 'ais ls --check-versions'
+                           supported commands include:
+                             - 'ais cp', 'ais prefetch', 'ais get'
+
+   --blob-threshold value  utilize built-in blob-downloader for remote objects greater than the specified (threshold) size
+                           in IEC or SI units, or "raw" bytes (e.g.: 4mb, 1MiB, 1048576, 128k; see '--units')
+   --num-workers value     number of concurrent workers (readers); defaults to a number of target mountpaths if omitted or zero;
+                           (-1) is a special value indicating no workers at all (ie., single-threaded execution);
+                           any positive value will be adjusted _not_ to exceed the number of target CPUs (default: 0)
+   --help, -h              show help
 ```
 
 Note usage examples above. You can always run `--help` option to see the most recently updated inline help.
 
 ### See also
 * [Prefetch/Evict objects](/docs/bucket.md#prefetchevict-objects)
+* Similar to delete, evict and copy operations, `prefetch`also supports embedded prefix - see [disambiguating multi-object operation](#disambiguating-multi-object-operation)
 
 ### Example: prefetch using prefix
 
@@ -1491,6 +1817,10 @@ Shards created: 999/999 [=======================================================
 $ ais object rm ais://dsort-testing --template 'shard-{900..999}.tar'
 removed from ais://dsort-testing objects in the range "shard-{900..999}.tar", use 'ais job show xaction EH291ljOy' to monitor the progress
 ```
+
+### See also:
+
+To fully synchronize in-cluster content with remote backend, please refer to [out of band updates](/docs/out_of_band.md)
 
 ## Evict multiple objects
 

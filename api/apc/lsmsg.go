@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -56,8 +56,8 @@ const (
 	// * `QparamDontAddRemote` (this package)
 	LsDontAddRemote
 
-	// cache list-objects results and use this cache to speed-up
-	UseListObjsCache
+	// Deprecated
+	_useListObjsCache //nolint:unused // Kept for backward compatibility.
 
 	// For remote buckets - list only remote props (aka `wantOnlyRemote`). When false,
 	// the default that's being used is: `WantOnlyRemoteProps` - see below.
@@ -70,17 +70,15 @@ const (
 	// See related feature flag: feat.DontOptimizeVirtualDir
 	LsNoRecursion
 
-	// For remote metadata-capable buckets (ie., bck.HasVersioningMD() == true):
-	// - check whether remote version exists,
-	// and if it does:
-	// - check whether remote version differs from its in-cluster copy
-	LsVerChanged
+	// Bidirectional (remote <-> in-cluster) diff requires remote metadata-capable (`HasVersioningMD`) buckets;
+	// it entails:
+	// - checking whether remote version exists,
+	//   and if it does,
+	// - checking whether it differs from its in-cluster copy.
+	// See related `cmn.LsoEnt` flags: `EntryVerChanged` and `EntryVerRemoved`, respectively.
+	LsDiff
 
-	// Do not return virtual subdirectories.
-	// Background:
-	// Currently,    `list-objects(ais://BUCKET)` never returns virtual subdirectories - while,
-	// for instance, `list-objects(aws://BUCKET)` MAY return the latter.
-	// To prevent this from happening, specify LsNoDirs flag.
+	// Do not return virtual subdirectories - do not include them as `cmn.LsoEnt` entries
 	LsNoDirs
 )
 
@@ -91,15 +89,16 @@ const (
 	MaxPageSizeAWS   = 1000
 	MaxPageSizeGCP   = 1000
 	MaxPageSizeAzure = 5000
+	MaxPageSizeOCI   = 1000
 )
 
 const (
-	// Status
+	// location _status_
 	LocOK = iota
 	LocMisplacedNode
 	LocMisplacedMountpath
 	LocIsCopy
-	LocIsCopyMissingObj
+	LocIsCopyMissingObj // missing "main replica"
 
 	// LsoEntry Flags
 	EntryIsCached   = 1 << (EntryStatusBits + 1)
@@ -108,6 +107,8 @@ const (
 	EntryIsArchive  = 1 << (EntryStatusBits + 4)
 	EntryVerChanged = 1 << (EntryStatusBits + 5) // see also: QparamLatestVer, et al.
 	EntryVerRemoved = 1 << (EntryStatusBits + 6) // ditto
+	// added v3.26
+	EntryHeadFail = 1 << (EntryStatusBits + 7)
 )
 
 // ObjEntry.Flags field
@@ -145,6 +146,7 @@ var (
 )
 
 type LsoMsg struct {
+	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 	UUID              string      `json:"uuid"`                  // ID to identify a single multi-page request
 	Props             string      `json:"props"`                 // comma-delimited, e.g. "checksum,size,custom" (see GetProps* enum)
 	TimeFormat        string      `json:"time_format,omitempty"` // RFC822 is the default
@@ -154,7 +156,6 @@ type LsoMsg struct {
 	SID               string      `json:"target"`                // selected target to solely execute backend.list-objects
 	Flags             uint64      `json:"flags,string"`          // enum {LsObjCached, ...} - "LsoMsg flags" above
 	PageSize          int64       `json:"pagesize"`              // max entries returned by list objects call
-	Header            http.Header `json:"hdr,omitempty"`         // (for pointers, see `ListArgs` in api/ls.go)
 }
 
 ////////////
@@ -207,6 +208,45 @@ func (lsmsg *LsoMsg) PropsSet() (s cos.StrSet) {
 		s.Set(p)
 	}
 	return s
+}
+
+func (lsmsg *LsoMsg) Str(cname string) string {
+	var sb strings.Builder
+	sb.Grow(80)
+
+	sb.WriteString(cname)
+	if lsmsg.Props != "" {
+		sb.WriteString(", props:")
+		sb.WriteString(lsmsg.Props)
+	}
+	if lsmsg.Flags == 0 {
+		return sb.String()
+	}
+
+	sb.WriteString(", flags:")
+	if lsmsg.IsFlagSet(LsObjCached) {
+		sb.WriteString("cached,")
+	}
+	if lsmsg.IsFlagSet(LsMissing) {
+		sb.WriteString("missing,")
+	}
+	if lsmsg.IsFlagSet(LsArchDir) {
+		sb.WriteString("arch,")
+	}
+	if lsmsg.IsFlagSet(LsBckPresent) {
+		sb.WriteString("bck-present,")
+	}
+	if lsmsg.IsFlagSet(LsDontAddRemote) {
+		sb.WriteString("skip-lookup,")
+	}
+	if lsmsg.IsFlagSet(LsNoRecursion) {
+		sb.WriteString("no-recurs,")
+	}
+	if lsmsg.IsFlagSet(LsDiff) {
+		sb.WriteString("diff,")
+	}
+	s := sb.String()
+	return s[:len(s)-1]
 }
 
 // LsoMsg flags enum: LsObjCached, ...

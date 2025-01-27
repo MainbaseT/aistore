@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that control running jobs in the cluster.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -20,7 +20,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/ext/etl"
-	"github.com/fatih/color"
 	"github.com/urfave/cli"
 )
 
@@ -58,21 +57,23 @@ var (
 			etlBucketRequestTimeout,
 			listFlag,
 			templateFlag,
+			numListRangeWorkersFlag,
 			verbObjPrefixFlag,
 			// TODO: progressFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 		},
-		cmdStart: {},
+		cmdStart:      {},
+		commandRemove: {},
 	}
 	showCmdETL = cli.Command{
 		Name:   commandShow,
-		Usage:  "show ETL(s)",
+		Usage:  "Show ETL(s)",
 		Action: etlListHandler,
 		Subcommands: []cli.Command{
 			{
 				Name:      cmdDetails,
-				Usage:     "show ETL details",
+				Usage:     "Show ETL details",
 				ArgsUsage: etlNameArgument,
 				Action:    etlShowDetailsHandler,
 			},
@@ -80,56 +81,64 @@ var (
 	}
 	stopCmdETL = cli.Command{
 		Name:         cmdStop,
-		Usage:        "stop ETL",
+		Usage:        "Stop ETL",
 		ArgsUsage:    etlNameListArgument,
 		Action:       etlStopHandler,
 		BashComplete: etlIDCompletions,
-		Flags:        etlSubFlags[cmdStop],
+		Flags:        sortFlags(etlSubFlags[cmdStop]),
 	}
 	startCmdETL = cli.Command{
 		Name:         cmdStart,
-		Usage:        "start ETL",
+		Usage:        "Start ETL",
 		ArgsUsage:    etlNameArgument,
 		Action:       etlStartHandler,
 		BashComplete: etlIDCompletions,
-		Flags:        etlSubFlags[cmdStart],
+		Flags:        sortFlags(etlSubFlags[cmdStart]),
+	}
+	removeCmdETL = cli.Command{
+		Name:         commandRemove,
+		Usage:        "Remove ETL",
+		ArgsUsage:    etlNameArgument,
+		Action:       etlRemoveHandler,
+		BashComplete: etlIDCompletions,
+		Flags:        sortFlags(etlSubFlags[commandRemove]),
 	}
 	initCmdETL = cli.Command{
 		Name:  cmdInit,
-		Usage: "start ETL job: 'spec' job (requires pod yaml specification) or 'code' job (with transforming function or script in a local file)",
+		Usage: "Start ETL job: 'spec' job (requires pod yaml specification) or 'code' job (with transforming function or script in a local file)",
 		Subcommands: []cli.Command{
 			{
 				Name:   cmdSpec,
-				Usage:  "start ETL job with YAML Pod specification",
-				Flags:  etlSubFlags[cmdSpec],
+				Usage:  "Start ETL job with YAML Pod specification",
+				Flags:  sortFlags(etlSubFlags[cmdSpec]),
 				Action: etlInitSpecHandler,
 			},
 			{
 				Name:   cmdCode,
-				Usage:  "start ETL job using the specified transforming function or script",
-				Flags:  etlSubFlags[cmdCode],
+				Usage:  "Start ETL job using the specified transforming function or script",
+				Flags:  sortFlags(etlSubFlags[cmdCode]),
 				Action: etlInitCodeHandler,
 			},
 		},
 	}
 	objCmdETL = cli.Command{
 		Name:         cmdObject,
-		Usage:        "transform object",
+		Usage:        "Transform object",
 		ArgsUsage:    etlNameArgument + " " + objectArgument + " OUTPUT",
 		Action:       etlObjectHandler,
 		BashComplete: etlIDCompletions,
 	}
 	bckCmdETL = cli.Command{
 		Name:         cmdBucket,
-		Usage:        "transform entire bucket or selected objects (to select, use '--list', '--template', or '--prefix')",
+		Usage:        "Transform entire bucket or selected objects (to select, use '--list', '--template', or '--prefix')",
 		ArgsUsage:    etlNameArgument + " " + bucketObjectSrcArgument + " " + bucketDstArgument,
 		Action:       etlBucketHandler,
-		Flags:        etlSubFlags[cmdBucket],
+		Flags:        sortFlags(etlSubFlags[cmdBucket]),
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{etlIDCompletions}, 1, 2),
 	}
 	logsCmdETL = cli.Command{
 		Name:         cmdViewLogs,
-		Usage:        "view ETL logs",
+		Usage:        "View ETL logs",
 		ArgsUsage:    etlNameArgument + " " + optionalTargetIDArgument,
 		Action:       etlLogsHandler,
 		BashComplete: etlIDCompletions,
@@ -137,13 +146,14 @@ var (
 	// subcommands
 	etlCmd = cli.Command{
 		Name:  commandETL,
-		Usage: "execute custom transformations on objects",
+		Usage: "Execute custom transformations on objects",
 		Subcommands: []cli.Command{
 			initCmdETL,
 			showCmdETL,
 			logsCmdETL,
 			startCmdETL,
 			stopCmdETL,
+			removeCmdETL,
 			objCmdETL,
 			bckCmdETL,
 		},
@@ -319,7 +329,7 @@ func etlList(c *cli.Context, caption bool) (int, error) {
 	}
 	if caption {
 		onlyActive := !flagIsSet(c, allJobsFlag)
-		jobCptn(c, commandETL, onlyActive, "", false)
+		jobCptn(c, commandETL, "" /*xid*/, "" /*ctlmsg*/, onlyActive, false)
 	}
 
 	hideHeader := flagIsSet(c, noHeaderFlag)
@@ -440,21 +450,29 @@ func etlStartHandler(c *cli.Context) (err error) {
 	}
 	etlName := c.Args()[0]
 	if err := api.ETLStart(apiBP, etlName); err != nil {
-		if herr, ok := err.(*cmn.ErrHTTP); ok && herr.Status == http.StatusNotFound {
-			color.New(color.FgYellow).Fprintf(c.App.Writer, "ETL[%s] not found", etlName)
-		}
 		return V(err)
 	}
 	fmt.Fprintf(c.App.Writer, "ETL[%s] started successfully\n", etlName)
 	return nil
 }
 
-func etlObjectHandler(c *cli.Context) error {
+func etlRemoveHandler(c *cli.Context) (err error) {
 	if c.NArg() == 0 {
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 1 {
+	}
+	etlName := c.Args()[0]
+	if err := api.ETLDelete(apiBP, etlName); err != nil {
+		return V(err)
+	}
+	fmt.Fprintf(c.App.Writer, "ETL[%s] successfully deleted\n", etlName)
+	return nil
+}
+
+func etlObjectHandler(c *cli.Context) error {
+	switch c.NArg() {
+	case 0, 1:
 		return missingArgumentsError(c, c.Command.ArgsUsage)
-	} else if c.NArg() == 2 {
+	case 2:
 		return missingArgumentsError(c, "OUTPUT")
 	}
 
@@ -469,11 +487,12 @@ func etlObjectHandler(c *cli.Context) error {
 	}
 
 	var w io.Writer
-	if outputDest == "-" {
+	switch {
+	case outputDest == "-":
 		w = os.Stdout
-	} else if discardOutput(outputDest) {
+	case discardOutput(outputDest):
 		w = io.Discard
-	} else {
+	default:
 		f, err := os.Create(outputDest)
 		if err != nil {
 			return err

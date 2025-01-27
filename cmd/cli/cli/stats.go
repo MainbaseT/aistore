@@ -96,6 +96,13 @@ func isRebalancing(tstatusMap teb.StstMap) bool {
 }
 
 func checkVersionWarn(c *cli.Context, role string, mmc []string, stmap teb.StstMap) bool {
+	const fmtEmptyVer = "empty version from %s (in maintenance mode?)"
+
+	longParams := getLongRunParams(c)
+	if longParams != nil && longParams.iters > 0 {
+		return false // already warned once, nothing to do
+	}
+
 	expected := mmc[0] + versionSepa + mmc[1]
 	minc, err := strconv.Atoi(mmc[1])
 	if err != nil {
@@ -106,7 +113,10 @@ func checkVersionWarn(c *cli.Context, role string, mmc []string, stmap teb.StstM
 	}
 	for _, ds := range stmap {
 		if ds.Version == "" {
-			warn := fmt.Sprintf("empty version from %s (in maintenance mode?)", ds.Node.Snode.StringEx())
+			if ds.Node.Snode.InMaintOrDecomm() {
+				continue
+			}
+			warn := fmt.Sprintf(fmtEmptyVer, ds.Node.Snode.StringEx())
 			actionWarn(c, warn)
 			continue
 		}
@@ -140,6 +150,14 @@ func checkVersionWarn(c *cli.Context, role string, mmc []string, stmap teb.StstM
 			// ditto
 			var cnt int
 			for _, ds2 := range stmap {
+				if ds2.Node.Snode.InMaintOrDecomm() {
+					continue
+				}
+				if ds2.Version == "" {
+					warn := fmt.Sprintf(fmtEmptyVer, ds2.Node.Snode.StringEx())
+					actionWarn(c, warn)
+					continue
+				}
 				if ds.Node.Snode.ID() != ds2.Node.Snode.ID() {
 					mmx2 := strings.Split(ds2.Version, versionSepa)
 					minx2, _ := strconv.Atoi(mmx2[1])
@@ -179,6 +197,7 @@ func verWarn(c *cli.Context, snode *meta.Snode, role, version, expected string, 
 		warn = fmt.Sprintf("node %s%s run%s aistore software version %s, which may not be fully compatible with the CLI (expecting v%s)",
 			sname, s1, s2, version, expected)
 	}
+
 	actionWarn(c, warn+"\n")
 }
 
@@ -213,7 +232,7 @@ func _addStatus(node *meta.Snode, mu *sync.Mutex, out teb.StstMap) {
 	mu.Unlock()
 }
 
-// [backward compatibility] v3.22
+// NOTE: [backward compatibility] v3.22
 func _status(node *meta.Snode) (ds *stats.NodeStatus, err error) {
 	ds, err = api.GetStatsAndStatus(apiBP, node)
 	if err == nil || !strings.Contains(err.Error(), "what=node_status") {
@@ -235,14 +254,14 @@ func _status(node *meta.Snode) (ds *stats.NodeStatus, err error) {
 	}
 	ds.Node.Snode = v.NodeV322.Snode
 	ds.Node.Tracker = v.NodeV322.Tracker
-	ds.Node.TargetCDF.PctMax = v.NodeV322.TargetCDF.PctMax
-	ds.Node.TargetCDF.PctAvg = v.NodeV322.TargetCDF.PctAvg
-	ds.Node.TargetCDF.PctMin = v.NodeV322.TargetCDF.PctMin
-	ds.Node.TargetCDF.CsErr = v.NodeV322.TargetCDF.CsErr
-	ds.Node.TargetCDF.Mountpaths = make(map[string]*fs.CDF, len(v.NodeV322.TargetCDF.Mountpaths))
+	ds.Node.Tcdf.PctMax = v.NodeV322.Tcdf.PctMax
+	ds.Node.Tcdf.PctAvg = v.NodeV322.Tcdf.PctAvg
+	ds.Node.Tcdf.PctMin = v.NodeV322.Tcdf.PctMin
+	ds.Node.Tcdf.CsErr = v.NodeV322.Tcdf.CsErr
+	ds.Node.Tcdf.Mountpaths = make(map[string]*fs.CDF, len(v.NodeV322.Tcdf.Mountpaths))
 
 	var used, avail uint64
-	for mpath, cdfv322 := range v.NodeV322.TargetCDF.Mountpaths {
+	for mpath, cdfv322 := range v.NodeV322.Tcdf.Mountpaths {
 		cdf := &fs.CDF{}
 		cdf.Capacity = cdfv322.Capacity
 		used += cdf.Capacity.Used
@@ -254,10 +273,10 @@ func _status(node *meta.Snode) (ds *stats.NodeStatus, err error) {
 				cdf.FS.FsType = cdfv322.FS[i+1 : j]
 			}
 		}
-		ds.Node.TargetCDF.Mountpaths[mpath] = cdf
+		ds.Node.Tcdf.Mountpaths[mpath] = cdf
 	}
-	ds.Node.TargetCDF.TotalUsed = used
-	ds.Node.TargetCDF.TotalAvail = avail
+	ds.Node.Tcdf.TotalUsed = used
+	ds.Node.Tcdf.TotalAvail = avail
 	return ds, nil
 }
 

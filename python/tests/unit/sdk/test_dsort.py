@@ -18,7 +18,8 @@ from aistore.sdk.const import (
 )
 from aistore.sdk.dsort import Dsort, DsortFramework, DsortShardsGroup, DsortAlgorithm
 from aistore.sdk.dsort.types import DsortMetrics, JobInfo
-from aistore.sdk.dsort.ekm import ExternalKeyMap, EKM_ORDER_FILE_NAME
+from aistore.sdk.dsort.ekm import ExternalKeyMap, EKM_FILE_NAME
+from aistore.sdk.provider import Provider
 from aistore.sdk.multiobj import ObjectNames, ObjectRange
 
 from aistore.sdk.types import BucketModel
@@ -116,13 +117,13 @@ class TestDsort(unittest.TestCase):
         self.mock_client.request.return_value = mock_request_return_val
 
         input_shards = DsortShardsGroup(
-            bck=BucketModel(name="input_bucket"),
+            bck=BucketModel(name="input_bucket", provider=Provider.AIS.value),
             role="input",
             format=ObjectRange("input-", 0, 99),
             extension="txt",
         )
         output_shards = DsortShardsGroup(
-            bck=BucketModel(name="output_bucket"),
+            bck=BucketModel(name="output_bucket", provider=Provider.AIS.value),
             role="output",
             format=ObjectRange("output-", 0, 99),
             extension="txt",
@@ -142,14 +143,14 @@ class TestDsort(unittest.TestCase):
             HTTP_METHOD_POST, path=URL_PATH_DSORT, json=dsort_framework.to_spec()
         )
 
-    @patch("aistore.sdk.object.Object.get_url")
+    @patch("aistore.sdk.obj.object.Object.get_url")
     def test_start_from_framework_with_ekm(self, mock_get_url):
         new_id = "789"
         mock_request_return_val = Mock(text=new_id)
         self.mock_client.request.return_value = mock_request_return_val
 
         input_shards = DsortShardsGroup(
-            bck=BucketModel(name="input_bucket"),
+            bck=BucketModel(name="input_bucket", provider=Provider.AIS.value),
             role="input",
             format=ObjectRange("input-", 0, 99),
             extension="txt",
@@ -181,7 +182,7 @@ class TestDsort(unittest.TestCase):
         )
 
         output_shards = DsortShardsGroup(
-            bck=BucketModel(name="output_bucket"),
+            bck=BucketModel(name="output_bucket", provider=Provider.AIS.value),
             role="output",
             format=ekm,
             extension="txt",
@@ -193,23 +194,23 @@ class TestDsort(unittest.TestCase):
             algorithm=DsortAlgorithm(),
             description="Test description",
         )
-        ekm_url = f"{URL_PATH_OBJECTS}/input_bucket/{ EKM_ORDER_FILE_NAME }"
+        ekm_url = f"{URL_PATH_OBJECTS}/input_bucket/{ EKM_FILE_NAME }"
         mock_get_url.return_value = ekm_url
 
         res = self.dsort.start(dsort_framework)
         self.assertEqual(new_id, res)
         self.assertEqual(new_id, self.dsort.dsort_id)
         spec = dsort_framework.to_spec()
-        spec["order_file"] = ekm_url
-        spec["order_file_sep"] = ""
+        spec["ekm_file"] = ekm_url
+        spec["ekm_file_sep"] = ""
 
-        # Ensure object.put_content and dsort.start are called
+        # Ensure object.get_writer().put_content and dsort.start are called
         self.mock_client.request.assert_has_calls(
             [
                 call(
                     HTTP_METHOD_PUT,
                     path=ekm_url,
-                    params={"provider": "ais"},
+                    params={"provider": Provider.AIS.value},
                     data=json.dumps(ekm.as_dict()).encode("utf-8"),
                 ),
                 call(HTTP_METHOD_POST, path=URL_PATH_DSORT, json=spec),
@@ -380,13 +381,13 @@ class TestDsort(unittest.TestCase):
 
     def test_to_spec(self):
         input_shards = DsortShardsGroup(
-            bck=BucketModel(name="input_bucket"),
+            bck=BucketModel(name="input_bucket", provider=Provider.AIS.value),
             role="input",
             format=ObjectRange("input-", 0, 99),
             extension="txt",
         )
         output_shards = DsortShardsGroup(
-            bck=BucketModel(name="output_bucket"),
+            bck=BucketModel(name="output_bucket", provider=Provider.AIS.value),
             role="output",
             format=ObjectRange("output-", 0, 99),
             extension="txt",

@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -86,20 +86,40 @@ func MakeRangeHdr(start, length int64) string {
 	return fmt.Sprintf("%s%d-%d", cos.HdrRangeValPrefix, start, start+length-1)
 }
 
+// Ref: https://www.rfc-editor.org/rfc/rfc7233#section-4.2
+func ParseRangeHdr(contentRange string) (start, length, objectSize int64, err error) {
+	var (
+		end int64
+		n   int
+	)
+	n, err = fmt.Sscanf(contentRange, "bytes %d-%d/%d", &start, &end, &objectSize)
+	if n != 3 {
+		err = fmt.Errorf("contentRange (\"%s\") malformed", contentRange)
+		return
+	}
+	length = end + 1 - start
+	return
+}
+
 // ParseURL splits URL path at "/" and matches resulting items against the specified, if any.
 // - splitAfter == true:  strings.Split() the entire path;
 // - splitAfter == false: strings.SplitN(len(itemsPresent)+itemsAfter)
 // Returns all items that follow the specified `items`.
+
+const maxItems = 1000
+
 func ParseURL(path string, itemsPresent []string, itemsAfter int, splitAfter bool) ([]string, error) {
+	// path.Clean(string) reduced to this:
+	for path != "" && path[0] == '/' {
+		path = path[1:]
+	}
+
 	var (
 		split []string
 		l     = len(itemsPresent)
 	)
-	if path != "" && path[0] == '/' {
-		path = path[1:] // remove leading slash
-	}
 	if splitAfter {
-		split = strings.Split(path, "/")
+		split = strings.SplitN(path, "/", maxItems)
 	} else {
 		split = strings.SplitN(path, "/", l+max(1, itemsAfter))
 	}
@@ -132,7 +152,7 @@ func ParseURL(path string, itemsPresent []string, itemsAfter int, splitAfter boo
 func ReadBytes(r *http.Request) (b []byte, err error) {
 	var e error
 
-	b, e = io.ReadAll(r.Body)
+	b, e = cos.ReadAllN(r.Body, r.ContentLength)
 	if e != nil {
 		err = fmt.Errorf("failed to read %s request, err: %v", r.Method, e)
 		if e == io.EOF {
@@ -204,7 +224,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 	for hardErrCnt, softErrCnt, iter = uint(0), uint(0), uint(1); ; iter++ {
 		if status, err = args.Call(); err == nil {
 			if args.Verbosity == RetryLogVerbose && (hardErrCnt > 0 || softErrCnt > 0) {
-				nlog.Warningf("%s Successful %s after (soft/hard errors: %d/%d, last: %v)",
+				nlog.Warningf("%s successful %s after (soft/hard errors: %d/%d, last: %v)",
 					callerStr, args.Action, softErrCnt, hardErrCnt, nonEmptyErr)
 			}
 			return
@@ -215,7 +235,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 			return
 		}
 		if args.Verbosity == RetryLogVerbose {
-			nlog.Errorf("%s Failed to %s, iter %d, err: %v(%d)", callerStr, args.Action, iter, err, status)
+			nlog.Errorf("%s failed to %s, iter %d, err: %v(%d)", callerStr, args.Action, iter, err, status)
 		}
 		if cos.IsRetriableConnErr(err) {
 			softErrCnt++
@@ -236,7 +256,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 	}
 	// Quiet: print once the summary (Verbose: no need)
 	if args.Verbosity == RetryLogQuiet {
-		nlog.Errorf("%sFailed to %s (soft/hard errors: %d/%d, last: %v)",
+		nlog.Errorf("%sfailed to %s (soft/hard errors: %d/%d, last: %v)",
 			callerStr, args.Action, softErrCnt, hardErrCnt, err)
 	}
 	return

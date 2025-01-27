@@ -1,11 +1,12 @@
 // Package xs is a collection of eXtended actions (xactions), including multi-object
 // operations, list-objects, (cluster) rebalance and (target) resilver, ETL, and more.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package xs
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -79,8 +80,13 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 	r = &XactNsumm{p: p}
 
 	r.totalDiskSize = fs.GetDiskSize()
+	if r.totalDiskSize < cos.KiB {
+		err = fmt.Errorf("invalid disk size (%d bytes)", r.totalDiskSize)
+		debug.AssertNoErr(err)
+		return nil, err
+	}
 
-	listRemote := p.Bck.IsCloud() && !p.msg.ObjCached
+	listRemote := lsoIsRemote(p.Bck, p.msg.ObjCached)
 	if listRemote {
 		var (
 			smap = core.T.Sowner().Get()
@@ -112,6 +118,9 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 		nb := len(opts.Buckets)
 		switch nb {
 		case 0:
+			if p.Bck.IsEmpty() {
+				return r, errors.New("no buckets in the cluster, nothing to do")
+			}
 			return r, fmt.Errorf("no buckets matching %q", p.Bck.Bucket())
 		case 1:
 			// change of mind: single result-set even though spec-ed as qbck
@@ -131,21 +140,25 @@ func newSumm(p *nsummFactory) (r *XactNsumm, err error) {
 		}
 	}
 
-	r.BckJog.Init(p.UUID(), p.Kind(), p.Bck, opts, cmn.GCO.Get())
+	ctlmsg := p.msg.Str(p.Bck.Cname(p.msg.Prefix))
+	r.BckJog.Init(p.UUID(), p.Kind(), ctlmsg, p.Bck, opts, cmn.GCO.Get())
 
-	s := fmt.Sprintf("-msg-%+v", r.p.msg)
-	r._nam = r.Base.Name() + s
-	r._str = r.Base.String() + s
+	r._nam = r.Base.Name() + "-" + ctlmsg
+	r._str = r.Base.String() + "-" + ctlmsg
 	return r, nil
 }
 
 func (r *XactNsumm) Run(started *sync.WaitGroup) {
 	started.Done()
-	nlog.Infoln(r.Name(), r.p.Bck.Cname(""))
-
 	var (
+		bname    string
 		rwg, lwg cos.WG
 	)
+	if !r.p.Bck.IsEmpty() {
+		bname = r.p.Bck.Cname("")
+	}
+	nlog.Infoln(r.Name(), bname)
+
 	// (I) remote
 	if r.listRemote {
 		// _this_ target to list-and-summ remote pages, in parallel
@@ -181,7 +194,6 @@ func (r *XactNsumm) Run(started *sync.WaitGroup) {
 			wg.Done()
 		}(lwg)
 	} else {
-		debug.Assert(len(r.buckets) > 1)
 		lwg = cos.NewLimitedWaitGroup(sys.NumCPU(), len(r.buckets))
 		for _, bck := range r.buckets {
 			res, ok := r.mapRes[bck.Props.BID]
@@ -265,9 +277,9 @@ func (r *XactNsumm) Snap() (snap *core.Snap) {
 
 func (r *XactNsumm) Result() (cmn.AllBsummResults, error) {
 	if r.single {
-		var res cmn.BsummResult
-		r.cloneRes(&res, &r.oneRes)
-		return cmn.AllBsummResults{&res}, r.Err()
+		var dst cmn.BsummResult
+		r.cloneRes(&dst, &r.oneRes)
+		return cmn.AllBsummResults{&dst}, r.Err()
 	}
 
 	all := make(cmn.AllBsummResults, 0, len(r.mapRes))
@@ -291,17 +303,17 @@ func (r *XactNsumm) cloneRes(dst, src *cmn.BsummResult) {
 		dst.TotalSize.RemoteObjs = ratomic.LoadUint64(&src.TotalSize.RemoteObjs)
 	}
 
-	dst.ObjSize.Min = ratomic.LoadInt64(&src.ObjSize.Min)
-	if dst.ObjSize.Min == math.MaxInt64 {
-		dst.ObjSize.Min = 0
-	}
 	dst.ObjSize.Max = ratomic.LoadInt64(&src.ObjSize.Max)
-
+	dst.ObjSize.Min = ratomic.LoadInt64(&src.ObjSize.Min)
+	if dst.ObjSize.Max > 0 {
+		dst.ObjSize.Min = min(dst.ObjSize.Min, dst.ObjSize.Max)
+	}
 	// compute the current (maybe, running-and-changing) average and used %%
 	if dst.ObjCount.Present > 0 {
 		dst.ObjSize.Avg = int64(cos.DivRoundU64(dst.TotalSize.PresentObjs, dst.ObjCount.Present))
 	}
-	debug.Assert(r.totalDiskSize == src.TotalSize.Disks)
+	debug.Assert(r.totalDiskSize == src.TotalSize.Disks || (src.TotalSize.Disks == 0 && cmn.Rom.TestingEnv()),
+		r.totalDiskSize, " vs ", src.TotalSize.Disks)
 	dst.TotalSize.Disks = r.totalDiskSize
 	dst.UsedPct = cos.DivRoundU64(dst.TotalSize.OnDisk*100, r.totalDiskSize)
 }
@@ -340,9 +352,9 @@ func (r *XactNsumm) runCloudBck(bck *meta.Bck, res *cmn.BsummResult) {
 	lsmsg := &apc.LsoMsg{Props: apc.GetPropsSize, Prefix: r.p.msg.Prefix}
 	lsmsg.SetFlag(apc.LsNameSize | apc.LsNoDirs)
 	for !r.IsAborted() {
-		npg := newNpgCtx(bck, lsmsg, noopCb, nil) // TODO -- FIXME: inventory offset
+		npg := newNpgCtx(bck, lsmsg, noopCb, nil) // TODO: inventory offset
 		nentries := allocLsoEntries()
-		lst, err := npg.nextPageR(nentries, false /*load LOMs to include status and local MD*/)
+		lst, err := npg.nextPageR(nentries)
 		if err != nil {
 			r.AddErr(err)
 			return

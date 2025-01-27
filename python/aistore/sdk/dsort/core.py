@@ -14,10 +14,11 @@ from aistore.sdk.const import (
     DSORT_UUID,
 )
 from aistore.sdk.dsort.framework import DsortFramework
-from aistore.sdk.dsort.ekm import ExternalKeyMap, EKM_ORDER_FILE_NAME
+from aistore.sdk.dsort.ekm import ExternalKeyMap, EKM_FILE_NAME
 from aistore.sdk.dsort.types import JobInfo
 from aistore.sdk.bucket import Bucket
 from aistore.sdk.errors import Timeout
+from aistore.sdk.request_client import RequestClient
 from aistore.sdk.utils import validate_file, probing_frequency
 
 
@@ -26,7 +27,7 @@ class Dsort:
     Class for managing jobs for the dSort extension: https://github.com/NVIDIA/aistore/blob/main/docs/cli/dsort.md
     """
 
-    def __init__(self, client: "Client", dsort_id: str = ""):
+    def __init__(self, client: RequestClient, dsort_id: str = ""):
         self._client = client
         self._dsort_id = dsort_id
 
@@ -55,17 +56,17 @@ class Dsort:
             dsort_framework = spec
             spec = dsort_framework.to_spec()
 
-            # If output format is an ExternalKeyMap, generate and PUT the order file before starting dsort
+            # If output format is an ExternalKeyMap, generate and PUT the ekm file before starting dsort
             output_format = dsort_framework.output_shards.format
             if isinstance(output_format, ExternalKeyMap):
                 input_bck_name = dsort_framework.input_shards.bck.name
                 input_bck = Bucket(name=input_bck_name, client=self._client)
-                order_file_obj = input_bck.object(EKM_ORDER_FILE_NAME)
-                order_file_obj.put_content(
+                ekm_file_obj = input_bck.object(EKM_FILE_NAME)
+                ekm_file_obj.get_writer().put_content(
                     json.dumps(output_format.as_dict()).encode("utf-8")
                 )
-                spec["order_file"] = order_file_obj.get_url()
-                spec["order_file_sep"] = ""
+                spec["ekm_file"] = ekm_file_obj.get_url()
+                spec["ekm_file_sep"] = ""
         else:
             raise ValueError("spec must be a Path or a DsortFramework instance")
 

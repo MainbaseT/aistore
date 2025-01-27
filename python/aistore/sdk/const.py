@@ -7,6 +7,7 @@ HEADER_ACCEPT = "Accept"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_CONTENT_LENGTH = "Content-Length"
+HEADER_LOCATION = "Location"
 # Standard Header Values
 USER_AGENT_BASE = "ais/python"
 JSON_CONTENT_TYPE = "application/json"
@@ -17,6 +18,13 @@ AIS_CHECKSUM_VALUE = "ais-checksum-value"
 AIS_ACCESS_TIME = "ais-atime"
 AIS_VERSION = "ais-version"
 AIS_CUSTOM_MD = "ais-custom-md"
+AIS_BCK_NAME = "ais-bucket-name"
+AIS_BCK_PROVIDER = "ais-bucket-provider"
+AIS_OBJ_NAME = "ais-name"
+AIS_LOCATION = "ais-location"
+AIS_MIRROR_PATHS = "ais-mirror-paths"
+AIS_MIRROR_COPIES = "ais-mirror-copies"
+AIS_PRESENT = "ais-present"
 # Bucket Props Header keys
 HEADER_PREFIX = "ais-"
 HEADER_BUCKET_PROPS = HEADER_PREFIX + "bucket-props"
@@ -30,6 +38,8 @@ HEADER_OBJECT_BLOB_WORKERS = HEADER_PREFIX + "blob-workers"
 HEADER_OBJECT_APPEND_HANDLE = "ais-append-handle"
 # Ref: https://www.rfc-editor.org/rfc/rfc7233#section-2.1
 HEADER_RANGE = "Range"
+# AuthN Headers
+HEADER_AUTHORIZATION = "Authorization"
 
 # URL Params
 # See api/apc/query.go
@@ -51,6 +61,7 @@ QPARAM_OBJ_APPEND_HANDLE = "append_handle"
 DSORT_UUID = "uuid"
 QPARAM_UUID = "uuid"
 QPARAM_LATEST = "latest-ver"
+QPARAM_NEW_CUSTOM = "set-new-custom"
 
 # URL Param values
 # See api/apc/query.go
@@ -72,14 +83,11 @@ URL_PATH_ETL = "etl"
 URL_PATH_DSORT = "sort"
 URL_PATH_REVERSE = "reverse"
 DSORT_ABORT = "abort"
-
-# Bucket providers
-# See api/apc/provider.go
-PROVIDER_AIS = "ais"
-PROVIDER_AMAZON = "aws"
-PROVIDER_AZURE = "azure"
-PROVIDER_GOOGLE = "gcp"
-PROVIDER_HTTP = "ht"
+# AuthN
+URL_PATH_AUTHN_USERS = "users"
+URL_PATH_AUTHN_CLUSTERS = "clusters"
+URL_PATH_AUTHN_ROLES = "roles"
+URL_PATH_AUTHN_TOKENS = "tokens"
 
 # HTTP Methods
 HTTP_METHOD_GET = "get"
@@ -87,6 +95,7 @@ HTTP_METHOD_POST = "post"
 HTTP_METHOD_DELETE = "delete"
 HTTP_METHOD_PUT = "put"
 HTTP_METHOD_HEAD = "head"
+HTTP_METHOD_PATCH = "patch"
 
 # Actions
 # See api/apc/actmsg.go
@@ -125,9 +134,18 @@ STATUS_ACCEPTED = 202
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
 STATUS_PARTIAL_CONTENT = 206
+STATUS_REDIRECT_TMP = 307
+STATUS_REDIRECT_PERM = 301
+
+# Protocol
+HTTP = "http://"
+HTTPS = "https://"
 
 # Environment Variables
-AIS_SERVER_CRT = "AIS_SERVER_CRT"
+AIS_CLIENT_CA = "AIS_CLIENT_CA"
+AIS_AUTHN_TOKEN = "AIS_AUTHN_TOKEN"
+AIS_CLIENT_CRT = "AIS_CRT"
+AIS_CLIENT_KEY = "AIS_CRT_KEY"
 
 # Content Constants
 LOREM = (
@@ -145,3 +163,11 @@ DUIS = (
 
 # AWS Constants
 AWS_DEFAULT_REGION = "us-east-1"
+
+# Time constants
+NANOSECONDS_IN_SECOND = 1_000_000_000
+
+DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s: %(message)s"
+
+# Ref: https://www.rfc-editor.org/rfc/rfc7233#section-2.1
+BYTE_RANGE_PREFIX_LENGTH = 6

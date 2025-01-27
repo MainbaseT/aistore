@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/NVIDIA/aistore/tools/tlog"
 )
 
 var (
@@ -28,7 +30,7 @@ func CheckFatal(tb testing.TB, err error) {
 	mu.Lock()
 	if _, ok := fatalities[tb.Name()]; ok {
 		mu.Unlock()
-		fmt.Printf("--- %s: duplicate CheckFatal: %v\n", tb.Name(), err) // see #1057
+		tlog.Logf("--- %s: duplicate CheckFatal: %v\n", tb.Name(), err) // see #1057
 		runtime.Goexit()
 	} else {
 		fatalities[tb.Name()] = struct{}{}
@@ -59,17 +61,31 @@ func DoAndCheckResp(tb testing.TB, client *http.Client, req *http.Request, statu
 	Errorf(tb, false, "expected %v status code, got %d", statusCode, resp.StatusCode)
 }
 
-func Fatalf(tb testing.TB, cond bool, msg string, args ...any) {
+func Fatal(tb testing.TB, cond bool, msg string) {
 	if !cond {
 		printStack()
-		tb.Fatalf(msg, args...)
+		tb.Fatal(msg)
 	}
 }
 
-func Errorf(tb testing.TB, cond bool, msg string, args ...any) {
+func Fatalf(tb testing.TB, cond bool, format string, args ...any) {
 	if !cond {
 		printStack()
-		tb.Errorf(msg, args...)
+		tb.Fatalf(format, args...)
+	}
+}
+
+func Error(tb testing.TB, cond bool, msg string) {
+	if !cond {
+		printStack()
+		tb.Error(msg, msg)
+	}
+}
+
+func Errorf(tb testing.TB, cond bool, format string, args ...any) {
+	if !cond {
+		printStack()
+		tb.Errorf(format, args...)
 	}
 }
 

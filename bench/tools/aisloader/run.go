@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 // AIS loader (aisloader) is a tool to measure storage performance. It's a load
@@ -27,7 +27,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -275,7 +274,10 @@ func Start(version, buildtime string) (err error) {
 			return fmt.Errorf("failed to get cluster map: %v", err)
 		}
 	}
-	loggedUserToken = authn.LoadToken(runParams.tokenFile)
+	loggedUserToken, err = authn.LoadToken(runParams.tokenFile)
+	if err != nil && runParams.tokenFile != "" {
+		return err
+	}
 	runParams.bp.Token = loggedUserToken
 	runParams.bp.UA = ua
 
@@ -297,13 +299,14 @@ func Start(version, buildtime string) (err error) {
 	}
 
 	// list objects, or maybe not
-	if created {
+	switch {
+	case created:
 		if runParams.putPct < 100 {
 			return errors.New("new bucket, expecting 100% PUT")
 		}
 		bucketObjsNames = &namegetter.RandomNameGetter{}
 		bucketObjsNames.Init([]string{}, rnd)
-	} else if !runParams.getConfig && !runParams.skipList {
+	case !runParams.getConfig && !runParams.skipList:
 		if err := listObjects(); err != nil {
 			return err
 		}
@@ -316,8 +319,8 @@ func Start(version, buildtime string) (err error) {
 			return errors.New("no objects with prefix '" + runParams.subDir + "' in the bucket, cannot run 100% read benchmark")
 		}
 
-		fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigNum(objsLen), cos.Plural(objsLen))
-	} else {
+		fmt.Printf("Found %s existing object%s\n\n", cos.FormatBigInt(objsLen), cos.Plural(objsLen))
+	default:
 		bucketObjsNames = &namegetter.RandomNameGetter{}
 		bucketObjsNames.Init([]string{}, rnd)
 	}
@@ -332,7 +335,7 @@ func Start(version, buildtime string) (err error) {
 		if !runParams.bck.IsAIS() {
 			v = "emptied"
 		}
-		fmt.Printf("BEWARE: cleanup is enabled, bucket %s will be %s upon termination!\n", runParams.bck, v)
+		fmt.Printf("BEWARE: cleanup is enabled, bucket %s will be %s upon termination!\n", runParams.bck.String(), v)
 		time.Sleep(time.Second)
 	}
 
@@ -352,7 +355,7 @@ func Start(version, buildtime string) (err error) {
 	// empty config to use memsys constants;
 	// alternatively: "memsys": { "min_free": "2gb", ... }
 	hk.Init()
-	go hk.DefaultHK.Run()
+	go hk.HK.Run()
 	hk.WaitStarted()
 
 	config := &cmn.Config{}
@@ -583,8 +586,11 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 		"when true, generate object names of 32 random characters. This option is ignored when loadernum is defined")
 	f.BoolVar(&p.randomProxy, "randomproxy", false,
 		"when true, select random gateway (\"proxy\") to execute I/O request")
-	f.StringVar(&p.subDir, "subdir", "", "when writing: virtual destination directory for all aisloader-generated objects;\n"+
-		"when listing: list objects with names that have the specified prefix (that may or may not be a virtual directory")
+	f.StringVar(&p.subDir, "subdir", "", "For GET requests, '-subdir' is a prefix that may or may not be an actual _virtual directory_;\n"+
+		"For PUTs, '-subdir' is a virtual destination directory for all aisloader-generated objects;\n"+
+		"See also:\n"+
+		"\t- closely related CLI '--prefix' option: "+cmn.GitHubHome+"/blob/main/docs/cli/object.md\n"+
+		"\t- virtual directories:                   "+cmn.GitHubHome+"/blob/main/docs/howto_virt_dirs.md")
 	f.Uint64Var(&p.putShards, "putshards", 0, "spread generated objects over this many subdirectories (max 100k)")
 	f.BoolVar(&p.uniqueGETs, "uniquegets", true,
 		"when true, GET objects randomly and equally. Meaning, make sure *not* to GET some objects more frequently than the others")
@@ -638,7 +644,7 @@ func addCmdLine(f *flag.FlagSet, p *params) {
 func _init(p *params) (err error) {
 	// '--s3endpoint' takes precedence
 	if s3Endpoint == "" {
-		if ep := os.Getenv(env.AWS.Endpoint); ep != "" {
+		if ep := os.Getenv(env.AWSEndpoint); ep != "" {
 			s3Endpoint = ep
 		}
 	}
@@ -816,7 +822,7 @@ func _init(p *params) (err error) {
 		if err != nil {
 			return err
 		}
-		etlSpec, err := io.ReadAll(fh)
+		etlSpec, err := cos.ReadAll(fh)
 		fh.Close()
 		if err != nil {
 			return err
@@ -893,11 +899,11 @@ func _init(p *params) (err error) {
 		aisEndpoint := "http://" + ip + ":" + port
 
 		// see also: tlsArgs
-		envEndpoint = os.Getenv(env.AIS.Endpoint)
+		envEndpoint = os.Getenv(env.AisEndpoint)
 		if envEndpoint != "" {
 			if ip != "" && ip != defaultClusterIP && ip != defaultClusterIPv4 {
 				return fmt.Errorf("'%s=%s' environment and '--ip=%s' command-line are mutually exclusive",
-					env.AIS.Endpoint, envEndpoint, ip)
+					env.AisEndpoint, envEndpoint, ip)
 			}
 			aisEndpoint = envEndpoint
 		}
@@ -921,7 +927,7 @@ func _init(p *params) (err error) {
 	if useHTTPS {
 		// environment to override client config
 		cmn.EnvToTLS(&sargs)
-		p.bp.Client = cmn.NewClientTLS(cargs, sargs)
+		p.bp.Client = cmn.NewClientTLS(cargs, sargs, false /*intra-cluster*/)
 	} else {
 		p.bp.Client = cmn.NewClient(cargs)
 	}
@@ -987,11 +993,11 @@ func setupBucket(runParams *params, created *bool) error {
 		}
 		if objName != "" {
 			return fmt.Errorf("expecting bucket name or a bucket URI with no object name in it: %s => [%v, %s]",
-				runParams.bck, bck, objName)
+				runParams.bck.String(), bck.String(), objName)
 		}
 		if runParams.bck.Provider != apc.AIS /*cmdline default*/ && runParams.bck.Provider != bck.Provider {
 			return fmt.Errorf("redundant and different bucket provider: %q vs %q in %s",
-				runParams.bck.Provider, bck.Provider, bck)
+				runParams.bck.Provider, bck.Provider, bck.String())
 		}
 		runParams.bck = bck
 	}
@@ -1000,7 +1006,7 @@ func setupBucket(runParams *params, created *bool) error {
 
 	if isDirectS3() {
 		if apc.ToScheme(runParams.bck.Provider) != apc.S3Scheme {
-			return fmt.Errorf("option --s3endpoint requires s3 bucket (have %s)", runParams.bck)
+			return fmt.Errorf("option --s3endpoint requires s3 bucket (have %s)", runParams.bck.String())
 		}
 		if runParams.cached {
 			return errors.New(cachedText + "cannot be used together with --s3endpoint (direct S3 access)")
@@ -1028,11 +1034,11 @@ func setupBucket(runParams *params, created *bool) error {
 	}
 	exists, err := api.QueryBuckets(runParams.bp, cmn.QueryBcks(runParams.bck), apc.FltPresent)
 	if err != nil {
-		return fmt.Errorf("%s not found: %v", runParams.bck, err)
+		return fmt.Errorf("%s not found: %v", runParams.bck.String(), err)
 	}
 	if !exists {
 		if err := api.CreateBucket(runParams.bp, runParams.bck, nil); err != nil {
-			return fmt.Errorf("failed to create %s: %v", runParams.bck, err)
+			return fmt.Errorf("failed to create %s: %v", runParams.bck.String(), err)
 		}
 		*created = true
 	}
@@ -1043,7 +1049,7 @@ func setupBucket(runParams *params, created *bool) error {
 	// update bucket props if bPropsStr is set
 	oldProps, err := api.HeadBucket(runParams.bp, runParams.bck, true /* don't add */)
 	if err != nil {
-		return fmt.Errorf("failed to read bucket %s properties: %v", runParams.bck, err)
+		return fmt.Errorf("failed to read bucket %s properties: %v", runParams.bck.String(), err)
 	}
 	change := false
 	if runParams.bProps.EC.Enabled != oldProps.EC.Enabled {
@@ -1065,7 +1071,7 @@ func setupBucket(runParams *params, created *bool) error {
 	}
 	if change {
 		if _, err = api.SetBucketProps(runParams.bp, runParams.bck, &propsToUpdate); err != nil {
-			return fmt.Errorf("failed to enable EC for the bucket %s properties: %v", runParams.bck, err)
+			return fmt.Errorf("failed to enable EC for the bucket %s properties: %v", runParams.bck.String(), err)
 		}
 	}
 	return nil

@@ -8,9 +8,11 @@ package backend
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/stats"
 )
 
-func NewGCP(_ core.TargetPut) (core.Backend, error) {
-	return nil, newErrInitBackend(apc.GCP)
+func NewGCP(core.TargetPut, stats.Tracker, bool) (core.Backend, error) {
+	return nil, &cmn.ErrInitBackend{Provider: apc.GCP}
 }

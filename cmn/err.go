@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -37,7 +37,6 @@ const (
 	FmtErrIntegrity      = "[%s%d, for troubleshooting see %s/blob/main/docs/troubleshooting.md]"
 	FmtErrUnmarshal      = "%s: failed to unmarshal %s (%s), err: %w"
 	FmtErrMorphUnmarshal = "%s: failed to unmarshal %s (%T), err: %w"
-	FmtErrUnknown        = "%s: unknown %s %q"
 	FmtErrBackwardCompat = "%v (backward compatibility is supported only one version back, e.g. 3.9 => 3.10)"
 
 	fmtErrFailedTo = "%s: failed to %s %s, err: %v" // (ErrFailedTo)
@@ -66,9 +65,12 @@ type (
 // assorted aistore errors
 type (
 	ErrBucketAlreadyExists struct{ bck Bck }
-	ErrRemoteBckNotFound   struct{ bck Bck }
 	ErrRemoteBucketOffline struct{ bck Bck }
 	ErrBckNotFound         struct{ bck Bck }
+	ErrRemoteBckNotFound   struct {
+		bck Bck
+		ctx string
+	}
 
 	ErrBusy struct {
 		whereOrType string
@@ -84,7 +86,9 @@ type (
 		status int    // http status, if available
 	}
 	ErrUnsupp struct {
-		action, what string
+		err    error
+		action string
+		what   string
 	}
 	ErrNotImpl struct {
 		action, what string
@@ -93,6 +97,10 @@ type (
 	ErrInvalidBackendProvider struct {
 		bck Bck
 	}
+	ErrRemoteMetadataMismatch struct {
+		cause error
+	}
+
 	ErrCapExceeded struct {
 		totalBytes     uint64
 		totalBytesUsed uint64
@@ -101,6 +109,10 @@ type (
 		usedPct        int32
 		oos            bool
 	}
+	ErrGetCap struct {
+		err error
+	}
+
 	ErrBucketAccessDenied struct{ errAccessDenied }
 	ErrObjectAccessDenied struct{ errAccessDenied }
 	errAccessDenied       struct {
@@ -114,7 +126,7 @@ type (
 		actualHash   string
 	}
 
-	ErrMountpathNotFound struct {
+	ErrMpathNotFound struct {
 		mpath    string
 		fqn      string
 		disabled bool
@@ -123,6 +135,28 @@ type (
 		mpath string
 		cause string
 	}
+	ErrMpathNoDisks struct {
+		err   error
+		mpath string
+		fs    string
+	}
+	ErrMpathLostDisk struct {
+		mpath   string
+		fs      string
+		lostd   string
+		disks   []string
+		fsdisks []string
+	}
+	ErrMpathNewDisk struct {
+		mpath   string
+		fs      string
+		disks   []string
+		fsdisks []string
+	}
+	ErrMpathCheck struct {
+		err error
+	}
+
 	ErrInvalidFSPathsConf struct {
 		err error
 	}
@@ -160,7 +194,7 @@ type (
 		PodName string
 		SvcName string
 	}
-	ErrSoft struct {
+	ErrWarning struct {
 		what string
 	}
 
@@ -168,7 +202,8 @@ type (
 		err error
 	}
 	ErrLmetaNotFound struct {
-		err error
+		err  error
+		name string
 	}
 
 	ErrLimitedCoexistence struct {
@@ -193,14 +228,21 @@ type (
 	ErrInvalidObjName struct {
 		name string
 	}
+	ErrInvalidPrefix struct {
+		tag    string
+		prefix string
+	}
 	ErrNotRemoteBck struct {
-		act string
 		bck *Bck
+		act string
 	}
 	ErrRangeNotSatisfiable struct {
 		err    error    // original (backend reported) error
 		ranges []string // RFC 7233
 		size   int64    // [0, size)
+	}
+	ErrCreateHreq struct {
+		err error // original
 	}
 )
 
@@ -230,7 +272,6 @@ func NewErrFailedTo(actor fmt.Stringer, action string, what any, err error, ecod
 	if e, ok := err.(*ErrFailedTo); ok {
 		return e
 	}
-	_clean(err)
 
 	e := &ErrFailedTo{action: action, what: what, err: err}
 	e.actor = thisNodeName
@@ -252,6 +293,11 @@ func (e *ErrFailedTo) Error() string {
 
 func (e *ErrFailedTo) Unwrap() (err error) { return e.err }
 
+func IsErrFailedTo(err error) bool {
+	_, ok := err.(*ErrFailedTo)
+	return ok
+}
+
 // ErrStreamTerminated
 
 func NewErrStreamTerminated(stream string, err error, reason, detail string) *ErrStreamTerminated {
@@ -271,9 +317,13 @@ func IsErrStreamTerminated(err error) bool {
 
 // ErrUnsupp & ErrNotImpl
 
-func NewErrUnsupp(action, what string) *ErrUnsupp { return &ErrUnsupp{action, what} }
+func NewErrUnsupp(action, what string) *ErrUnsupp { return &ErrUnsupp{action: action, what: what} }
+func NewErrUnsuppErr(err error) *ErrUnsupp        { return &ErrUnsupp{err: err} }
 
 func (e *ErrUnsupp) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
 	return fmt.Sprintf("cannot %s %s - operation not supported", e.action, e.what)
 }
 
@@ -300,7 +350,7 @@ func NewErrBckAlreadyExists(bck *Bck) *ErrBucketAlreadyExists {
 }
 
 func (e *ErrBucketAlreadyExists) Error() string {
-	return fmt.Sprintf("bucket %q already exists", e.bck)
+	return fmt.Sprintf("bucket %q already exists", e.bck.String())
 }
 
 func IsErrBucketAlreadyExists(err error) bool {
@@ -314,11 +364,14 @@ func NewErrRemoteBckNotFound(bck *Bck) *ErrRemoteBckNotFound {
 	return &ErrRemoteBckNotFound{bck: *bck}
 }
 
+func (e *ErrRemoteBckNotFound) Set(ctx string) { e.ctx = ctx }
+
 func (e *ErrRemoteBckNotFound) Error() string {
 	if e.bck.IsCloud() {
-		return fmt.Sprintf("%s bucket %q does not exist", apc.NormalizeProvider(e.bck.Provider), e.bck.Cname(""))
+		np := apc.NormalizeProvider(e.bck.Provider)
+		return fmt.Sprintf("%s bucket %q does not exist%s", np, e.bck.Cname(""), e.ctx)
 	}
-	return fmt.Sprintf("remote bucket %q does not exist", e.bck)
+	return fmt.Sprintf("remote bucket %q does not exist%s", e.bck.String(), e.ctx)
 }
 
 func IsErrRemoteBckNotFound(err error) bool {
@@ -334,7 +387,7 @@ func NewErrBckNotFound(bck *Bck) *ErrBckNotFound {
 }
 
 func (e *ErrBckNotFound) Error() string {
-	return fmt.Sprintf("bucket %q does not exist", e.bck)
+	return fmt.Sprintf("bucket %q does not exist", e.bck.String())
 }
 
 func IsErrBckNotFound(err error) bool {
@@ -349,7 +402,7 @@ func NewErrRemoteBckOffline(bck *Bck) *ErrRemoteBucketOffline {
 }
 
 func (e *ErrRemoteBucketOffline) Error() string {
-	return fmt.Sprintf("bucket %q is currently unreachable", e.bck)
+	return fmt.Sprintf("bucket %q is currently unreachable", e.bck.String())
 }
 
 func isErrRemoteBucketOffline(err error) bool {
@@ -362,14 +415,23 @@ func isErrRemoteBucketOffline(err error) bool {
 func (e *ErrInvalidBackendProvider) Error() string {
 	if e.bck.Name != "" {
 		return fmt.Sprintf("invalid backend provider %q for bucket %s: must be one of [%s]",
-			e.bck.Provider, e.bck, apc.AllProviders)
+			e.bck.Provider, e.bck.String(), apc.AllProviders)
 	}
 	return fmt.Sprintf("invalid backend provider %q: must be one of [%s]", e.bck.Provider, apc.AllProviders)
 }
 
-func (*ErrInvalidBackendProvider) Is(target error) bool {
-	_, ok := target.(*ErrInvalidBackendProvider)
+func (*ErrInvalidBackendProvider) Is(err error) bool {
+	_, ok := err.(*ErrInvalidBackendProvider)
 	return ok
+}
+
+// ErrRemoteMetadataMismatch
+
+func NewErrRemoteMetadataMismatch(cause error) error {
+	return &ErrRemoteMetadataMismatch{cause: cause}
+}
+func (e *ErrRemoteMetadataMismatch) Error() string {
+	return fmt.Sprintf("metadata mismatch: %v", e.cause)
 }
 
 // ErrBusy
@@ -441,10 +503,26 @@ func (e *ErrCapExceeded) Error() string {
 
 func IsErrCapExceeded(err error) bool {
 	_, ok := err.(*ErrCapExceeded)
+	return ok || cos.IsErrOOS(err) // NOTE: a superset
+}
+
+// ErrGetCap
+
+func NewErrGetCap(err error) *ErrGetCap {
+	return &ErrGetCap{err: err}
+}
+
+func (e *ErrGetCap) Error() string {
+	return fmt.Sprintf("failed to update capacity: %v", e.err)
+}
+
+func IsErrGetCap(err error) bool {
+	_, ok := err.(*ErrGetCap)
 	return ok
 }
 
-// ErrInvalidCksum
+// ErrInvalidCksum - end-to-end client side protection
+// (compare with cos.ErrBadCksum)
 
 func (e *ErrInvalidCksum) Error() string {
 	return fmt.Sprintf("checksum: expected [%s], actual [%s]", e.expectedHash, e.actualHash)
@@ -456,9 +534,9 @@ func NewErrInvalidCksum(eHash, aHash string) *ErrInvalidCksum {
 
 func (e *ErrInvalidCksum) Expected() string { return e.expectedHash }
 
-// ErrMountpathNotFound
+// ErrMpathNotFound
 
-func (e *ErrMountpathNotFound) Error() string {
+func (e *ErrMpathNotFound) Error() string {
 	if e.mpath != "" {
 		if e.disabled {
 			return "mountpath " + e.mpath + " is disabled"
@@ -472,12 +550,15 @@ func (e *ErrMountpathNotFound) Error() string {
 	return "mountpath for fqn " + e.fqn + " does not exist"
 }
 
-func NewErrMountpathNotFound(mpath, fqn string, disabled bool) *ErrMountpathNotFound {
-	return &ErrMountpathNotFound{mpath: mpath, fqn: fqn, disabled: disabled}
+func (e *ErrMpathNotFound) Mpath() string  { return e.mpath }
+func (e *ErrMpathNotFound) Disabled() bool { return e.disabled }
+
+func NewErrMpathNotFound(mpath, fqn string, disabled bool) *ErrMpathNotFound {
+	return &ErrMpathNotFound{mpath: mpath, fqn: fqn, disabled: disabled}
 }
 
-func IsErrMountpathNotFound(err error) bool {
-	_, ok := err.(*ErrMountpathNotFound)
+func IsErrMpathNotFound(err error) bool {
+	_, ok := err.(*ErrMpathNotFound)
 	return ok
 }
 
@@ -489,6 +570,58 @@ func (e *ErrInvalidMountpath) Error() string {
 
 func NewErrInvalidaMountpath(mpath, cause string) *ErrInvalidMountpath {
 	return &ErrInvalidMountpath{mpath: mpath, cause: cause}
+}
+
+// ErrMpathNoDisks
+
+func NewErrMpathNoDisks(mpath, fs string, err error) *ErrMpathNoDisks {
+	return &ErrMpathNoDisks{mpath: mpath, fs: fs, err: err}
+}
+
+func (e *ErrMpathNoDisks) Error() string {
+	return fmt.Sprintf("mp[%s, fs=%s] has no disks, err: %v", e.mpath, e.fs, e.err)
+}
+
+// ErrMpathLostDisk
+
+func NewErrMpathLostDisk(mpath, fs, lostd string, disks, fsdisks []string) *ErrMpathLostDisk {
+	return &ErrMpathLostDisk{mpath: mpath, fs: fs, lostd: lostd, disks: disks, fsdisks: fsdisks}
+}
+
+func (e *ErrMpathLostDisk) Error() string {
+	return fmt.Sprintf("mp[%s, fs=%s]: disk %q is lost (orig: %v, available now: %v)", e.mpath, e.fs, e.lostd, e.disks, e.fsdisks)
+}
+
+// ErrMpathNewDisk
+
+func NewErrMpathNewDisk(mpath, fs string, disks, fsdisks []string) *ErrMpathNewDisk {
+	return &ErrMpathNewDisk{mpath: mpath, fs: fs, disks: disks, fsdisks: fsdisks}
+}
+
+func (e *ErrMpathNewDisk) Error() string {
+	plural := len(e.fsdisks) - len(e.disks)
+	return fmt.Sprintf("mp[%s, fs=%s]: newly attached disk%s (orig: %v, available now: %v)",
+		e.mpath, e.fs, cos.Plural(plural), e.disks, e.fsdisks)
+}
+
+func IsErrMpathNewDisk(err error) bool {
+	_, ok := err.(*ErrMpathNewDisk)
+	return ok
+}
+
+// ErrMpathCheck
+
+func NewErrMpathCheck(err error) *ErrMpathCheck {
+	return &ErrMpathCheck{err: err}
+}
+
+func (e *ErrMpathCheck) Error() string {
+	return e.err.Error()
+}
+
+func IsErrMpathCheck(err error) bool {
+	_, ok := err.(*ErrMpathCheck)
+	return ok
 }
 
 // ErrInvalidFSPathsConf
@@ -544,7 +677,7 @@ func IsErrXactNotFound(err error) bool {
 // ErrObjDefunct
 
 func (e *ErrObjDefunct) Error() string {
-	return fmt.Sprintf("%s is defunct (%d != %d)", e.name, e.d1, e.d2)
+	return fmt.Sprintf("%s is defunct (%x != %x)", e.name, e.d1, e.d2)
 }
 
 func NewErrObjDefunct(name string, d1, d2 uint64) *ErrObjDefunct {
@@ -562,7 +695,6 @@ func NewErrAborted(what, ctx string, err error) *ErrAborted {
 	if e, ok := err.(*ErrAborted); ok {
 		return e
 	}
-	_clean(err)
 	return &ErrAborted{what: what, ctx: ctx, err: err}
 }
 
@@ -586,9 +718,9 @@ func AsErrAborted(err error) (errAborted *ErrAborted) {
 	if errAborted, ok = err.(*ErrAborted); ok {
 		return
 	}
-	target := &ErrAborted{}
-	if errors.As(err, &target) {
-		errAborted = target
+	wrapped := &ErrAborted{}
+	if errors.As(err, &wrapped) {
+		errAborted = wrapped
 	}
 	return
 }
@@ -596,22 +728,36 @@ func AsErrAborted(err error) (errAborted *ErrAborted) {
 // ErrInitBackend & ErrMissingBackend
 
 func (e *ErrInitBackend) Error() string {
-	return fmt.Sprintf(
-		"cannot initialize %q backend (present in the cluster configuration): missing %s-supporting libraries in the build",
-		e.Provider, e.Provider,
-	)
+	p := apc.DisplayProvider(e.Provider)
+	s := "cannot initialize " + p + " backend "
+	s += "(present in the cluster configuration): "
+	s += "missing " + p + "-supporting libraries in the build"
+	return s
 }
 
 func (e *ErrMissingBackend) Error() string {
 	if e.Msg != "" {
 		return e.Msg
 	}
-	return fmt.Sprintf("%q backend is missing in the cluster configuration", e.Provider)
+	return apc.DisplayProvider(e.Provider) + " backend is missing in the cluster configuration"
+}
+
+func IsErrInitMissingBackend(err error) bool {
+	_, ok := err.(*ErrInitBackend)
+	if !ok {
+		_, ok = err.(*ErrMissingBackend)
+	}
+	return ok
 }
 
 // ErrETL
 
-func NewErrETL(ctx *ETLErrCtx, format string, a ...any) *ErrETL {
+func NewErrETL(ctx *ETLErrCtx, msg string) *ErrETL {
+	e := &ErrETL{Reason: msg}
+	return e.WithContext(ctx)
+}
+
+func NewErrETLf(ctx *ETLErrCtx, format string, a ...any) *ErrETL {
 	e := &ErrETL{
 		Reason: fmt.Sprintf(format, a...),
 	}
@@ -674,23 +820,23 @@ func (e *ErrETL) WithContext(ctx *ETLErrCtx) *ErrETL {
 		withSvcName(ctx.SvcName)
 }
 
-// ErrSoft
-// non-critical and can be ignored in certain cases (e.g, when `--force` is set)
+// ErrWarning
+// non-critical errors that can be ignored e.g, when `--force`-ed
 
-func NewErrSoft(what string) *ErrSoft {
-	return &ErrSoft{what}
+func NewErrWarning(what string) *ErrWarning {
+	return &ErrWarning{what}
 }
 
-func (e *ErrSoft) Error() string {
+func (e *ErrWarning) Error() string {
 	return e.what
 }
 
-func IsErrSoft(err error) bool {
-	if _, ok := err.(*ErrSoft); ok {
+func IsErrWarning(err error) bool {
+	if _, ok := err.(*ErrWarning); ok {
 		return true
 	}
-	target := &ErrSoft{}
-	return errors.As(err, &target)
+	wrapped := &ErrWarning{}
+	return errors.As(err, &wrapped)
 }
 
 // ErrLmetaCorrupted & ErrLmetaNotFound
@@ -704,9 +850,12 @@ func IsErrLmetaCorrupted(err error) bool {
 	return ok
 }
 
-func NewErrLmetaNotFound(err error) *ErrLmetaNotFound { return &ErrLmetaNotFound{err} }
-func (e *ErrLmetaNotFound) Error() string             { return e.err.Error() }
-func (e *ErrLmetaNotFound) Unwrap() (err error)       { return e.err }
+func NewErrLmetaNotFound(name string, err error) *ErrLmetaNotFound {
+	return &ErrLmetaNotFound{name: name, err: err}
+}
+
+func (e *ErrLmetaNotFound) Error() string       { return e.name + ", err: " + e.err.Error() }
+func (e *ErrLmetaNotFound) Unwrap() (err error) { return e.err }
 
 func IsErrLmetaNotFound(err error) bool {
 	_, ok := err.(*ErrLmetaNotFound)
@@ -739,30 +888,65 @@ func IsErrXactUsePrev(err error) bool {
 	return ok
 }
 
-// ErrInvalidObjName
+// ErrInvalidObjName, ErrInvalidPrefix
 
-func ValidateObjName(name string) (err *ErrInvalidObjName) {
-	if cos.IsLastB(name, filepath.Separator) || strings.Contains(name, "../") {
-		err = &ErrInvalidObjName{name}
+const (
+	inv1 = "../"
+	inv2 = "~/"
+)
+
+func ValidateOname(name string) (err *ErrInvalidObjName) {
+	if name == "" {
+		return &ErrInvalidObjName{name}
 	}
-	return err
+	return ValidOname(name)
+}
+
+func ValidOname(name string) *ErrInvalidObjName {
+	if cos.IsLastB(name, filepath.Separator) {
+		return &ErrInvalidObjName{name}
+	}
+	if strings.IndexByte(name, inv1[0]) < 0 && strings.IndexByte(name, inv2[0]) < 0 { // most of the time
+		return nil
+	}
+	if strings.Contains(name, inv1) || strings.Contains(name, inv2) {
+		return &ErrInvalidObjName{name}
+	}
+	return nil
 }
 
 func (e *ErrInvalidObjName) Error() string {
 	return fmt.Sprintf("invalid object name %q", e.name)
 }
 
+func ValidatePrefix(tag, prefix string) *ErrInvalidPrefix {
+	if prefix == "" {
+		return nil
+	}
+	if strings.IndexByte(prefix, inv1[0]) < 0 && strings.IndexByte(prefix, inv2[0]) < 0 { // ditto
+		return nil
+	}
+	if strings.Contains(prefix, inv1) || strings.Contains(prefix, inv2) {
+		return &ErrInvalidPrefix{tag, prefix}
+	}
+	return nil
+}
+
+func (e *ErrInvalidPrefix) Error() string {
+	return fmt.Sprintf("%s: invalid prefix %q", e.tag, e.prefix)
+}
+
 // ErrNotRemoteBck
 
 func ValidateRemoteBck(act string, bck *Bck) (err *ErrNotRemoteBck) {
 	if !bck.IsRemote() {
-		err = &ErrNotRemoteBck{act, bck}
+		err = &ErrNotRemoteBck{act: act, bck: bck}
 	}
 	return err
 }
 
 func (e *ErrNotRemoteBck) Error() string {
-	return fmt.Sprintf("%s: expecting remote bucket (have %s)", e.act, e.bck)
+	return fmt.Sprintf("%s: expecting remote bucket (have %s)", e.act, e.bck.String())
 }
 
 // ErrXactTgtInMaint
@@ -796,6 +980,18 @@ func IsErrRangeNotSatisfiable(err error) bool {
 	return ok
 }
 
+// ErrCreateHreq
+
+func NewErrCreateHreq(err error) *ErrCreateHreq {
+	return &ErrCreateHreq{err}
+}
+
+func (e *ErrCreateHreq) Error() string {
+	return fmt.Sprintf("%v (cannot create http request)", e.err)
+}
+
+func (e *ErrCreateHreq) Unwrap() (err error) { return e.err }
+
 //
 // more is-error helpers
 //
@@ -813,7 +1009,7 @@ func IsErrObjNought(err error) bool {
 // used internally to report http.StatusNotFound _iff_ status is not set (is zero)
 func isErrNotFoundExtended(err error, status int) bool {
 	return IsErrBckNotFound(err) || IsErrRemoteBckNotFound(err) ||
-		IsErrMountpathNotFound(err) || IsErrXactNotFound(err) ||
+		IsErrMpathNotFound(err) || IsErrXactNotFound(err) ||
 		cos.IsNotExist(err, status)
 }
 
@@ -880,12 +1076,13 @@ func InitErrHTTP(r *http.Request, err error, ecode int) (e *ErrHTTP) {
 }
 
 func (e *ErrHTTP) init(r *http.Request, err error, ecode int) {
+	const maxlen = 100
 	e.Status = http.StatusBadRequest
 	if ecode != 0 {
 		e.Status = ecode
 	}
 	tcode := fmt.Sprintf("%T", err)
-	if i := strings.Index(tcode, "."); i > 0 {
+	if i := strings.Index(tcode, "."); i > 0 && i < maxlen && len(tcode)-i < maxlen {
 		if pkg := tcode[:i]; pkg != "*errors" && pkg != "errors" {
 			e.TypeCode = tcode[i+1:]
 		}

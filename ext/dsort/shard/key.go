@@ -1,17 +1,17 @@
 // Package shard provides Extract(shard), Create(shard), and associated methods
 // across all suppported archival formats (see cmn/archive/mime.go)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package shard
 
 import (
 	"bytes"
-	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"hash"
 	"io"
+	"regexp"
 	"strconv"
 
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -37,7 +37,7 @@ type (
 	}
 
 	md5KeyExtractor struct {
-		h hash.Hash
+		cksum *cos.CksumHash
 	}
 
 	nameKeyExtractor    struct{}
@@ -49,6 +49,12 @@ type (
 	ErrSortingKeyType struct {
 		ty string
 	}
+
+	// represents a map where keys are regex patterns and values are associated strings.
+	ExternalKeyMap map[string]struct {
+		regex *regexp.Regexp
+		value string
+	}
 )
 
 /////////////////////
@@ -56,12 +62,12 @@ type (
 /////////////////////
 
 func NewMD5KeyExtractor() (KeyExtractor, error) {
-	return &md5KeyExtractor{h: md5.New()}, nil
+	return &md5KeyExtractor{cksum: cos.NewCksumHash(cos.ChecksumMD5)}, nil
 }
 
 func (ke *md5KeyExtractor) ExtractKey(ske *SingleKeyExtractor) (any, error) {
-	s := hex.EncodeToString(ke.h.Sum([]byte(ske.name)))
-	ke.h.Reset()
+	s := hex.EncodeToString(ke.cksum.H.Sum(cos.UnsafeB(ske.name)))
+	ke.cksum.H.Reset()
 	return s, nil
 }
 
@@ -109,7 +115,7 @@ func (ke *contentKeyExtractor) ExtractKey(ske *SingleKeyExtractor) (any, error) 
 	if ske == nil {
 		return nil, nil
 	}
-	b, err := io.ReadAll(ske.buf)
+	b, err := cos.ReadAll(ske.buf)
 	ske.buf = nil
 	if err != nil {
 		return nil, err
@@ -138,4 +144,61 @@ func ValidateContentKeyTy(ty string) error {
 
 func (e *ErrSortingKeyType) Error() string {
 	return fmt.Sprintf("invalid content sorting key %q, expecting one of: 'int', 'float', 'string'", e.ty)
+}
+
+/////////////////
+// RegexKeyMap //
+/////////////////
+
+func NewExternalKeyMap(n int) ExternalKeyMap {
+	return make(ExternalKeyMap, n)
+}
+
+func (ekm ExternalKeyMap) Add(key, value string) error {
+	if _, exists := ekm[key]; exists {
+		return errors.New("duplicated regex keys")
+	}
+	re, err := regexp.Compile(key)
+	if err != nil {
+		return err
+	}
+
+	ekm[key] = struct {
+		regex *regexp.Regexp
+		value string
+	}{
+		regex: re,
+		value: value,
+	}
+	return nil
+}
+
+func (ekm ExternalKeyMap) Lookup(input string) (string, error) {
+	var matches []string
+	for _, p := range ekm {
+		if p.regex.MatchString(input) {
+			matches = append(matches, p.value)
+		}
+	}
+
+	if len(matches) == 0 {
+		return "", errors.New("no match found")
+	}
+	if len(matches) > 1 {
+		return "", errors.New("multiple matches found")
+	}
+	return matches[0], nil
+}
+
+func (ekm ExternalKeyMap) All() (result []string) {
+	set := make(map[string]struct{}, 8)
+	for _, v := range ekm {
+		set[v.value] = struct{}{}
+	}
+
+	result = make([]string, 0, 8)
+	for key := range set {
+		result = append(result, key)
+	}
+	return
 }

@@ -21,8 +21,8 @@ CLI_VERSION := $(shell ais version 2>/dev/null)
 MAKEFLAGS += --no-print-directory
 
 # Uncomment to cross-compile aisnode and cli, respectively:
-# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.22
-# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.22
+# CROSS_COMPILE = docker run --rm -v $(AISTORE_PATH):/go/src/n -w /go/src/n golang:1.23
+# CROSS_COMPILE_CLI = docker run -e $(CGO_DISABLE) --rm -v $(AISTORE_PATH)/cmd/cli:/go/src/n -w /go/src/n golang:1.23
 
 # Build version, flags, and tags
 VERSION = $(shell git rev-parse --short HEAD)
@@ -111,7 +111,7 @@ endif
 	@echo "done."
 
 cli: ## Build CLI binary. NOTE: 1) a separate go.mod, 2) static linkage with cgo disabled
-	@echo "Building ais (CLI) => $(BUILD_DEST)/ais [build tags:$(BUILD_TAGS)]"
+	@echo "Building ais (CLI) [build tags:$(BUILD_TAGS)]"
 ifdef CROSS_COMPILE_CLI
 	cd $(BUILD_DIR)/cli && \
 	$(CROSS_COMPILE_CLI) go build -o ./ais -tags="$(BUILD_TAGS)" $(BUILD_FLAGS) $(LDFLAGS) *.go && mv ./ais $(BUILD_DEST)/.
@@ -129,9 +129,15 @@ cli-autocompletions: ## Add CLI autocompletions
 	@echo "Adding CLI autocomplete..."
 	@./$(BUILD_DIR)/cli/autocomplete/install.sh
 
+ishard: ## Build ishard CLI binary
+	@echo "Building ishard..."
+	@cd $(BUILD_DIR)/ishard && go build -o $(BUILD_DEST)/ishard *.go
+	@echo "done."
+
 authn: build-authn         ## Build AuthN
 aisloader: build-aisloader ## Build aisloader
 xmeta: build-xmeta         ## Build xmeta
+aisinit: build-aisinit     ## Build aisinit
 
 build-%:
 	@echo -n "Building $*... "
@@ -185,6 +191,7 @@ clean: ## Remove all AIS related files and binaries
 
 mod-all: mod-clean mod-tidy
 	@echo "CLI ..." && cd cmd/cli && $(MAKE) mod-tidy
+	@echo "ishard ..." && cd cmd/ishard && $(MAKE) mod-tidy
 
 # cleanup go-mod cache
 mod-clean:
@@ -223,6 +230,9 @@ test-short: test-envcheck ## Run short tests
 	@RE="$(RE)" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-short
 	@cd $(BUILD_DIR)/cli && go test -v -tags=debug ./...
 
+test-tracing-unit:
+	@cd tracing && go test -v -tags=oteltracing ./...
+
 test-assorted: test-envcheck # Run specific tests
 	@RE="ETLBucket|ETLConnectionError|ETLInitCode" BUCKET="$(BUCKET)" TESTS_DIR="$(TESTS_DIR)" AIS_ENDPOINT="$(AIS_ENDPOINT)" $(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" test-long
 
@@ -257,22 +267,23 @@ lint-update:
 ## See also: .github/workflows/lint.yml
 lint-update-ci:
 	@rm -f $(GOPATH)/bin/golangci-lint
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.59.1
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.63.4
 
 lint:
 	@([[ -x "$(command -v golangci-lint)" ]] && echo "Cannot find golangci-lint, run 'make lint-update' to install" && exit 1) || true
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" lint
 	@$(MAKE) -C $(BUILD_DIR)/cli lint
+	@$(MAKE) -C $(BUILD_DIR)/ishard lint
 
 install-python-deps:
 	@pip3 install -r ./python/aistore/common_requirements
 
 fmt-check: install-python-deps ## Check code formatting
-	@ [[ $$(black --help) ]] || pip3 install black[jupyter]
+	@pip3 install --upgrade black[jupyter] -q
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" fmt
 
 fmt-fix: ## Fix code formatting
-	@ [[ $$(black --help) ]] || pip3 install black[jupyter]
+	@pip3 install --upgrade black[jupyter] -q
 	@$(SHELL) "$(SCRIPTS_DIR)/bootstrap.sh" fmt --fix
 
 spell-check: ## Run spell checker on the project
@@ -313,11 +324,8 @@ help:
 	@printf "  $(cyan)%s$(term-reset)\n    %s\n\n" \
 		"make deploy" "Deploy cluster locally" \
 		"make kill clean" "Stop locally deployed cluster and cleanup all cluster-related data and bucket metadata (but not cluster map)" \
-		"make kill deploy <<< $$'7\n2\n4\ny\ny\nn\n0\n'"  "Shutdown and then (non-interactively) generate local configs and deploy a cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build 'aisnode' executable with the support for GCP and AWS backends" \
-		"make restart <<< $$'7\n2\n4\ny\ny\nn\nn\n0\n'"  "Restart a cluster of 7 targets (4 mountpaths each) and 2 proxies; utilize previously generated (pre-shutdown) local configurations" \
-		"RUN_ARGS=-override_backends MODE=debug make kill deploy <<< $$'4\n1\n4\nn\nn\nn\nn\n0\n'"  "Redeploy (4 targets + 1 proxy) cluster; build executable for debug without any backend-supporting libraries; use RUN_ARGS to pass additional command-line option ('-override_backends=true') to each running node"\
-		"RUN_ARGS='-override_backends -standby' MODE=debug make kill deploy <<< $$'4\n1\n4\nn\nn\nn\nn\n0\n'"  "Same as above, but additionally run all 4 targets in a standby mode"\
-		"make kill clean cli deploy <<< $$'7\n2\n4\ny\ny\nn\n1G\n'"  "Shutdown, cleanup, build CLI, and redeploy from scratch; create 4 loopback devices (size = 1G, one loopback per mountpath)" \
+		"make kill deploy <<< $$'7\n2\n4\ny\ny\n'"  "Shutdown and then (non-interactively) generate local configs and deploy a cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build 'aisnode' executable with AWS and GCP backends" \
+		"TAGS=\"aws gcp\" make kill deploy <<< $$'7\n2\n'"  "Same as above (see docs/getting_started.md for many more examples)" \
 		"GORACE='log_path=/tmp/race' make deploy" "Deploy cluster with race detector, write reports to /tmp/race.<PID>" \
 		"MODE=debug make deploy" "Deploy cluster with 'aisnode' (AIS target and proxy) executable built with debug symbols and debug asserts enabled" \
 		"BUCKET=tmp make test-short" "Run all short tests" \

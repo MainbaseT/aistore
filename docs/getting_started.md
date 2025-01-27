@@ -23,10 +23,11 @@ For datasets, say, below 50TB a single host may suffice and should, therefore, b
 AIStore runs on commodity Linux machines with no special requirements whatsoever. It is expected that within a given cluster, all AIS [targets](/docs/overview.md#key-concepts-and-diagrams) are identical, hardware-wise.
 
 * [Linux](#Linux) distribution with `GCC`, `sysstat`, `attr` and `util-linux` packages(**)
-* Linux kernel 5.15+
-* [Go 1.21 or later](https://golang.org/dl/)
+* Linux kernel 6.8+
+* [Go 1.23 or later](https://golang.org/dl/)
 * Extended attributes (`xattrs` - see next section)
 * Optionally, Amazon (AWS), Google Cloud Platform (GCP), and/or Azure Cloud Storage accounts.
+* Optionally, [golangci-lint 1.62 or later](https://golangci-lint.run/welcome/install/)
 
 > (**) [Mac](#macOS) is also supported albeit in a limited (development only) way.
 
@@ -41,7 +42,7 @@ Depending on your Linux distribution, you may or may not have `GCC`, `sysstat`, 
 
 Speaking of distributions, our current default recommendation is Ubuntu Server 20.04 LTS. But Ubuntu 18.04 and CentOS 8.x (or later) will also work. As well as numerous others.
 
-For the [local filesystem](/docs/performance.md), we currently recommend xfs. But again, this (default) recommendation shall not be interpreted as a limitation of any kind: other fine choices include zfs, ext4, f2fs, and more.
+For the [local filesystem](/docs/performance.md), we currently recommend xfs. But again, this (default) recommendation shall not be interpreted as a limitation of any kind: other fine choices include zfs, ext4, f2fs and more.
 
 Since AIS itself provides n-way mirroring and erasure coding, hardware RAID would _not_ be recommended. But can be used, and will work.
 
@@ -90,14 +91,14 @@ The rest of this document is structured as follows:
 - [Multiple deployment options](#multiple-deployment-options)
   - [Kubernetes deployments](#kubernetes-deployments)
   - [Minimal all-in-one-docker Deployment](#minimal-all-in-one-docker-deployment)
-  - [Local Playground Demo](#local-playground-demo)
-  - [Manual deployment](#manual-deployment)
   - [Testing your cluster](#testing-your-cluster)
+- [Running AIStore in Google Colab](#running-aistore-in-google-colab)
 - [Kubernetes Playground](#kubernetes-playground)
 - [Setting Up HTTPS Locally](#setting-up-https-locally)
 - [Build, Make, and Development Tools](#build-make-and-development-tools)
+  - [A note on conditional linkage](#a-note-on-conditional-linkage)
 - [Containerized Deployments: Host Resource Sharing](#containerized-deployments-host-resource-sharing)
-- [Assorted command lines](#assorted-command-lines)
+- [Assorted Curl](#assorted-curl)
 
 ## Local Playground
 
@@ -135,7 +136,12 @@ some of the associated binaries through the environment variables we set up earl
 $ cd $GOPATH/src/github.com/NVIDIA
 $ git clone https://github.com/NVIDIA/aistore.git
 $ cd aistore
-# Optionally, run `make mod-tidy` to preload dependencies
+```
+
+Optionally, run `go mod tidy` (or the command below) to preload dependencies:
+
+```console
+$ make mod-tidy
 ```
 
 ## Step 2: Deploy cluster and verify the running status using `ais` cli
@@ -144,76 +150,40 @@ $ cd aistore
 
 Many useful commands are provided via top [Makefile](https://github.com/NVIDIA/aistore/blob/main/Makefile) (for details, see [Make](#make) section below).
 
-In particular, we can use `make` to deploy our very first 1-node cluster:
+In particular, we can use `make` to deploy our very first 3 nodes (and 3 gateways) cluster:
 
 ```console
-$ make kill clean cli deploy <<< $'1\n1\n1\nn\nn\nn\n0\n'
+$ make kill clean cli aisloader deploy <<< $'3\n3'
 ```
 
-OR (same):
+This `make` command executes several make targets (not to confuse with ais targets) - in particular, it:
+
+* shuts down (via `make kill`) AIStore that _may_ have been previously deployed in the local playground;
+* removes its metadata and data (`make clean`);
+* builds CLI (`ais`) and `aisloader` tools (that we are using all the time);
+
+and, finally:
+
+* deploys (3 storage nodes, 3 gateways) cluster.
+
+The cluster than can be observed as follows:
+
 ```console
-$ make kill clean # kill previous cluster and clean any binaries
-$ make cli # build ais cli
-$ make deploy
-Enter number of storage targets:
-1
-Enter number of proxies (gateways):
-1
-Number of local mountpaths (enter 0 for preconfigured filesystems):
-1
-Select backend providers:
-Amazon S3: (y/n) ?
-n
-Google Cloud Storage: (y/n) ?
-n
-Azure: (y/n) ?
-n
-Loopback device size, e.g. 10G, 100M (press Enter to skip):
+$ ais show cluster
 ```
 
-You should see a successful deployment in the output when the AIS proxy is listening on port 8080 (unless changed in config).
+### `clean_deploy.sh`
 
-```
-Building aisnode 2ce1aaeb1 [build tags: mono]
-done.
-Proxy is listening on port: 8080
-Primary endpoint: http://localhost:8080
-```
+Alternatively (to `make deploy`) or, rather, in addition, one can also use:
 
-Note that [`clean_deploy.sh`](/docs/development.md#clean-deploy) with no arguments also builds AIStore binaries (such as `aisnode` and `ais` CLI). You can pass in arguments to configure the same options that the `make deploy` command above uses. 
+* [`clean_deploy.sh`](https://github.com/NVIDIA/aistore/blob/main/scripts/clean_deploy.sh)
+* [`clean_deploy.sh readme`](/docs/development.md#clean-deploy)
 
-> WARNING: Note that the `--cleanup` option will wipe all AIS related files and binaries. You do not need to use the --cleanup option if you just want to run the local playground with a different number of nodes or proxies. The same warning applies to running `make clean` as well. If you'd like to just restart the cluster without loss of data, just kill the cluster using `make kill` and `make run` to restart cluster without recreating daemon configs.
+With no arguments, this script also builds AIStore binaries (such as `aisnode` and `ais` CLI). You can pass in arguments to configure the same options that the `make deploy` command above uses.
 
 ```console
 $ ./scripts/clean_deploy.sh --target-cnt 1 --proxy-cnt 1 --mountpath-cnt 1 --deployment local --cleanup
 ```
-
-We can verify that the cluster is running using:
-
-```console
-$ ais show cluster
-
-# Example output below
-PROXY            MEM USED(%)     MEM AVAIL       LOAD AVERAGE    UPTIME  STATUS  VERSION                 BUILD TIME
-p[FAEp8080][P]   0.13%           29.31GiB        [0.4 0.2 0.2]   -       online  3.23.rc3.2ce1aaeb1      2024-05-15T16:19:05-0700
-
-TARGET           MEM USED(%)     MEM AVAIL       CAP USED(%)     CAP AVAIL       LOAD AVERAGE    REBALANCE       UPTIME  STATUS  VERSION                 BUILD TIME
-t[hgjt8081]      0.13%           29.31GiB        39%             21.999GiB       [0.4 0.2 0.2]   -               -       online  3.23.rc3.2ce1aaeb1      2024-05-15T16:19:05-0700
-
-Summary:
-   Proxies:             1
-   Targets:             1 (one disk)
-   Capacity:            used 14.61GiB (39%), available 22.00GiB
-   Cluster Map:         version 5, UUID PrVDVYkcT, primary p[FAEp8080]
-   Deployment:          dev
-   Status:              2 online
-   Rebalance:           n/a
-   Authentication:      disabled
-   Version:             3.23.rc3.2ce1aaeb1
-   Build:               2024-05-15T16:19:05-0700
-```
-
-If you get repreated errors indicating that the cluster is taking a long time to start up, then your configuration is incorrect.
 
 ## Step 3: Run `aisloader` tool
 
@@ -262,7 +232,15 @@ index c5e0e4fae..46085e19c 100755
 * Step 2: deploy a single target with two loopback devices (1GB size each):
 
 ```console
-$ make kill clean cli deploy <<< $'1\n1\n2\ny\ny\nn\n1G\n'
+$ make kill clean cli deploy <<< $'1\n1\n4\ny\ny\nn\n1G\n'
+```
+
+or, same:
+
+```console
+$ TAGS=aws TEST_LOOPBACK_SIZE=1G make kill clean cli deploy <<< $'1\n1\n'
+```
+
 
 $ mount | grep dev/loop
 /dev/loop23 on /tmp/ais/mp1 type ext4 (rw,relatime)
@@ -276,8 +254,8 @@ $ ais show cluster
 PROXY            MEM USED(%)     MEM AVAIL       LOAD AVERAGE    UPTIME  STATUS  VERSION         BUILD TIME
 p[BOxqibgv][P]   0.14%           27.28GiB        [1.2 1.1 1.1]   -       online  3.22.bf26375e5  2024-02-29T11:11:52-0500
 
-TARGET           MEM USED(%)     MEM AVAIL       CAP USED(%)     CAP AVAIL       LOAD AVERAGE    REBALANCE       UPTIME  STATUS  VERSION
-t[IwzSpiIm]      0.14%           27.28GiB        6%              1.770GiB        [1.2 1.1 1.1]   -               -       online  3.22.bf26375e5
+TARGET           MEM USED(%)     MEM AVAIL    CAP USED(%)  CAP AVAIL    LOAD AVERAGE    REBALANCE   UPTIME  STATUS  VERSION
+t[IwzSpiIm]      0.14%           27.28GiB     6%           1.770GiB     [1.2 1.1 1.1]   -           -       online  3.22.bf26375e5
 
 Summary:
    Proxies:             1
@@ -344,17 +322,49 @@ $ make help
 
 This shows all subcommands, environment variables, and numerous usage examples, including:
 
+### Example: deploy cluster locally
 ```console
-Examples:
-# Deploy cluster locally
 $ make deploy
-
-# Stop locally deployed cluster and cleanup all cluster-related data and bucket metadata (but not cluster map)
-$ make kill clean
-
-# Stop and then deploy (non-interactively) cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build `aisnode` executable with the support for GCP and AWS backends
-$ make kill deploy <<< $'7\n2\n4\ny\ny\nn\n0\n'
 ```
+
+### Example: shutdown cluster and cleanup all its data and metadata
+```console
+$ make kill clean
+```
+
+### Example: shutdown/cleanup, and then deploy non-interactively a cluster consisting of 7 targets (4 mountpaths each) and 2 proxies; build `aisnode` executable with GCP and AWS backends
+```console
+$ make kill clean deploy <<< $'7\n2\n4\ny\ny\nn\n0\n'
+```
+
+### Example: same as above
+```console
+$ AIS_BACKEND_PROVIDERS="aws gcp" make kill clean deploy <<< $'7\n2'
+```
+
+### Example: same as above
+```console
+$ TAGS="aws gcp" make kill clean deploy <<< $'7\n2'
+```
+
+> Use `TAGS` environment to specify any/all supported build tags that also include conditionally linked remote backends (see next).
+
+> Use `AIS_BACKEND_PROVIDERS` environment to select remote backends that include 3 (three) Cloud providers and `ht://` - namely: (`aws`, `gcp`, `azure`, `ht`)
+
+### Example: same as above but also build `aisnode` with debug info
+```console
+$ TAGS="aws gcp debug" make kill clean deploy <<< $'7\n2'
+```
+
+### Further:
+
+* `make kill`    - terminate local AIStore.
+* `make restart` - shut it down and immediately restart using the existing configuration.
+* `make help`    - show make options and usage examples.
+
+For even more development options and tools, please refer to:
+
+* [development docs](/docs/development.md)
 
 ## System environment variables
 
@@ -384,9 +394,11 @@ For developers, CLI `ais config cluster log.modules ec xs` (for instance) would 
 
 > To list all log modules, type `ais config cluster` or `ais config node` and press `<TAB-TAB>`.
 
-Finally, there's also HTTPS configuration (including **X509** certificates and options), and the corresponding [environment](#tls-testing-with-self-signed-certificates).
+Finally, there's also HTTPS configuration (including **X.509** certificates and options), and the corresponding [environment](#tls-testing-with-self-signed-certificates).
 
-For details, please see section [TLS: testing with self-signed certificates](#tls-testing-with-self-signed-certificates) below.
+For details, please refer to:
+
+* [HTTPS: loading, reloading, and generating certificates; switching cluster between HTTP and HTTPS](/docs/https.md)
 
 ## Multiple deployment options
 
@@ -421,51 +433,6 @@ Finally, the [repository](https://github.com/NVIDIA/ais-k8s) hosts the [Kubernet
 
 This option has the unmatched convenience of requiring an absolute minimum time and resources - please see this [README](/deploy/prod/docker/single/README.md) for details.
 
-### Manual deployment
-
-You can also run `make deploy` in the root directory of the repository to deploy a cluster:
-```console
-$ make deploy
-Enter number of storage targets:
-10
-Enter number of proxies (gateways):
-3
-Number of local cache directories (enter 0 to use preconfigured filesystems):
-2
-Select backend providers:
-Amazon S3: (y/n) ?
-n
-Google Cloud Storage: (y/n) ?
-n
-Azure: (y/n) ?
-n
-HDFS: (y/n) ?
-n
-Create loopback devices (note that it may take some time): (y/n) ?
-n
-Building aisnode: version=df24df77 providers=
-```
-> Notice the "Cloud" prompt above and the fact that access to 3rd party Cloud storage is a deployment-time option.
-
-Run `make help` for supported (make) options and usage examples, including:
-
-```console
-# Restart a cluster of 7 targets (4 mountpaths each) and 2 proxies; utilize previously generated (pre-shutdown) local configurations
-$ make restart <<< $'7\n2\n4\ny\ny\nn\n0\n'
-
-...
-```
-
-Further:
-
-* `make kill`    - terminate local AIStore.
-* `make restart` - shut it down and immediately restart using the existing configuration.
-* `make help`    - show make options and usage examples.
-
-For even more development options and tools, please refer to:
-
-* [development docs](/docs/development.md)
-
 ### Testing your cluster
 
 For development, health-checking a new deployment, or for any other (functional and performance testing) related reason you can run any/all of the included tests.
@@ -499,6 +466,14 @@ The command randomly shuffles existing short tests and then, depending on your p
 
 > Ctrl-C or any other (kind of) abnormal termination of a running test may have a side effect of leaving some test data in the test bucket.
 
+## Running AIStore in Google Colab
+
+To quickly set up AIStore (with AWS and GCP backends) in a [Google Colab](https://colab.research.google.com/) notebook, use our ready-to-use [notebook](https://colab.research.google.com/github/NVIDIA/aistore/blob/main/python/examples/google_colab/aistore_deployment.ipynb): 
+
+**Important Notes:**
+- This sample installs Go v1.23.1, the supported Go version and toolchain at the time of writing.
+- AIStore runs in the background. However, if you stop any cell, it sends a "SIGINT" (termination signal) to all background processes, terminating AIStore. To restart AIStore, simply rerun the relevant cell.
+
 ## Kubernetes Playground
 
 In our development and testing, we make use of [Minikube](https://kubernetes.io/docs/tutorials/hello-minikube/) and the capability, further documented [here](/deploy/dev/k8s/README.md), to run the Kubernetes cluster on a single development machine. There's a distinct advantage that AIStore extensions that require Kubernetes - such as [Extract-Transform-Load](/docs/etl.md), for example - can be developed rather efficiently.
@@ -507,87 +482,16 @@ In our development and testing, we make use of [Minikube](https://kubernetes.io/
 
 ## Setting Up HTTPS Locally
 
-In the end, all examples above run a bunch of local web servers that listen for plain HTTP requests. Following are quick steps for developers to engage HTTPS.
+So far, all examples in this getting-started document run a bunch of local web servers that listen for plain HTTP and collaborate to provide clustered storage.
 
-This is still a so-called _local playground_ type deployment _from scratch_, whereby we are not trying to switch an existing cluster from HTTP to HTTPS, or vice versa. All we do here is deploying a brand new HTTPS-based aistore.
+There's a separate document that tackles HTTPS topics that, in part, include:
 
-> Note: If you need to switch an existing AIS cluster to HTTPS, please refer to [these steps](switch_https.md).
-
-### Generate Certificates
-
-Creating a self-signed certificate along with its private key and a Certificate Authority (CA) certificate using [OpenSSL](https://www.openssl.org/) involves several steps. First we create a self-signed Certificate Authority (CA) certificate (`ca.crt`). Then we create a Certificate Signing Request (CSR) and finally based on CSR and CA we create the server certs (`server.key` and `server.crt`).
-
-```console
-$ openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.crt -days 1024 -nodes -subj "/CN=localhost" -extensions v3_ca -config <(printf "[req]\ndistinguished_name=req\nx509_extensions=v3_ca\n[ v3_ca ]\nsubjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1\nbasicConstraints=CA:TRUE\n")
-$ openssl req -new -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/C=US/ST=California/L=Santa Clara/O=NVIDIA/OU=AIStore/CN=localhost" -config <(printf "[req]\ndistinguished_name=req\nreq_extensions = v3_req\n[ v3_req ]\nsubjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1\n")
-$ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile <(printf "[ext]\nsubjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,nonRepudiation,keyEncipherment,dataEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n") -extensions ext
-```
-
-**Important:** Ensure you specify the appropriate DNS relevant to your deployment context. For deployments intended to run locally, the domain name `localhost` and `127.0.0.1` should be provided for the certificates to be valid.
-
-### Deploy Cluster (4 targets, 1 gateway, 6 mountpaths, AWS)
-
-```console
-$ # shutdown prev running AIS cluster
-$ make kill
-$ # delete smaps of prev AIS clusters
-$ find ~/.ais* -type f -name ".ais.smap" | xargs rm
-$ AIS_USE_HTTPS=true AIS_SKIP_VERIFY_CRT=true AIS_SERVER_CRT=<path-to-cert>/server.crt AIS_SERVER_KEY=<path-to-key>/server.key make deploy <<< $'4\n1\n6\ny\nn\nn\n0\n'
-```
-> Notice environment variables above: **AIS_USE_HTTPS**, **AIS_SKIP_VERIFY_CRT**, **AIS_SERVER_CRT** and **AIS_SERVER_KEY**.
-
-### Accessing the Cluster
-
-To use CLI, try first any command with HTTPS-based cluster endpoint, for instance:
-
-```console
-$ AIS_ENDPOINT=https://127.0.0.1:8080 ais show cluster
-```
-
-But if it fails with "failed to verify certificate" message, perform a simple step to configufre CLI to skip HTTPS cert validation:
-
-```console
-$ ais config cli set cluster.skip_verify_crt true
-"cluster.skip_verify_crt" set to: "true" (was: "false")
-```
-
-And then try again.
-
-### TLS: testing with self-signed certificates
-
-In the previous example, the cluster is simply ignoring SSL certificate verification due to `AIS_SKIP_VERIFY_CRT` being `true`. For a more secure setup, consider validating certificates by configuring the necessary environment variables as shown in the table below- 
-
-| var name | description | the corresponding cluster configuration |
-| -- | -- | -- |
-| `AIS_USE_HTTPS`          | when false, we use plain HTTP with all the TLS config (below) simply **ignored** | "net.http.use_https" |
-| `AIS_SERVER_CRT`         | aistore cluster X509 certificate | "net.http.server_crt" |
-| `AIS_SERVER_KEY`         | certificate's private key | "net.http.server_key"|
-| `AIS_DOMAIN_TLS`         | NOTE: not supported, must be empty (domain, hostname, or SAN registered with the certificate) | "net.http.domain_tls"|
-| `AIS_CLIENT_CA_TLS`      | Certificate authority that authorized (signed) the certificate | "net.http.client_ca_tls" |
-| `AIS_CLIENT_AUTH_TLS`    | Client authentication during TLS handshake: a range from 0 (no authentication) to 4 (request and validate client's certificate) | "net.http.client_auth_tls" |
-| `AIS_SKIP_VERIFY_CRT`    | when true: skip X509 cert verification (usually enabled to circumvent limitations of self-signed certs) | "net.http.skip_verify" |
-
-> More info on [`AIS_CLIENT_AUTH_TLS`](https://pkg.go.dev/crypto/tls#ClientAuthType).
-
-In the following example, we run https based deployment where `AIS_SKIP_VERIFY_CRT` is `false`.
-
-```console
-$ make kill
-$ # delete smaps
-$ find ~/.ais* -type f -name ".ais.smap" | xargs rm
-$ # substitute varibles in below files to point to correct certificates
-$ source ais/test/tls-env/server.conf
-$ source ais/test/tls-env/client.conf
-$ AIS_USE_HTTPS=true make deploy <<< $'6\n6\n4\ny\ny\nn\n\n'
-```
-
-Notice that when the cluster is first time deployed `server.conf` environment (above) overrides aistore cluster configuration.
-
-> Environment is ignored upon cluster restarts and upgrades.
-
-On the other hand, `ais/test/tls-env/client.conf` contains environment variables to override CLI config. The correspondence between environment and config names is easy to see as well.
-
-> See also: [Client-side TLS environment](/docs/cli.md#environment-variables)
+- [Generating self-signed certificates](https.md#generating-self-signed-certificates)
+- [Deploying: 4 targets, 1 gateway, 6 mountpaths, AWS backend](https.md#deploying-4-targets-1-gateway-6-mountpaths-aws-backend)
+- [Accessing the cluster](https.md#accessing-the-cluster)
+- [Testing with self-signed certificates](https.md#testing-with-self-signed-certificates)
+- [Updating and reloading X.509 certificates](https.md#updating-and-reloading-x509-certificates)
+- [Switching cluster between HTTP and HTTPS](https.md#switching-cluster-between-http-and-https)
 
 ## Build, Make, and Development Tools
 
@@ -601,9 +505,9 @@ In particular, the `make` provides a growing number of developer-friendly comman
 
 * **deploy** the AIS cluster on your local development machine;
 * **run** all or selected tests;
-* **instrument** AIS binary with race detection, CPU and/or memory profiling, and more.
+* **instrument** AIS binary with race detection, CPU and/or memory profiling and more.
 
-Of course, local build is intended for development only. For production, there is a separate dedicated repository (noted below).
+Of course, local build is intended for development only. For production, there is a separate [dedicated repository](https://github.com/NVIDIA/ais-k8s) noted below.
 
 In summary:
 
@@ -620,6 +524,39 @@ AIStore build supports conditional linkage of the supported remote backends: [S3
 To access remote data (and store it in-cluster), AIStore utilizes the respective provider's SDK.
 
 > For Amazon S3, that would be `aws-sdk-go-v2`, for Azure - `azure-storage-blob-go`, and so on. Each SDK can be **conditionally linked** into `aisnode` executable - the decision to link or not to link is made prior to deployment.
+
+But not only supported remote backends are conditionally linked. Overall, the following list of commented examples presents almost all supported build tags (with maybe one minor exception):
+
+```console
+# 1) build aisnode with no build tags, no debug
+$ MODE="" make node
+
+# 2) build aisnode with no build tags but with debug
+$ MODE="debug" make node
+
+# 3) all 3 cloud backends, no debug
+$ AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="" make node
+
+# 4) cloud backends, with debug
+$ AIS_BACKEND_PROVIDERS="aws azure gcp" MODE="debug" make node
+
+# 5) cloud backends, debug, statsd
+## Note: if `statsd` build tag is not specified `aisnode` will get built with Prometheus support.
+## For more information (including the binary choice between StatsD and Prometheus), please see docs/metrics.md and docs/prometheus.md
+$ TAGS="aws azure gcp statsd debug" make node
+
+# 6) statsd, debug, nethttp (note that fasthttp is used by default)
+$ TAGS="nethttp statsd debug" make node
+```
+
+In addition, to build [AuthN](/docs/authn.md), [CLI](/docs/cli.md), and/or [aisloader](/docs/aisloader.md), run:
+
+* `make authn`
+* `make cli`
+* `make aisloader`
+
+respectively. With each of these `make`s, you can also use `MODE=debug` - debug mode is universally supported.
+
 
 ## Containerized Deployments: Host Resource Sharing
 
@@ -639,14 +576,49 @@ Further, given the container's cgroup/memory limitation, each AIS node adjusts t
 
 > For technical details on AIS memory management, please see [this readme](/memsys/README.md).
 
-## Assorted command lines
+## Assorted Curl
 
-AIStore targets may execute (and parse the output of) the following command:
+Some will say that using AIS [CLI](/docs/cli.md) with aistore is an order of magnitude more convenient than [curl](https://curl.se/). Or two orders.
+
+Must be a matter of taste, though, and so here are a few `curl` examples.
+
+> As always, `http://localhost:8080` address (below) simply indicates [Local Playground](#local-playground) and must be understood as a placeholder for an _arbitrary_ aistore endpoint (`AIS_ENDPOINT`).
+
+### Example: PUT via aistore [S3 interface](/docs/s3compat.md); specify PUT content inline (in the curl command):
 
 ```console
-$ lsblk -Jt
+$ ais create ais://nnn ## create bucket, if doesn't exist
+
+$ curl -L -X PUT -d "0123456789" http://localhost:8080/s3/nnn/qqq
+
+$ ais ls ais://nnn
+NAME     SIZE
+qqq      10B
 ```
 
-**Tip**:
+### Example: same as above using [Easy URL](/docs/http_api.md#easy-url)
 
-> In fact, prior to deploying AIS cluster on a given Linux distribution the very first time, it'd make sense to maybe run the 3 commands and check output for "invalid option" or lack of thereof.
+```console
+## notice PROVIDER/BUCKET/OBJECT notation
+##
+$ curl -L -X PUT -d "0123456789" http://localhost:8080/ais/nnn/eee
+
+$ ais ls ais://nnn
+NAME     SIZE
+eee      10B
+qqq      10B
+```
+
+### Finally, same as above using native aistore API
+
+```console
+## notice '/v1/objects' API endpoint
+##
+$ curl -L -X PUT -d "0123456789" http://localhost:8080/v1/objects/nnn/uuu
+
+$ ais ls ais://nnn
+NAME     SIZE
+eee      10B
+qqq      10B
+uuu      10B
+```

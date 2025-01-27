@@ -5,8 +5,10 @@
 package ais
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -14,7 +16,7 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/archive"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 // RESTful API: datapath query parameters
@@ -45,6 +47,22 @@ type dpq struct {
 	isS3          bool // special use: frontend S3 API
 }
 
+var _except = map[string]bool{
+	apc.QparamProxyID:        false,
+	apc.QparamDontHeadRemote: false,
+
+	// flows that utilize the following query parameters perform conventional r.URL.Query()
+	s3.QparamMptUploadID: false,
+	s3.QparamMptUploads:  false,
+	s3.QparamMptPartNo:   false,
+	s3.QparamAccessKeyID: false,
+	s3.QparamExpires:     false,
+	s3.QparamSignature:   false,
+	s3.QparamXID:         false,
+
+	// plus, all headers that have s3.HeaderPrefix "X-Amz-"
+}
+
 var (
 	dpqPool sync.Pool
 	dpq0    dpq
@@ -66,18 +84,26 @@ func dpqFree(dpq *dpq) {
 // Parse URL query for a selected few parameters used in the datapath.
 // (This is a faster alternative to the conventional and RFC-compliant URL.Query()
 // to be used narrowly to handle those few (keys) and nothing else.)
+
+const maxNumQparams = 100
+
 func (dpq *dpq) parse(rawQuery string) (err error) {
-	query := rawQuery
-	for query != "" {
+	var (
+		iters int
+		query = rawQuery // r.URL.RawQuery
+	)
+	for query != "" && iters < maxNumQparams {
 		key, value := query, ""
 		if i := strings.IndexByte(key, '&'); i >= 0 {
 			key, query = key[:i], key[i+1:]
+			iters++
 		} else {
-			query = ""
+			query = "" // last iter
 		}
 		if k, v, ok := _dpqKeqV(key); ok {
 			key, value = k, v
 		}
+
 		// supported URL query parameters explicitly named below; attempt to parse anything
 		// outside this list will fail
 		switch key {
@@ -126,27 +152,21 @@ func (dpq *dpq) parse(rawQuery string) (err error) {
 		case apc.QparamLatestVer:
 			dpq.latestVer = cos.IsParseBool(value)
 
-		default:
-			debug.Func(func() {
-				switch key {
-				// not used yet
-				case apc.QparamProxyID, apc.QparamDontHeadRemote:
-
-				// flows that utilize these particular keys perform conventional
-				// `r.URL.Query()` parsing
-				case s3.QparamMptUploadID, s3.QparamMptUploads, s3.QparamMptPartNo,
-					s3.QparamAccessKeyID, s3.QparamExpires, s3.QparamSignature,
-					s3.HeaderAlgorithm, s3.HeaderCredentials, s3.HeaderDate,
-					s3.HeaderExpires, s3.HeaderSignedHeaders, s3.HeaderSignature, s3.QparamXID:
-
-				default:
-					err = fmt.Errorf("failed to fast-parse [%s], unknown key: %q", rawQuery, key)
-					debug.AssertNoErr(err)
-				}
-			})
+		default: // the key must be known or `_except`-ed
+			if strings.HasPrefix(key, s3.HeaderPrefix) {
+				continue
+			}
+			if _, ok := _except[key]; !ok {
+				err = fmt.Errorf("invalid query parameter: %q (raw query: %q)", key, rawQuery)
+				nlog.Errorln(err)
+				return err
+			}
 		}
 	}
-	return
+	if err == nil && iters >= maxNumQparams {
+		err = errors.New("exceeded max number of dpq iterations: " + strconv.Itoa(iters))
+	}
+	return err
 }
 
 func _dpqKeqV(s string) (string, string, bool) {

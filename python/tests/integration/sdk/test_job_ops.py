@@ -1,7 +1,7 @@
 #
 # Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
 #
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
@@ -59,8 +59,7 @@ class TestJobOps(RemoteEnabledTest):  # pylint: disable=unused-variable
         "Remote bucket is not set",
     )
     def test_job_wait_single_node(self):
-        obj_name = "test-obj"
-        _ = self._create_object_with_content(obj_name=obj_name)
+        obj_name, _ = self._create_object_with_content()
 
         evict_job_id = self.bucket.objects(obj_names=[obj_name]).evict()
         self.client.job(evict_job_id).wait(timeout=TEST_TIMEOUT)
@@ -73,10 +72,10 @@ class TestJobOps(RemoteEnabledTest):  # pylint: disable=unused-variable
         self._validate_objects_cached(objects, True)
 
     def test_get_within_timeframe(self):
-        start_time = datetime.now().time()
+        start_time = datetime.now(timezone.utc) - timedelta(seconds=1)
         job_id = self.client.job(job_kind="lru").start()
         self.client.job(job_id=job_id).wait()
-        end_time = datetime.now().time()
+        end_time = datetime.now(timezone.utc) + timedelta(seconds=1)
         self.assertNotEqual(job_id, "")
         jobs_list = self.client.job(job_id=job_id).get_within_timeframe(
             start_time=start_time, end_time=end_time

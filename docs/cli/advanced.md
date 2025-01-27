@@ -7,42 +7,36 @@ redirect_from:
  - /docs/cli/advanced.md/
 ---
 
-# `ais advanced` commands
-
-Commands for special use cases (e.g. scripting) and *advanced* usage scenarios, whereby a certain level of understanding of possible consequences is implied and required:
-
-```console
-$ ais advanced --help
-NAME:
-   ais advanced - special commands intended for development and advanced usage
-
-USAGE:
-   ais advanced command [command options] [arguments...]
-
-COMMANDS:
-   gen-shards        generate and write random TAR shards, e.g.:
-                     - gen-shards 'ais://bucket1/shard-{001..999}.tar' - write 999 random shards (default sizes) to ais://bucket1
-                     - gen-shards 'gs://bucket2/shard-{01..20..2}.tgz' - 10 random gzipped tarfiles to Cloud bucket
-                     (notice quotation marks in both cases)
-   resilver          resilver user data on a given target (or all targets in the cluster): fix data redundancy
-                     with respect to bucket configuration, remove migrated objects and old/obsolete workfiles
-   preload           preload object metadata into in-memory cache
-   remove-from-smap  immediately remove node from cluster map (beware: potential data loss!)
-   random-node       print random node ID (by default, ID of a randomly selected target)
-   random-mountpath  print a random mountpath from a given target
-   rotate-logs       rotate aistore logs
-   enable-backend    (re)enable cloud backend
-   disable-backend   disable cloud backend
- ```
-
-AIS CLI features a number of miscellaneous and advanced-usage commands.
+Commands for special use cases (e.g. scripting) and *advanced* usage scenarios, whereby a certain level of understanding of possible consequences is assumed (and required).
 
 ## Table of Contents
+- [`ais advanced`](#ais-advanced)
 - [Manual Resilvering](#manual-resilvering)
 - [Preload bucket](#preload-bucket)
 - [Remove node from Smap](#remove-node-from-smap)
 - [Rotate logs: individual nodes or entire cluster](#rotate-logs-individual-nodes-or-entire-cluster)
 - [Disable/Enable cloud backend at runtime](#disableenable-cloud-backend-at-runtime)
+
+## `ais advanced`
+
+```console
+$ ais advanced --help
+
+USAGE:
+   ais advanced command [command options] [arguments...]
+
+COMMANDS:
+   resilver          resilver user data on a given target (or all targets in the cluster); entails:
+                     - fix data redundancy with respect to bucket configuration;
+                     - remove migrated objects and old/obsolete workfiles.
+   preload           preload object metadata into in-memory cache
+   remove-from-smap  immediately remove node from cluster map (beware: potential data loss!)
+   random-node       print random node ID (by default, ID of a randomly selected target)
+   random-mountpath  print a random mountpath from a given target
+   rotate-logs       rotate aistore logs
+   enable-backend    (re)enable cloud backend (see also: 'ais config cluster backend')
+   disable-backend   disable cloud backend (see also: 'ais config cluster backend')
+```
 
 ## Manual Resilvering
 
@@ -65,9 +59,7 @@ Started resilver "NGxmOthtE", use 'ais show job xaction NGxmOthtE' to monitor th
 
 `ais advanced preload BUCKET`
 
-Preload bucket's objects metadata into in-memory caches.
-
-### Examples
+Preload objects metadata into in-memory cache.
 
 ```console
 $ ais advanced preload ais://bucket
@@ -77,7 +69,7 @@ $ ais advanced preload ais://bucket
 
 `ais advanced remove-from-smap NODE_ID`
 
-Immediately remove node from the cluster map.
+Immediately remove node from the cluster map (a.k.a. Smap).
 
 Beware! When the node in question is ais target, the operation may (and likely will) result in a data loss that cannot be undone. Use decommission and start/stop maintenance operations to perform graceful removal.
 
@@ -93,11 +85,15 @@ xVMNp8081        0.16%           31.12GiB        6m50s
 MvwQp8080[P]     0.18%           31.12GiB        6m40s
 NnPLp8082        0.16%           31.12GiB        6m50s
 
-
 $ ais advanced remove-from-smap MvwQp8080
 Node MvwQp 8080 is primary: cannot remove
 
 $ ais advanced remove-from-smap p[xVMNp8081]
+```
+
+And the result:
+
+```console
 $ ais show cluster proxy
 PROXY            MEM USED %      MEM AVAIL       UPTIME
 BcnQp8083        0.16%           31.12GiB        8m
@@ -151,6 +147,7 @@ This capability is now supported, and will be included in v3.24 release. And the
 ### Examples
 
 **1)** say, there's a cloud bucket with 4 objects:
+
 ```console
 $ ais ls s3://test-bucket
 NAME     SIZE            CACHED
@@ -163,6 +160,7 @@ NAME     SIZE            CACHED
 Note that only 2 objects out of 4 are in-cluster.
 
 **2)** disable s3 backend:
+
 ```console
 $ ais advanced disable-backend <TAB-TAB>
 gcp     aws     azure
@@ -172,12 +170,14 @@ cluster: disabled aws backend
 ```
 
 **3)** observe "offline" error when trying to list the bucket:
+
 ```console
 $ ais ls s3://test-bucket
 Error: ErrRemoteBucketOffline: bucket "s3://test-bucket" is currently unreachable
 ```
 
 **4)** but (!) all in-cluster objects can still be listed:
+
 ```console
 $ ais ls s3://test-bucket --cached
 NAME     SIZE
@@ -186,24 +186,28 @@ NAME     SIZE
 ```
 
 **5)** and read:
+
 ```console
 $ ais get s3://test-bucket/111 /dev/null
-GET and discard 111 from s3://test-bucket (15.97KiB)
+GET (and discard) 111 from s3://test-bucket (15.97KiB)
 ```
 
 **6)** expectedly, remote objects are not accessible:
+
 ```console
 $ ais get s3://test-bucket/333 /dev/null
 Error: object "s3://test-bucket/333" does not exist
 ```
 
 **7)** let's now reconnect s3:
+
 ```console
 $ ais advanced enable-backend aws
 cluster: enabled aws backend
 ```
 
-**8)** and observer that both in-cluster and remote content is now again available:
+**8)** finally, observe that both in-cluster and remote content is now again available:
+
 ```console
 $ ais ls s3://test-bucket
 NAME     SIZE            CACHED
@@ -213,5 +217,5 @@ NAME     SIZE            CACHED
 444      15.97KiB        no
 
 $ ais get s3://test-bucket/333 /dev/null
-GET and discard 333 from s3://test-bucket (15.97KiB)
+GET (and discard) 333 from s3://test-bucket (15.97KiB)
 ```

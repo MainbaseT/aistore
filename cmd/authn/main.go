@@ -1,6 +1,6 @@
 // Package authn is authentication server for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
@@ -22,8 +22,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/kvdb"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
-
-const secretKeyPodEnv = "SECRETKEY" // via https://kubernetes.io/docs/concepts/configuration/secret
 
 var (
 	build     string
@@ -62,18 +60,19 @@ func main() {
 		configDir = confDirFlag.Value.String()
 	}
 	if configDir == "" {
-		configDir = os.Getenv(env.AuthN.ConfDir)
+		configDir = os.Getenv(env.AisAuthConfDir)
 	}
 	if configDir == "" {
 		cos.ExitLogf("Missing %s configuration file (to specify, use '-%s' option or '%s' environment)",
-			svcName, confDirFlag.Name, env.AuthN.ConfDir)
+			svcName, confDirFlag.Name, env.AisAuthConfDir)
 	}
 	configPath = filepath.Join(configDir, fname.AuthNConfig)
 	if _, err := jsp.LoadMeta(configPath, Conf); err != nil {
 		cos.ExitLogf("Failed to load configuration from %q: %v", configPath, err)
 	}
-	if val := os.Getenv(secretKeyPodEnv); val != "" {
-		Conf.Server.Secret = val
+	Conf.Init()
+	if val := os.Getenv(env.AisAuthSecretKey); val != "" {
+		Conf.SetSecret(&val)
 	}
 	if err := updateLogOptions(); err != nil {
 		cos.ExitLogf("Failed to set up logger: %v", err)
@@ -87,9 +86,9 @@ func main() {
 	if err != nil {
 		cos.ExitLogf("Failed to init local database: %v", err)
 	}
-	mgr, err := newMgr(driver)
+	mgr, code, err := newMgr(driver)
 	if err != nil {
-		cos.ExitLogf("Failed to init manager: %v", err)
+		cos.ExitLogf("Failed to init manager: %v(%d)", err, code)
 	}
 
 	nlog.Infof("Version %s (build %s)\n", cmn.VersionAuthN+"."+build, buildtime)
@@ -107,10 +106,11 @@ func main() {
 }
 
 func updateLogOptions() error {
-	if err := cos.CreateDir(Conf.Log.Dir); err != nil {
-		return fmt.Errorf("failed to create log dir %q, err: %v", Conf.Log.Dir, err)
+	logDir := cos.GetEnvOrDefault(env.AisAuthLogDir, Conf.Log.Dir)
+	if err := cos.CreateDir(logDir); err != nil {
+		return fmt.Errorf("failed to create log dir %q, err: %v", logDir, err)
 	}
-	nlog.SetLogDirRole(Conf.Log.Dir, "auth")
+	nlog.SetPre(logDir, "auth")
 	return nil
 }
 

@@ -172,7 +172,7 @@ host_bucket="--host-bucket=$s3endpoint/%(bucket)"
 ```
 
 > Separately, note that by default aistore handles S3 API at its `AIS_ENDPOINT/s3` endpoint (e.g., `localhost:8080/s3`).
-> However, any aistore cluster is configurable to accept S3 API at its root as well. That is, without the "/s3" suffix shown above. 
+> However, any aistore cluster is **configurable** to accept S3 API calls at its root as well. That is, without the "/s3" suffix shown above.
 
 Back to running `s3cmd` though - the second, and arguably the easiest, way is exemplified by the `diff` below:
 
@@ -346,7 +346,7 @@ $ diff -uN ~/.s3cfg.orig ~/.s3cfg
  invalidate_default_index_root_on_cf = True
 ```
 
-Goes without saying that `localhost:8080` (above) can be replaced with any legitimate (http or https) address of any AIS gateway.
+> **NOTE:** `localhost:8080` (above) can be replaced with any legitimate (http or https) address of any AIS gateway. The latter may - but not necessarily have to - be specified with the environment variable `AIS ENDPOINT`.
 
 The following further assumes that `abc` is an AIStore bucket, while `my-s3-bucket` is S3 bucket that _this_ AIStore cluster can access.
 
@@ -399,6 +399,37 @@ In other words, `s3cmd` does not recognize any prefix other than `s3://`.
 In the examples above, the `mmm` and `nnn` buckets are, actually, AIS buckets with no [remote backends](/docs/providers.md).
 
 Nevertheless, when using `s3cmd` we have to reference them as `s3://mmm` and `s3://nnn`, respectively.
+
+## S3CMD with AIStore Authentication (AuthN)
+
+When [Auth](https://github.com/NVIDIA/aistore/blob/main/docs/authn.md) is enabled on AIStore, it expects a JWT token for each request. Unfortunately, using the `--add-header` option in `s3cmd` doesn't work because the header gets overwritten with the signature and signing algorithm when the actual request is made.
+
+To overcome this, you can modify the `S3.py` file in `s3cmd` to include the JWT token directly in the `Authorization` header before the request is sent.
+
+### Example:
+
+In the `S3.py` file (found in the [S3CMD GitHub repository](https://github.com/s3tools/s3cmd/blob/master/S3/S3.py)), add the following line before the request is sent:
+
+```python
+self.headers["Authorization"] = "Bearer <token>"
+```
+
+### Git Diff for reference:
+```diff
+$ git diff
+diff --git a/S3/S3.py b/S3/S3.py
+index d4cac8f..9fa1496 100644
+--- a/S3/S3.py
++++ b/S3/S3.py
+@@ -210,6 +210,7 @@ class S3Request(object):
+         resource['uri'] = s3_quote(resource['uri'], quote_backslashes=False, unicode_output=True)
+         # Get the final uri by adding the uri parameters
+         resource['uri'] += format_param_str(self.params)
++        self.headers["Authorization"] = "Bearer <token>"
+         return (self.method_string, resource, self.headers)
+```
+
+Adding this line ensures that the `Authorization` header contains the correct token for requests to the AIStore server.
 
 For table summary documenting AIS/S3 compatibility and further discussion, please see:
 

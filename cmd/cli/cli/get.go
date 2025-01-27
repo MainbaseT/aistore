@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -77,7 +77,7 @@ func getHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if !bck.IsHTTP() {
+	if shouldHeadRemote(c, bck) {
 		if bck.Props, err = headBucket(bck, false /* don't add */); err != nil {
 			return err
 		}
@@ -218,16 +218,16 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	}
 
 	// list-objects
-	objList, err := api.ListObjects(apiBP, bck, msg, lsargs)
+	lst, err := api.ListObjects(apiBP, bck, msg, lsargs)
 	if err != nil {
 		return V(err)
 	}
 	if lstFilter._len() > 0 {
-		objList.Entries, _ = lstFilter.apply(objList.Entries)
+		lst.Entries, _ = lstFilter.apply(lst.Entries)
 	}
 
 	// can't do many to one
-	l := len(objList.Entries)
+	l := len(lst.Entries)
 	if l > 1 {
 		if outFile != "" && outFile != fileStdIO && !discardOutput(outFile) {
 			finfo, errEx := os.Stat(outFile)
@@ -239,7 +239,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	}
 	// total size
 	var totalSize int64
-	for _, entry := range objList.Entries {
+	for _, entry := range lst.Entries {
 		totalSize += entry.Size
 	}
 	// announce, confirm
@@ -250,19 +250,21 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 		units, errU  = parseUnitsFlag(c, unitsFlag)
 	)
 	if errU != nil {
-		return err
+		return errU
 	}
 
-	if discardOutput(outFile) {
+	switch {
+	case discardOutput(outFile):
 		discard = " (and discard)"
-	} else if outFile == fileStdIO {
+	case outFile == fileStdIO:
 		out = " to standard output"
-	} else {
+	default:
 		out = outFile
 		if out != "" {
 			out = cos.TrimLastB(out, filepath.Separator)
 		}
 	}
+
 	if flagIsSet(c, lengthFlag) {
 		verb = "Read range"
 	}
@@ -272,7 +274,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 
 	if flagIsSet(c, yesFlag) && (l > 1 || quiet) {
 		fmt.Fprintln(c.App.Writer, cptn)
-	} else if ok := confirm(c, cptn); !ok {
+	} else if !confirm(c, cptn) {
 		return nil
 	}
 	// context to get in parallel
@@ -283,7 +285,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 	if u.showProgress {
 		var (
 			filesBarArg = barArgs{ // bar[0]
-				total:   int64(len(objList.Entries)),
+				total:   int64(len(lst.Entries)),
 				barText: "Objects:    ",
 				barType: unitsArg,
 			}
@@ -298,42 +300,44 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 		u.barObjs = totalBars[0]
 		u.barSize = totalBars[1]
 	}
-	for _, entry := range objList.Entries {
+	for _, en := range lst.Entries {
 		var shardName string
 
 		// NOTE: s3.ListObjectsV2 _may_ return a directory - filtering out
-		if err := cmn.ValidateObjName(entry.Name); err != nil {
-			warn := fmt.Sprintf("%v in the list-objects results (ignored)", err)
-			actionNote(c, warn)
+		if cos.IsLastB(en.Name, filepath.Separator) {
+			actionNote(c, "virtual directory '"+en.Name+"' in 'list-objects' results (skipping)")
+			continue
+		}
+		if err := cmn.ValidOname(en.Name); err != nil {
 			continue
 		}
 
-		if entry.IsInsideArch() {
+		if en.IsAnyFlagSet(apc.EntryInArch) {
 			if origPrefix != msg.Prefix {
-				if !strings.HasPrefix(entry.Name, origPrefix) {
+				if !strings.HasPrefix(en.Name, origPrefix) {
 					// skip
 					if u.showProgress {
 						u.barObjs.IncrInt64(1)
-						u.barSize.IncrInt64(entry.Size)
+						u.barSize.IncrInt64(en.Size)
 					}
 					continue
 				}
 			}
-			for _, shardEntry := range objList.Entries {
-				if shardEntry.IsListedArch() && strings.HasPrefix(entry.Name, shardEntry.Name+"/") {
+			for _, shardEntry := range lst.Entries {
+				if shardEntry.IsAnyFlagSet(apc.EntryIsArchive) && strings.HasPrefix(en.Name, shardEntry.Name+"/") {
 					shardName = shardEntry.Name
 					break
 				}
 			}
 			if shardName == "" {
 				// should not be happening
-				warn := fmt.Sprintf("archived file %q: cannot find parent shard in the listed results", entry.Name)
+				warn := fmt.Sprintf("archived file %q: cannot find parent shard in the listed results", en.Name)
 				actionWarn(c, warn)
 				continue
 			}
 		}
 		u.wg.Add(1)
-		go u.get(c, bck, entry, shardName, outFile, quiet, extract)
+		go u.get(c, bck, en, shardName, outFile, quiet, extract)
 	}
 	u.wg.Wait()
 
@@ -442,7 +446,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 				// TODO: strictly speaking: fstat again and confirm if exists
 			} else if finfo.Mode().IsRegular() && !flagIsSet(c, yesFlag) { // `/dev/null` is fine
 				warn := fmt.Sprintf("overwrite existing %q", outFile)
-				if ok := confirm(c, warn); !ok {
+				if !confirm(c, warn) {
 					return nil
 				}
 			}
@@ -466,10 +470,10 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 			}
 			hdr.Set(apc.HdrBlobChunk, parseStrFlag(c, chunkSizeFlag))
 		}
-		if flagIsSet(c, numWorkersFlag) {
-			nw := parseIntFlag(c, numWorkersFlag)
+		if flagIsSet(c, numBlobWorkersFlag) {
+			nw := parseIntFlag(c, numBlobWorkersFlag)
 			if nw <= 0 || nw > 128 {
-				return fmt.Errorf("invalid %s=%d: expecting (1..128) range", flprn(numWorkersFlag), nw)
+				return fmt.Errorf("invalid %s=%d: expecting (1..128) range", flprn(numBlobWorkersFlag), nw)
 			}
 			hdr.Set(apc.HdrBlobWorkers, strconv.Itoa(nw))
 		}
@@ -477,18 +481,19 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 		if !quiet {
 			now = mono.NanoTime()
 		}
-	} else if flagIsSet(c, chunkSizeFlag) || flagIsSet(c, numWorkersFlag) {
+	} else if flagIsSet(c, chunkSizeFlag) || flagIsSet(c, numBlobWorkersFlag) {
 		return fmt.Errorf("command line options (%s, %s) can be used only together with %s",
-			qflprn(chunkSizeFlag), qflprn(numWorkersFlag), qflprn(blobDownloadFlag))
+			qflprn(chunkSizeFlag), qflprn(numBlobWorkersFlag), qflprn(blobDownloadFlag))
 	}
 
 	var getArgs api.GetArgs
-	if outFile == fileStdIO {
+	switch {
+	case outFile == fileStdIO:
 		getArgs = api.GetArgs{Writer: os.Stdout, Header: hdr}
 		quiet = true
-	} else if discardOutput(outFile) {
+	case discardOutput(outFile):
 		getArgs = api.GetArgs{Writer: io.Discard, Header: hdr}
-	} else {
+	default:
 		var file *os.File
 		if file, err = os.Create(outFile); err != nil {
 			return err
@@ -631,7 +636,7 @@ func (a *qparamArch) getQuery(c *cli.Context, bck *cmn.Bck) (q url.Values) {
 			q = make(url.Values, 4)
 		}
 	}
-	if bck.IsHTTP() {
+	if bck.IsHT() {
 		f()
 		uri := c.Args().Get(0)
 		q.Set(apc.QparamOrigURL, uri)
@@ -727,9 +732,4 @@ func (ex *extractor) _write(filename string, size int64, wfh *os.File, reader io
 // discard
 func discardOutput(outf string) bool {
 	return outf == "/dev/null" || outf == "dev/null" || outf == "dev/nil"
-}
-
-// rr
-func errRangeReadArch(what string) error {
-	return fmt.Errorf("cannot range-read (%s, %s) archived content (%s) - "+NIY, qflprn(lengthFlag), qflprn(offsetFlag), what)
 }

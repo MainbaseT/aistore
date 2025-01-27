@@ -304,7 +304,7 @@ func (ic *ic) handleGet(w http.ResponseWriter, r *http.Request) {
 func (ic *ic) handlePost(w http.ResponseWriter, r *http.Request) {
 	var (
 		smap = ic.p.owner.smap.get()
-		msg  = &aisMsg{}
+		msg  = &actMsgExt{}
 	)
 	if err := cmn.ReadJSON(w, r, msg); err != nil {
 		return
@@ -429,7 +429,7 @@ func (ic *ic) syncICBundle() error {
 			Query:  url.Values{apc.QparamWhat: []string{apc.WhatICBundle}},
 		}
 		cargs.timeout = cmn.Rom.CplaneOperation()
-		cargs.cresv = cresIC{} // -> icBundle
+		cargs.cresv = cresjGeneric[icBundle]{}
 	}
 	res := ic.p.call(cargs, smap)
 	freeCargs(cargs)

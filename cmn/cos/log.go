@@ -12,11 +12,19 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
-func Infof(format string, a ...any) {
+func Infoln(a ...any) {
 	if flag.Parsed() {
-		nlog.InfoDepth(1, fmt.Sprintf(format, a...))
+		nlog.InfoDepth(1, a...)
 	} else {
-		fmt.Printf(format+"\n", a...)
+		fmt.Println(a...)
+	}
+}
+
+func Errorln(a ...any) {
+	if flag.Parsed() {
+		nlog.ErrorDepth(1, a...)
+	} else {
+		fmt.Fprintln(os.Stderr, a...)
 	}
 }
 

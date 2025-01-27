@@ -12,9 +12,9 @@ redirect_from:
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Go Report Card](https://goreportcard.com/badge/github.com/NVIDIA/aistore)
 
-AIStore (AIS for short) is a built from scratch, lightweight storage stack tailored for AI apps. It's an elastic cluster that can grow and shrink at runtime and can be ad-hoc deployed, with or without Kubernetes, anywhere from a single Linux machine to a bare-metal cluster of any size.
+AIStore (AIS for short) is a built-from-scratch, lightweight storage stack tailored for AI apps. It's an elastic cluster that can grow and shrink at runtime and can be ad-hoc deployed, with or without Kubernetes, anywhere from a single Linux machine to a bare-metal cluster of any size.
 
-AIS [consistently shows balanced I/O distribution and linear scalability](https://aiatscale.org/blog/2024/02/16/multihome-bench) across arbitrary numbers of clustered nodes. The ability to scale linearly with each added disk was, and remains, one of the main incentives. Much of the initial design was also driven by the ideas to [offload](https://aiatscale.org/blog/2023/06/09/aisio-transforms-with-webdataset-pt-3) custom dataset transformations (often referred to as [ETL](https://aiatscale.org/blog/2021/10/21/ais-etl-1)). And finally, since AIS is a software system that aggregates Linux machines to provide storage for user data, there's the requirement number one: reliability and data protection.
+AIS [consistently shows balanced I/O distribution and linear scalability](https://aistore.nvidia.com/blog/2024/02/16/multihome-bench) across arbitrary numbers of clustered nodes. The ability to scale linearly with each added disk was, and remains, one of the main incentives. Much of the initial design was also driven by the ideas to [offload](https://aistore.nvidia.com/blog/2023/06/09/aisio-transforms-with-webdataset-pt-3) custom dataset transformations (often referred to as [ETL](https://aistore.nvidia.com/blog/2021/10/21/ais-etl-1)). And finally, since AIS is a software system that aggregates Linux machines to provide storage for user data, there's the requirement number one: reliability and data protection.
 
 ## Features
 
@@ -43,9 +43,9 @@ For developers and data scientists, there's also:
   - [Python SDK reference guide](/docs/python_sdk.md)
 * [PyTorch integration](https://github.com/NVIDIA/aistore/tree/main/python/aistore/pytorch) and usage examples
 * [Boto3 support](https://github.com/NVIDIA/aistore/tree/main/python/aistore/botocore_patch) for interoperability with AWS SDK for Python (aka [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html)) client
-  - and other [Botocore](https://github.com/boto/botocorehttps://github.com/boto/botocore) derivatives.
+  - and other [Botocore](https://github.com/boto/botocore) derivatives.
 
-For the original AIStore **white paper** and design philosophy, for introduction to large-scale deep learning and the most recently added features, please see [AIStore Overview](/docs/overview.md) (where you can also find six alternative ways to work with existing datasets). Videos and **animated presentations** can be found at [videos](/docs/videos.md).
+For the original AIStore **white paper** and design philosophy, for introduction to large-scale deep learning and the most recently added features, please see [AIStore Overview](/docs/overview.md) (where you can also find six alternative ways to work with existing datasets). For our 2024 KubeCon presentation, please see [AIStore: enhancing petascale Deep Learning across Cloud backends](https://www.youtube.com/watch?v=N-d9cbROndg).
 
 Finally, [getting started](/docs/getting_started.md) with AIS takes only a few minutes.
 
@@ -53,13 +53,15 @@ Finally, [getting started](/docs/getting_started.md) with AIS takes only a few m
 
 ## Deployment options
 
-AIS deployment options, as well as intended (development vs. production vs. first-time) usages, are all [summarized here](deploy/README.md).
+AIS deployment options, as well as intended (development vs. production vs. first-time) usages, are all [summarized here](/deploy/README.md).
 
-Since prerequisites boil down to, essentially, having Linux with a disk the deployment options range from [all-in-one container](/docs/videos.md#minimal-all-in-one-standalone-docker) to a petascale bare-metal cluster of any size, and from a single VM to multiple racks of high-end servers. But practical use cases require, of course, further consideration and may include:
+Since the prerequisites essentially boil down to having Linux with a disk the deployment options range from [all-in-one container](https://github.com/NVIDIA/aistore/tree/main/deploy/prod/docker/single) to a petascale bare-metal cluster of any size, and from a single VM to multiple racks of high-end servers. Practical use cases require, of course, further consideration.
+
+Some of the most popular deployment options include:
 
 | Option | Objective |
 | --- | ---|
-| [Local playground](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#local-playground) | AIS developers and development, Linux or Mac OS |
+| [Local playground](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#local-playground) | AIS developers or first-time users, Linux or Mac OS; to get started, run `make kill cli aisloader deploy <<< $'N\nM'`, where `N` is a number of [targets](/docs/overview.md#terminology), `M` - [gateways](/docs/overview.md#terminology) |
 | Minimal production-ready deployment | This option utilizes preinstalled docker image and is targeting first-time users or researchers (who could immediately start training their models on smaller datasets) |
 | [Easy automated GCP/GKE deployment](https://github.com/NVIDIA/aistore/blob/main/docs/getting_started.md#kubernetes-deployments) | Developers, first-time users, AI researchers |
 | [Large-scale production deployment](https://github.com/NVIDIA/ais-k8s) | Requires Kubernetes and is provided via a separate repository: [ais-k8s](https://github.com/NVIDIA/ais-k8s) |
@@ -79,16 +81,16 @@ AIStore supports multiple ways to populate itself with existing datasets, includ
 * **copy** multiple matching objects;
 * **archive** multiple objects
 * **prefetch** remote bucket or parts of thereof;
-* **download** raw http(s) addressible directories, including (but not limited to) Cloud storages;
-* **promote** NFS or SMB shares accessible by one or multiple (or all) AIS target nodes;
+* **download** raw http(s) addressable directories, including (but not limited to) Cloud storages;
+* **promote** NFS or SMB shares accessible by one or multiple (or all) AIS [target](/docs/overview.md#terminology) nodes;
 
-> The on-demand "way" is maybe the most popular, whereby users just start running their workloads against a [remote bucket](docs/providers.md) with AIS cluster positioned as an intermediate fast tier.
+> The on-demand "way" is maybe the most popular, whereby users just start running their workloads against a [remote bucket](/docs/providers.md) with AIS cluster positioned as an intermediate fast tier.
 
 But there's more. In [v3.22](https://github.com/NVIDIA/aistore/releases/tag/v1.3.22), we introduce [blob downloader](/docs/blob_downloader.md), a special facility to download very large remote objects (BLOBs). And in [v3.23](https://github.com/NVIDIA/aistore/releases/tag/v1.3.23), there's a new capability, dubbed [bucket inventory](/docs/s3inventory.md), to list very large S3 buckets _fast_.
 
 ## Installing from release binaries
 
-Generally, AIStore (cluster) requires at least some sort of [deployment](/deploy#contents) procedure. There are standalone binaries, though, that can be [built](Makefile) from source or, alternatively, installed directly from GitHub:
+Generally, AIStore (cluster) requires at least some sort of [deployment](/deploy#contents) procedure. There are standalone binaries, though, that can be [built](/Makefile) from source or installed directly from GitHub:
 
 ```console
 $ ./scripts/install_from_binaries.sh --help
@@ -98,30 +100,18 @@ The script installs [aisloader](/docs/aisloader.md) and [CLI](/docs/cli.md) from
 
 ## PyTorch integration
 
-AIS is one of the PyTorch [Iterable Datapipes](https://github.com/pytorch/data/tree/main/torchdata/datapipes/iter/load#iterable-datapipes).
+PyTorch integration is a growing set of datasets (both iterable and map-style), samplers, and dataloaders:
 
-Specifically, [TorchData](https://github.com/pytorch/data) library provides:
-* [AISFileLister](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLister.html#aisfilelister)
-* [AISFileLoader](https://pytorch.org/data/main/generated/torchdata.datapipes.iter.AISFileLoader.html#aisfileloader)
+* [Taxonomy of abstractions and API reference](/docs/pytorch.md)
+* [AIS plugin for PyTorch: usage examples](https://github.com/NVIDIA/aistore/tree/main/python/aistore/pytorch/README.md)
+* [Jupyter notebook examples](https://github.com/NVIDIA/aistore/tree/main/python/examples/aisio-pytorch/)
 
-to list and, respectively, load data from AIStore.
-
-Further references and usage examples - in our technical blog at https://aiatscale.org/blog:
-* [PyTorch: Loading Data from AIStore](https://aiatscale.org/blog/2022/07/12/aisio-pytorch)
-* [Python SDK: Getting Started](https://aiatscale.org/blog/2022/07/20/python-sdk)
-
-Since AIS natively supports a number of [remote backends](/docs/providers.md), you can also use (PyTorch + AIS) to iterate over Amazon S3 and Google Cloud buckets, and more.
-
-## Reuse
-
-This repo includes [SGL and Slab allocator](/memsys) intended to optimize memory usage, [Streams and Stream Bundles](/transport) to multiplex messages over long-lived HTTP connections, and a few other sub-packages providing rather generic functionality.
-
-With a little effort, they all could be extracted and used outside.
+Since AIS natively supports [remote backends](/docs/providers.md), you can also use (PyTorch + AIS) to iterate over Amazon S3, GCS and Azure buckets, and more.
 
 ## Guides and References
 
 - [Getting Started](/docs/getting_started.md)
-- [Technical Blog](https://aiatscale.org/blog)
+- [Technical Blog](https://aistore.nvidia.com/blog)
 - API and SDK
   - [Go (language) API](https://github.com/NVIDIA/aistore/tree/main/api)
   - [Python SDK](https://github.com/NVIDIA/aistore/tree/main/python/aistore), and also:
@@ -150,9 +140,6 @@ With a little effort, they all could be extracted and used outside.
   - [Jobs](/docs/cli/job.md)
 - Security and Access Control
   - [Authentication Server (AuthN)](/docs/authn.md)
-- Tutorials
-  - [Tutorials](/docs/tutorials/README.md)
-  - [Videos](/docs/videos.md)
 - Power tools and extensions
   - [Reading, writing, and listing *archives*](/docs/archive.md)
   - [Distributed Shuffle](/docs/dsort.md)
@@ -186,27 +173,28 @@ With a little effort, they all could be extracted and used outside.
   - [CLI: `ais config`](/docs/cli/config.md)
   - [Feature flags](/docs/feature_flags.md)
 - Observability
-  - [Observability](/docs/metrics.md)
   - [Prometheus](/docs/prometheus.md)
+    - [Reference: all supported metrics](/docs/metrics-reference.md)
+  - [Observability overview: StatsD and Prometheus, logs, and CLI](/docs/metrics.md)
   - [CLI: `ais show performance`](/docs/cli/show.md)
 - For users and developers
   - [Getting started](/docs/getting_started.md)
   - [Docker](/docs/docker_main.md)
   - [Useful scripts](/docs/development.md)
-  - Profiling, race-detecting, and more
+  - Profiling, race-detecting and more
 - Batch jobs
   - [Batch operations](/docs/batch.md)
-  - [eXtended Actions (xactions)](/xact/README.md)
+  - [eXtended Actions (xactions)](https://github.com/NVIDIA/aistore/blob/main/xact/README.md)
   - [CLI: `ais job`](/docs/cli/job.md) and [`ais show job`](/docs/cli/show.md), including:
-    - [prefetch remote dataset](/docs/cli/object.md#prefetch-objects)
-    - [copy bucket](/docs/cli/bucket.md#copy-bucket)
-    - [copy multiple objects](/docs/cli/bucket.md#copy-multiple-objects)
+    - [prefetch remote datasets](/docs/cli/object.md#prefetch-objects)
+    - [copy (list, range, and/or prefix) selected objects or entire (in-cluster or remote) buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
     - [download remote BLOBs](/docs/cli/blob-downloader.md)
-    - [promote NFS or SMB share](https://aiatscale.org/blog/2022/03/17/promote), and more
+    - [promote NFS or SMB share](https://aistore.nvidia.com/blog/2022/03/17/promote)
 - Assorted Topics
+  - [Virtual directories](/docs/howto_virt_dirs.md)
   - [System files](/docs/sysfiles.md)
-  - [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
-  - [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
+  - [HTTPS: loading, reloading, and generating certificates; switching cluster between HTTP and HTTPS](/docs/https.md)
+    - [Managing TLS Certificates](/docs/cli/x509.md)
   - [Feature flags](/docs/feature_flags.md)
   - [`aisnode` command line](/docs/command_line.md)
   - [Traffic patterns](/docs/traffic_patterns.md)

@@ -29,7 +29,7 @@ Majority of the configuration knobs can be changed at runtime (and at any time).
 
 For the most part, commands to view and update (CLI, cluster, node) configuration can be found [here](/docs/cli/config.md).
 
-The [same document](docs/cli/config.md) also contains a brief theory of operation, command descriptions, numerous usage examples, and more.
+The [same document](/docs/cli/config.md) also contains a brief theory of operation, command descriptions, numerous usage examples and more.
 
 > **Important:** as an input, CLI accepts both plain text and JSON-formatted values. For the latter, make sure to embed the (JSON value) argument into single quotes, e.g.:
 
@@ -328,7 +328,6 @@ In the `DEFAULT` column above hyphen (`-`) indicates that the corresponding valu
 - [Enabling HTTPS](#enabling-https)
 - [Filesystem Health Checker](#filesystem-health-checker)
 - [Networking](#networking)
-- [Reverse proxy](#reverse-proxy)
 - [Curl examples](#curl-examples)
 - [CLI examples](#cli-examples)
 
@@ -505,7 +504,7 @@ Configuration option `fspaths` specifies the list of local mountpath directories
 
 > In regards **non-sharing of disks** between mountpaths: for development we make an exception, such that multiple mountpaths are actually allowed to share a disk and coexist within a single filesystem. This is done strictly for development convenience, though.
 
-AIStore [REST API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](/health/fshc.md).
+AIStore [REST API](http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](https://github.com/NVIDIA/aistore/blob/main/fs/health/README.md).
 
 ## Disabling extended attributes
 
@@ -534,12 +533,16 @@ If extended attributes are disabled globally when deploying a cluster, node IDs 
 
 ## Enabling HTTPS
 
-To switch from HTTP protocol to an encrypted HTTPS, configure `net.http.use_https`=`true` and modify `net.http.server_crt` and `net.http.server_key` values so they point to your OpenSSL certificate and key files respectively (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)).
+To switch from HTTP protocol to an encrypted HTTPS, configure `net.http.use_https`=`true` and modify `net.http.server_crt` and `net.http.server_key` values so they point to your TLS certificate and key files respectively (see [AIStore configuration](/deploy/dev/local/aisnode_config.sh)).
 
-See also:
+The following HTTPS topics are also covered elsewhere:
 
-* [HTTPS from scratch](/docs/getting_started.md)
-* [Switching an already deployed cluster between HTTP and HTTPS](/docs/switch_https.md)
+- [Generating self-signed certificates](https.md#generating-self-signed-certificates)
+- [Deploying: 4 targets, 1 gateway, 6 mountpaths, AWS backend](https.md#deploying-4-targets-1-gateway-6-mountpaths-aws-backend)
+- [Accessing the cluster](https.md#accessing-the-cluster)
+- [Testing with self-signed certificates](https.md#testing-with-self-signed-certificates)
+- [Updating and reloading X.509 certificates](https.md#updating-and-reloading-x509-certificates)
+- [Switching cluster between HTTP and HTTPS](https.md#switching-cluster-between-http-and-https)
 
 ## Filesystem Health Checker
 
@@ -547,7 +550,7 @@ Default installation enables filesystem health checker component called FSHC. FS
 
 When enabled, FSHC gets notified on every I/O error upon which it performs extensive checks on the corresponding local filesystem. One possible outcome of this health-checking process is that FSHC disables the faulty filesystems leaving the target with one filesystem less to distribute incoming data.
 
-Please see [FSHC readme](/health/fshc.md) for further details.
+Please see [FSHC readme](https://github.com/NVIDIA/aistore/blob/main/fs/health/README.md) for further details.
 
 ## Networking
 
@@ -604,10 +607,6 @@ Separately, there's a **multi-homing** capability motivated by the fact that tod
 ```
 
 No other changes. Just add the second NIC - second IPv4 addr `10.50.56.206` above, and that's all.
-
-## Reverse proxy
-
-AIStore gateway can act as a reverse proxy vis-à-vis AIStore storage targets. This functionality is limited to GET requests only and must be used with caution and consideration. Related [configuration variable](/deploy/dev/local/aisnode_config.sh) is called `rproxy` - see sub-section `http` of the section `net`. For further details, please refer to [this readme](rproxy.md).
 
 ## Curl examples
 

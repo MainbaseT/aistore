@@ -1,16 +1,15 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
 from __future__ import annotations  # pylint: disable=unused-variable
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from aistore.sdk.const import (
     HTTP_METHOD_GET,
     ACT_LIST,
-    PROVIDER_AIS,
     QPARAM_WHAT,
     QPARAM_PRIMARY_READY_REB,
     QPARAM_PROVIDER,
@@ -27,6 +26,7 @@ from aistore.sdk.const import (
     WHAT_NODE_STATS_AND_STATUS,
     WHAT_NODE_STATS_AND_STATUS_V322,
 )
+from aistore.sdk.provider import Provider
 
 from aistore.sdk.types import (
     BucketModel,
@@ -84,13 +84,13 @@ class Cluster:
         """
         return self._get_smap().proxy_si.public_net.direct_url
 
-    def list_buckets(self, provider: str = PROVIDER_AIS):
+    def list_buckets(self, provider: Union[str, Provider] = Provider.AIS):
         """
         Returns list of buckets in AIStore cluster.
 
         Args:
-            provider (str, optional): Name of bucket provider, one of "ais", "aws", "gcp", "az" or "ht".
-            Defaults to "ais". Empty provider returns buckets of all providers.
+            provider (str or Provider, optional): Provider of bucket (one of "ais", "aws", "gcp", ...).
+                Defaults to "ais". Empty provider returns buckets of all providers.
 
         Returns:
             List[BucketModel]: A list of buckets
@@ -101,7 +101,7 @@ class Cluster:
             requests.ConnectionTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
         """
-        params = {QPARAM_PROVIDER: provider}
+        params = {QPARAM_PROVIDER: Provider.parse(provider).value}
         action = ActionMsg(action=ACT_LIST).dict()
 
         return self.client.request_deserialize(
@@ -269,3 +269,9 @@ class Cluster:
     def _get_targets(self):
         tmap = self._get_smap().tmap
         return list(tmap.keys())
+
+    def get_uuid(self) -> str:
+        """
+        Returns: UUID of AIStore Cluster
+        """
+        return self._get_smap().uuid

@@ -1,13 +1,14 @@
 // Package bundle provides multi-streaming transport with the functionality
 // to dynamically (un)register receive endpoints, establish long-lived flows, and more.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package bundle
 
 import (
-	"fmt"
+	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -22,35 +23,31 @@ import (
 )
 
 type (
+	bp struct {
+		client  transport.Client
+		recv    transport.RecvObj
+		streams *Streams
+		trname  string
+		net     string // one of cmn.KnownNetworks, empty defaults to cmn.NetIntraData
+	}
 	DataMover struct {
-		data struct {
-			client  transport.Client
-			recv    transport.RecvObj
-			streams *Streams
-			trname  string
-			net     string // one of cmn.KnownNetworks, empty defaults to cmn.NetIntraData
-		}
-		ack struct {
-			client  transport.Client
-			recv    transport.RecvObj
-			streams *Streams
-			trname  string
-			net     string // one of cmn.KnownNetworks, empty defaults to cmn.NetIntraControl
-		}
+		data        bp // data
+		ack         bp // ACKs and control
 		xctn        core.Xact
 		config      *cmn.Config
 		compression string // enum { apc.CompressNever, ... }
 		multiplier  int
 		owt         cmn.OWT
 		stage       struct {
-			regred atomic.Bool
+			regmtx sync.Mutex
+			regged atomic.Bool
 			opened atomic.Bool
 			laterx atomic.Bool
 		}
 		sizePDU    int32
 		maxHdrSize int32
 	}
-	// additional (and optional) params for new data mover
+	// additional (and optional) params for new data mover instance
 	Extra struct {
 		RecvAck     transport.RecvObj
 		Config      *cmn.Config
@@ -61,27 +58,23 @@ type (
 	}
 )
 
-var _ core.DM = (*DataMover)(nil) // via t.CopyObject()
-
 // In re `owt` (below): data mover passes it to the target's `PutObject`
 // to properly finalize received payload.
 // For DMs that do not create new objects (e.g, rebalance) `owt` should
 // be set to `OwtMigrateRepl`; all others are expected to have `OwtPut` (see e.g, CopyBucket).
 
-func NewDataMover(trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Extra) (*DataMover, error) {
+func NewDM(trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Extra) *DataMover {
 	debug.Assert(extra.Config != nil)
 	dm := &DataMover{config: extra.Config}
 	dm.owt = owt
 	dm.multiplier = extra.Multiplier
 	dm.sizePDU, dm.maxHdrSize = extra.SizePDU, extra.MaxHdrSize
-	switch extra.Compression {
-	case "":
-		dm.compression = apc.CompressNever
-	case apc.CompressAlways, apc.CompressNever:
-		dm.compression = extra.Compression
-	default:
-		return nil, fmt.Errorf("invalid compression %q", extra.Compression)
+
+	if extra.Compression == "" {
+		extra.Compression = apc.CompressNever
 	}
+	dm.compression = extra.Compression
+
 	dm.data.trname, dm.data.recv = trname, recvCB
 	if dm.data.net == "" {
 		dm.data.net = cmn.NetIntraData
@@ -93,11 +86,11 @@ func NewDataMover(trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Ex
 	}
 	dm.ack.recv = extra.RecvAck
 	if !dm.useACKs() {
-		return dm, nil
+		return dm
 	}
 	dm.ack.trname = "ack." + trname
 	dm.ack.client = transport.NewIntraDataClient()
-	return dm, nil
+	return dm
 }
 
 func (dm *DataMover) useACKs() bool { return dm.ack.recv != nil }
@@ -109,16 +102,79 @@ func (dm *DataMover) OWT() cmn.OWT  { return dm.owt }
 func (dm *DataMover) SetXact(xctn core.Xact) { dm.xctn = xctn }
 func (dm *DataMover) GetXact() core.Xact     { return dm.xctn }
 
+// when config changes
+func (dm *DataMover) Renew(trname string, recvCB transport.RecvObj, owt cmn.OWT, extra Extra) *DataMover {
+	dm.config = extra.Config // always refresh
+	if extra.Compression == "" {
+		extra.Compression = apc.CompressNever
+	}
+	debug.Assert(owt == dm.owt)
+	if dm.multiplier == extra.Multiplier && dm.compression == extra.Compression && dm.sizePDU == extra.SizePDU && dm.maxHdrSize == extra.MaxHdrSize {
+		return nil
+	}
+	nlog.Infoln("renew DM", dm.String(), "=> [", extra.Compression, extra.Multiplier, "]")
+	return NewDM(trname, recvCB, owt, extra)
+}
+
 // register user's receive-data (and, optionally, receive-ack) wrappers
-func (dm *DataMover) RegRecv() (err error) {
-	if err = transport.Handle(dm.data.trname, dm.wrapRecvData); err != nil {
-		return
+func (dm *DataMover) RegRecv() error {
+	dm.stage.regmtx.Lock()
+	defer dm.stage.regmtx.Unlock()
+
+	if dm.stage.regged.Load() {
+		return errors.New("duplicated reg: " + dm.String())
+	}
+	if err := transport.Handle(dm.data.trname, dm.wrapRecvData); err != nil {
+		// (unlikely)
+		debug.AssertNoErr(err)
+		return err
 	}
 	if dm.useACKs() {
-		err = transport.Handle(dm.ack.trname, dm.wrapRecvACK)
+		if err := transport.Handle(dm.ack.trname, dm.wrapRecvACK); err != nil {
+			if nerr := transport.Unhandle(dm.data.trname); nerr != nil {
+				nlog.Errorln("FATAL:", err, "[ nested:", nerr, dm.String(), "]")
+				debug.AssertNoErr(nerr)
+			}
+			return err
+		}
 	}
-	dm.stage.regred.Store(true)
-	return
+
+	dm.stage.regged.Store(true)
+	return nil
+}
+
+func (dm *DataMover) UnregRecv() {
+	if dm == nil {
+		return
+	}
+	dm.stage.regmtx.Lock()
+	defer dm.stage.regmtx.Unlock()
+
+	if !dm.stage.regged.Load() {
+		nlog.WarningDepth(1, "duplicated unreg:", dm.String())
+		return
+	}
+	defer dm.stage.regged.Store(false)
+
+	if dm.xctn != nil {
+		timeout := dm.config.Transport.QuiesceTime.D()
+		if dm.xctn.IsAborted() {
+			timeout = time.Second
+		}
+		dm.Quiesce(timeout)
+	}
+	if err := transport.Unhandle(dm.data.trname); err != nil {
+		nlog.ErrorDepth(1, "FATAL:", err, "[", dm.data.trname, dm.String(), "]")
+	}
+	if dm.useACKs() {
+		if err := transport.Unhandle(dm.ack.trname); err != nil {
+			nlog.ErrorDepth(1, "FATAL:", err, "[", dm.ack.trname, dm.String(), "]")
+		}
+	}
+}
+
+func (dm *DataMover) IsFree() bool {
+	return !dm.stage.regged.Load()
 }
 
 func (dm *DataMover) Open() {
@@ -135,9 +191,7 @@ func (dm *DataMover) Open() {
 		Multiplier:   dm.multiplier,
 		ManualResync: true,
 	}
-	if dm.xctn != nil {
-		dataArgs.Extra.SenderID = dm.xctn.ID()
-	}
+	dataArgs.Extra.Xact = dm.xctn
 	dm.data.streams = New(dm.data.client, dataArgs)
 	if dm.useACKs() {
 		ackArgs := Args{
@@ -147,12 +201,12 @@ func (dm *DataMover) Open() {
 			Ntype:        core.Targets,
 			ManualResync: true,
 		}
-		if dm.xctn != nil {
-			ackArgs.Extra.SenderID = dm.xctn.ID()
-		}
+		ackArgs.Extra.Xact = dm.xctn
 		dm.ack.streams = New(dm.ack.client, ackArgs)
 	}
+
 	dm.stage.opened.Store(true)
+	nlog.Infoln(dm.String(), "is open")
 }
 
 func (dm *DataMover) String() string {
@@ -160,11 +214,11 @@ func (dm *DataMover) String() string {
 	switch {
 	case dm.stage.opened.Load():
 		s = "open-"
-	case dm.stage.regred.Load():
-		s = "reg-" // not open yet or closed but not unreg-ed yet
+	case dm.stage.regged.Load():
+		s = "reg-" // reg-ed handlers, not open yet tho
 	}
 	if dm.data.streams == nil {
-		return "dm-nil-" + s
+		return "dm-" + s + "no-streams"
 	}
 	if dm.data.streams.UsePDU() {
 		return "dm-pdu-" + s + dm.data.streams.Trname()
@@ -179,9 +233,13 @@ func (dm *DataMover) Quiesce(d time.Duration) core.QuiRes {
 
 func (dm *DataMover) Close(err error) {
 	if dm == nil {
+		if cmn.Rom.FastV(5, cos.SmoduleTransport) {
+			nlog.Warningln("Warning: DM is <nil>") // e.g., single-node cluster
+		}
 		return
 	}
 	if !dm.stage.opened.CAS(true, false) {
+		nlog.Errorln("Warning:", dm.String(), "not open")
 		return
 	}
 	if err == nil && dm.xctn != nil && dm.xctn.IsAborted() {
@@ -192,6 +250,7 @@ func (dm *DataMover) Close(err error) {
 	if dm.useACKs() {
 		dm.ack.streams.Close(err == nil)
 	}
+	nlog.Infoln(dm.String(), err)
 }
 
 func (dm *DataMover) Abort() {
@@ -199,26 +258,8 @@ func (dm *DataMover) Abort() {
 	if dm.useACKs() {
 		dm.ack.streams.Abort()
 	}
-}
-
-func (dm *DataMover) UnregRecv() {
-	if dm == nil {
-		return
-	}
-	if !dm.stage.regred.CAS(true, false) {
-		return // e.g., 2PC (begin => abort) sequence with no Open
-	}
-	if dm.xctn != nil {
-		dm.Quiesce(dm.config.Transport.QuiesceTime.D())
-	}
-	if err := transport.Unhandle(dm.data.trname); err != nil {
-		nlog.Errorln(err)
-	}
-	if dm.useACKs() {
-		if err := transport.Unhandle(dm.ack.trname); err != nil {
-			nlog.Errorln(err)
-		}
-	}
+	dm.stage.opened.Store(false)
+	nlog.Warningln("dm.abort", dm.String())
 }
 
 func (dm *DataMover) Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.Snode) (err error) {
@@ -233,6 +274,10 @@ func (dm *DataMover) ACK(hdr *transport.ObjHdr, cb transport.ObjSentCB, tsi *met
 	return dm.ack.streams.Send(&transport.Obj{Hdr: *hdr, Callback: cb}, nil, tsi)
 }
 
+func (dm *DataMover) Notif(hdr *transport.ObjHdr) error {
+	return dm.ack.streams.Send(&transport.Obj{Hdr: *hdr}, nil)
+}
+
 func (dm *DataMover) Bcast(obj *transport.Obj, roc cos.ReadOpenCloser) error {
 	return dm.data.streams.Send(obj, roc)
 }
@@ -241,11 +286,15 @@ func (dm *DataMover) Bcast(obj *transport.Obj, roc cos.ReadOpenCloser) error {
 // private
 //
 
-func (dm *DataMover) quicb(_ time.Duration /*accum. sleep time*/) core.QuiRes {
-	if dm.stage.laterx.CAS(true, false) {
+func (dm *DataMover) quicb(time.Duration /*total*/) core.QuiRes {
+	switch {
+	case dm.xctn != nil && dm.xctn.IsAborted():
+		return core.QuiInactiveCB
+	case dm.stage.laterx.CAS(true, false):
 		return core.QuiActive
+	default:
+		return core.QuiInactiveCB
 	}
-	return core.QuiInactiveCB
 }
 
 func (dm *DataMover) wrapRecvData(hdr *transport.ObjHdr, reader io.Reader, err error) error {

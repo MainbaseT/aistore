@@ -1,18 +1,20 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, Mock
+from urllib3.util import Retry
 
 from aistore.sdk import Client
 from aistore.sdk.cluster import Cluster
-from aistore.sdk.etl import Etl
+from aistore.sdk.provider import Provider
+from aistore.sdk.etl.etl import Etl
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import Namespace
 from aistore.sdk.job import Job
 from tests.const import ETL_NAME
-from tests.utils import test_cases
+from tests.utils import cases
 
 
 class TestClient(unittest.TestCase):  # pylint: disable=unused-variable
@@ -20,31 +22,56 @@ class TestClient(unittest.TestCase):  # pylint: disable=unused-variable
         self.endpoint = "https://aistore-endpoint"
         self.client = Client(self.endpoint)
 
+    @patch("aistore.sdk.client.SessionManager")
     @patch("aistore.sdk.client.RequestClient")
-    def test_init_defaults(self, mock_request_client):
+    def test_init_defaults(self, mock_request_client, mock_sm):
         Client(self.endpoint)
-        mock_request_client.assert_called_with(self.endpoint, False, None, None)
-
-    @test_cases(
-        (True, None, None),
-        (False, "ca_cert_location", None),
-        (False, None, 30.0),
-        (False, None, (10, 30.0)),
-    )
-    @patch("aistore.sdk.client.RequestClient")
-    def test_init(self, test_case, mock_request_client):
-        skip_verify, ca_cert, timeout = test_case
-        Client(self.endpoint, skip_verify=skip_verify, ca_cert=ca_cert, timeout=timeout)
         mock_request_client.assert_called_with(
-            self.endpoint, skip_verify, ca_cert, timeout
+            endpoint=self.endpoint,
+            session_manager=mock_sm.return_value,
+            timeout=None,
+            token=None,
         )
 
-    def test_bucket(self):
+    @cases(
+        (True, None, None, None, None, "dummy.token"),
+        (False, "ca_cert_location", None, None, None, None),
+        (False, None, "client_cert_location", None, None, None),
+        (False, None, None, 30.0, Retry(total=4), None),
+        (False, None, None, (10, 30.0), Retry(total=5, connect=2), "dummy.token"),
+    )
+    @patch("aistore.sdk.client.SessionManager")
+    @patch("aistore.sdk.client.RequestClient")
+    def test_init(self, test_case, mock_request_client, mock_sm):
+        skip_verify, ca_cert, client_cert, timeout, retry, token = test_case
+        Client(
+            self.endpoint,
+            skip_verify=skip_verify,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            timeout=timeout,
+            retry=retry,
+            token=token,
+        )
+        mock_sm.assert_called_with(
+            retry=retry,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            skip_verify=skip_verify,
+        )
+        mock_request_client.assert_called_with(
+            endpoint=self.endpoint,
+            session_manager=mock_sm.return_value,
+            timeout=timeout,
+            token=token,
+        )
+
+    @cases(*Provider)
+    def test_bucket(self, provider):
         bck_name = "bucket_123"
-        provider = "bucketProvider"
         namespace = Namespace(uuid="id", name="namespace")
         bucket = self.client.bucket(bck_name, provider, namespace)
-        self.assertEqual(self.endpoint, bucket.client.endpoint)
+        self.assertIn(self.endpoint, bucket.client.base_url)
         self.assertIsInstance(bucket.client, RequestClient)
         self.assertEqual(bck_name, bucket.name)
         self.assertEqual(provider, bucket.provider)
@@ -52,7 +79,7 @@ class TestClient(unittest.TestCase):  # pylint: disable=unused-variable
 
     def test_cluster(self):
         res = self.client.cluster()
-        self.assertEqual(self.endpoint, res.client.endpoint)
+        self.assertIn(self.endpoint, res.client.base_url)
         self.assertIsInstance(res.client, RequestClient)
         self.assertIsInstance(res, Cluster)
 
@@ -79,13 +106,13 @@ class TestClient(unittest.TestCase):  # pylint: disable=unused-variable
 
         mock_parse_url.return_value = (provider, bck_name, obj_name)
 
-        mock_bucket_instance = MagicMock()
+        mock_bucket_instance = Mock()
         mock_bucket.return_value = mock_bucket_instance
 
-        expected_object = MagicMock()
+        expected_object = Mock()
         mock_bucket_instance.object.return_value = expected_object
 
-        result = self.client.fetch_object_by_url(url)
+        result = self.client.get_object_from_url(url)
 
         mock_bucket.assert_called_once_with(bck_name, provider=provider)
         mock_bucket_instance.object.assert_called_once_with(obj_name)

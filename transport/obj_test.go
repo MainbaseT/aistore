@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport_test
 
@@ -61,11 +61,13 @@ type dummyStatsTracker struct{}
 // interface guard
 var _ cos.StatsUpdater = (*dummyStatsTracker)(nil)
 
-func (*dummyStatsTracker) Add(string, int64)                                   {}
-func (*dummyStatsTracker) Inc(string)                                          {}
-func (*dummyStatsTracker) Get(string) int64                                    { return 0 }
-func (*dummyStatsTracker) AddMany(...cos.NamedVal64)                           {}
-func (*dummyStatsTracker) Flag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
+func (*dummyStatsTracker) Add(string, int64)                                         {}
+func (*dummyStatsTracker) Inc(string)                                                {}
+func (*dummyStatsTracker) Get(string) int64                                          { return 0 }
+func (*dummyStatsTracker) AddWith(...cos.NamedVal64)                                 {}
+func (*dummyStatsTracker) ClrFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetFlag(string, cos.NodeStateFlags)                        {}
+func (*dummyStatsTracker) SetClrFlag(string, cos.NodeStateFlags, cos.NodeStateFlags) {}
 
 var (
 	objmux   *mux.ServeMux
@@ -89,10 +91,10 @@ func TestMain(t *testing.M) {
 	config.Transport.QuiesceTime = cos.Duration(10 * time.Second)
 	config.Log.Level = "3"
 	cmn.GCO.CommitUpdate(config)
-	sc := transport.Init(&dummyStatsTracker{}, config)
+	sc := transport.Init(&dummyStatsTracker{})
 	go sc.Run()
 
-	objmux = mux.NewServeMux()
+	objmux = mux.NewServeMux(false /*enableTracing*/)
 	path := transport.ObjURLPath("")
 	objmux.HandleFunc(path, transport.RxAnyStream)
 	objmux.HandleFunc(path+"/", transport.RxAnyStream)
@@ -102,7 +104,7 @@ func TestMain(t *testing.M) {
 
 func Example_headers() {
 	f := func(_ http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body, err := cos.ReadAll(r.Body)
 		if err != nil {
 			panic(err)
 		}
@@ -122,7 +124,8 @@ func Example_headers() {
 				break
 			}
 
-			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n", hdr.Bck, hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
+			fmt.Printf("Bck:%s ObjName:%s SID:%s Opaque:%v ObjAttrs:{%s} (%d)\n",
+				hdr.Bck.String(), hdr.ObjName, hdr.SID, hdr.Opaque, hdr.ObjAttrs.String(), hlen)
 			off += hlen + int(hdr.ObjAttrs.Size)
 		}
 	}
@@ -193,7 +196,7 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 func Example_obj() {
 	receive := func(hdr *transport.ObjHdr, objReader io.Reader, err error) error {
 		cos.Assert(err == nil)
-		object, err := io.ReadAll(objReader)
+		object, err := cos.ReadAll(objReader)
 		if err != nil {
 			panic(err)
 		}
@@ -345,7 +348,7 @@ func TestSendCallback(t *testing.T) {
 		posted    = make([]*randReader, objectCnt)
 	)
 	random := newRand(mono.NanoTime())
-	for idx := range len(posted) {
+	for idx := range posted {
 		hdr, rr := makeRandReader(random, false)
 		mu.Lock()
 		posted[idx] = rr
@@ -556,14 +559,14 @@ func TestDryRun(t *testing.T) {
 			size += hdr.ObjAttrs.Size
 			if size-prevsize >= cos.GiB*100 {
 				prevsize = size
-				tlog.Logf("[dry]: %d GiB\n", size/cos.GiB)
+				fmt.Printf("[dry]: %d GiB\n", size/cos.GiB)
 			}
 		}
 	}
 	stream.Fin()
 	stats := stream.GetStats()
 
-	fmt.Printf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
+	tlog.Logf("[dry]: offset=%d, num=%d(%d)\n", stats.Offset.Load(), stats.Num.Load(), num)
 }
 
 func TestCompletionCount(t *testing.T) {

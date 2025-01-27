@@ -3,7 +3,8 @@
 #
 from abc import ABC, abstractmethod
 from typing import Iterable
-from aistore.sdk.object import Object
+from aistore.sdk.obj.object import Object
+from aistore.sdk.request_client import RequestClient
 
 
 # pylint: disable=too-few-public-methods
@@ -12,13 +13,22 @@ class AISSource(ABC):
     Interface for all AIS class types providing access to AIS objects via URLs
     """
 
+    @property
     @abstractmethod
-    def list_all_objects_iter(self, prefix: str = "") -> Iterable[Object]:
+    def client(self) -> RequestClient:
+        """The client bound to the AISSource."""
+
+    @abstractmethod
+    def list_all_objects_iter(
+        self, prefix: str = "", props: str = "name,size"
+    ) -> Iterable[Object]:
         """
         Get an iterable of all the objects contained in this source (bucket, group, etc.)
 
         Args:
             prefix (str, optional): Only include objects with names matching this prefix
+            props (str, optional): Comma-separated list of object properties to return. Default value is "name,size".
+                Properties: "name", "size", "atime", "version", "checksum", "target_url", "copies".
 
         Returns:
             Iterable over selected objects

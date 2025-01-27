@@ -28,7 +28,7 @@ const (
 	_wdskey
 )
 
-var MatchMode = []string{
+var MatchMode = [...]string{
 	"regexp",
 	"prefix",
 	"suffix",
@@ -65,10 +65,9 @@ type ErrMatchMode struct{ mmode string }
 // private
 type (
 	matcher struct {
+		re    *regexp.Regexp // when (and if) compiled
 		regex string
 		mmode string
-		// when (and if) compiled
-		re *regexp.Regexp
 	}
 )
 
@@ -86,8 +85,8 @@ type (
 	}
 	zipReader struct {
 		baseR
-		size int64
 		zr   *zip.Reader
+		size int64
 	}
 	lz4Reader struct {
 		tr  tarReader
@@ -379,8 +378,10 @@ func ValidateMatchMode(mmode string) (_ string, err error) {
 	if cos.MatchAll(mmode) {
 		return MatchMode[_prefix], nil
 	}
-	if !cos.StringInSlice(mmode, MatchMode) {
-		err = &ErrMatchMode{mmode}
+	for i := range MatchMode {
+		if MatchMode[i] == mmode {
+			return mmode, nil
+		}
 	}
-	return mmode, err
+	return "", &ErrMatchMode{mmode}
 }

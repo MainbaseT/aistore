@@ -1,21 +1,23 @@
 // Package s3 provides Amazon S3 compatibility layer
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package s3
 
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // NOTE: xattr stores only the (*) marked attributes
@@ -27,10 +29,11 @@ type (
 		Num  int32  // part number (*)
 	}
 	mpt struct {
-		bckName string
-		objName string
-		parts   []*MptPart // by part number
-		ctime   time.Time  // InitUpload time
+		ctime    time.Time // InitUpload time
+		bckName  string
+		objName  string
+		parts    []*MptPart // by part number
+		metadata map[string]string
 	}
 	uploads map[string]*mpt // by upload ID
 )
@@ -41,16 +44,17 @@ var (
 )
 
 // Start miltipart upload
-func InitUpload(id, bckName, objName string) {
+func InitUpload(id, bckName, objName string, metadata map[string]string) {
 	mu.Lock()
 	if ups == nil {
 		ups = make(uploads, 8)
 	}
 	ups[id] = &mpt{
-		bckName: bckName,
-		objName: objName,
-		parts:   make([]*MptPart, 0, iniCapParts),
-		ctime:   time.Now(),
+		bckName:  bckName,
+		objName:  objName,
+		parts:    make([]*MptPart, 0, iniCapParts),
+		ctime:    time.Now(),
+		metadata: metadata,
 	}
 	mu.Unlock()
 }
@@ -71,7 +75,7 @@ func AddPart(id string, npart *MptPart) (err error) {
 }
 
 // TODO: compare non-zero sizes (note: s3cmd sends 0) and part.ETag as well, if specified
-func CheckParts(id string, parts []*PartInfo) ([]*MptPart, error) {
+func CheckParts(id string, parts []types.CompletedPart) ([]*MptPart, error) {
 	mu.RLock()
 	defer mu.RUnlock()
 	mpt, ok := ups[id]
@@ -81,16 +85,17 @@ func CheckParts(id string, parts []*PartInfo) ([]*MptPart, error) {
 	// first, check that all parts are present
 	var prev = int32(-1)
 	for _, part := range parts {
-		debug.Assert(part.PartNumber > prev) // must ascend
-		if mpt.getPart(part.PartNumber) == nil {
-			return nil, fmt.Errorf("upload %q: part %d not found", id, part.PartNumber)
+		curr := *part.PartNumber
+		debug.Assert(curr > prev) // must ascend
+		if mpt.getPart(curr) == nil {
+			return nil, fmt.Errorf("upload %q: part %d not found", id, curr)
 		}
-		prev = part.PartNumber
+		prev = curr
 	}
 	// copy (to work on it with no locks)
 	nparts := make([]*MptPart, 0, len(parts))
 	for _, part := range parts {
-		nparts = append(nparts, mpt.getPart(part.PartNumber))
+		nparts = append(nparts, mpt.getPart(*part.PartNumber))
 	}
 	return nparts, nil
 }
@@ -119,6 +124,16 @@ func ObjSize(id string) (size int64, err error) {
 	return
 }
 
+func GetUploadMetadata(id string) (metadata map[string]string) {
+	mu.RLock()
+	defer mu.RUnlock()
+	mpt, ok := ups[id]
+	if !ok {
+		return nil
+	}
+	return mpt.metadata
+}
+
 // remove all temp files and delete from the map
 // if completed (i.e., not aborted): store xattr
 func CleanupUpload(id, fqn string, aborted bool) (exists bool) {
@@ -134,12 +149,12 @@ func CleanupUpload(id, fqn string, aborted bool) (exists bool) {
 
 	if !aborted {
 		if err := storeMptXattr(fqn, mpt); err != nil {
-			nlog.Warningf("fqn %s, id %s: %v", fqn, id, err)
+			nlog.Warningln("failed to xattr [", fqn, id, err, "]")
 		}
 	}
 	for _, part := range mpt.parts {
-		if err := os.Remove(part.FQN); err != nil && !os.IsNotExist(err) {
-			nlog.Errorln(err)
+		if err := cos.RemoveFile(part.FQN); err != nil {
+			nlog.Errorln("failed to remove part [", fqn, id, err, "]")
 		}
 	}
 	return true
@@ -176,7 +191,7 @@ func ListUploads(bckName, idMarker string, maxUploads int) (result *ListMptUploa
 	return
 }
 
-func ListParts(id string, lom *core.LOM) (parts []*PartInfo, ecode int, err error) {
+func ListParts(id string, lom *core.LOM) (parts []types.CompletedPart, ecode int, err error) {
 	mu.RLock()
 	mpt, ok := ups[id]
 	if !ok {
@@ -189,9 +204,12 @@ func ListParts(id string, lom *core.LOM) (parts []*PartInfo, ecode int, err erro
 		mpt.bckName, mpt.objName = lom.Bck().Name, lom.ObjName
 		mpt.ctime = lom.Atime()
 	}
-	parts = make([]*PartInfo, 0, len(mpt.parts))
+	parts = make([]types.CompletedPart, 0, len(mpt.parts))
 	for _, part := range mpt.parts {
-		parts = append(parts, &PartInfo{ETag: part.MD5, PartNumber: part.Num, Size: part.Size})
+		parts = append(parts, types.CompletedPart{
+			ETag:       apc.Ptr(part.MD5),
+			PartNumber: apc.Ptr(part.Num),
+		})
 	}
 	mu.RUnlock()
 	return parts, ecode, err

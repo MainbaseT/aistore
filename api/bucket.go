@@ -12,7 +12,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -92,11 +91,18 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 	if !ok {
 		return err
 	}
-	debug.Assert(herr.Status == status, herr.Status, " vs ", status)
+	if status == 0 && herr.Status != 0 { // (connection refused)
+		return err
+	}
 
-	quoted := "\"" + bck.Cname("") + "\""
 	if !bck.IsQuery() && status == http.StatusNotFound {
-		herr.Message = "bucket " + quoted + " does not exist"
+		// when message already resulted from (unwrap)
+		if herr2 := cmn.Str2HTTPErr(err.Error()); herr2 != nil {
+			herr.Message = herr2.Message
+		} else {
+			quoted := "\"" + bck.Cname("") + "\""
+			herr.Message = "bucket " + quoted + " does not exist"
+		}
 		return herr
 	}
 	// common
@@ -108,6 +114,7 @@ func hdr2msg(bck cmn.Bck, status int, err error) error {
 	if bck.IsQuery() {
 		herr.Message += "query "
 	}
+	quoted := "\"" + bck.Cname("") + "\""
 	herr.Message += quoted
 	return herr
 }
@@ -165,7 +172,7 @@ func DestroyBucket(bp BaseParams, bck cmn.Bck) error {
 //     otherwise the copy operation won't be successful.
 //   - There are no limitations on copying buckets across Backend providers:
 //     you can copy AIS bucket to (or from) AWS bucket, and the latter to Google or Azure
-//     bucket, etc.
+//     or OCI bucket, etc.
 //   - Copying multiple buckets to the same destination bucket is also permitted.
 //
 // `fltPresence` applies exclusively to remote `bckFrom` and is ignored if the source is ais://
@@ -266,7 +273,7 @@ func MakeNCopies(bp BaseParams, bck cmn.Bck, copies int) (xid string, err error)
 // Erasure-code entire `bck` bucket at a given `data`:`parity` redundancy.
 // The operation requires at least (`data + `parity` + 1) storage targets in the cluster.
 // Returns xaction ID if successful, an error otherwise.
-func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int) (xid string, err error) {
+func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int, checkAndRecover bool) (xid string, err error) {
 	bp.Method = http.MethodPost
 	// Without `string` conversion it makes base64 from []byte in `Body`.
 	ecConf := string(cos.MustMarshal(&cmn.ECConfToSet{
@@ -278,7 +285,11 @@ func ECEncodeBucket(bp BaseParams, bck cmn.Bck, data, parity int) (xid string, e
 	{
 		reqParams.BaseParams = bp
 		reqParams.Path = apc.URLPathBuckets.Join(bck.Name)
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActECEncode, Value: ecConf})
+		msg := apc.ActMsg{Action: apc.ActECEncode, Value: ecConf}
+		if checkAndRecover {
+			msg.Name = apc.ActEcRecover
+		}
+		reqParams.Body = cos.MustMarshal(msg)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
 		reqParams.Query = bck.NewQuery()
 	}

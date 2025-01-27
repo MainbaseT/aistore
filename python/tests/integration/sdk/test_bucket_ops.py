@@ -15,12 +15,13 @@ from aistore.sdk.dataset.data_attribute import DataAttribute
 from aistore.sdk.dataset.label_attribute import LabelAttribute
 from aistore.sdk.errors import InvalidBckProvider, AISError, ErrBckNotFound
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.provider import Provider
 
 from tests.integration.sdk.remote_enabled_test import RemoteEnabledTest
 from tests import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 from tests.integration.boto3 import AWS_REGION
 
-from tests.utils import random_string, cleanup_local, test_cases
+from tests.utils import random_string, cleanup_local, cases
 from tests.const import OBJECT_COUNT, OBJ_CONTENT, PREFIX_NAME
 from tests.integration import REMOTE_SET
 
@@ -60,18 +61,21 @@ class TestBucketOps(RemoteEnabledTest):
         _create_files(inner_dir, lower_level_files)
 
     def test_bucket(self):
-        new_bck_name = random_string(10)
-        self._create_bucket(new_bck_name)
+        new_bck = self._create_bucket()
         res = self.client.cluster().list_buckets()
         bucket_names = {bck.name for bck in res}
-        self.assertIn(new_bck_name, bucket_names)
+        self.assertIn(new_bck.name, bucket_names)
 
-    @test_cases(
+    @cases(
         "*", ".", "", " ", "bucket/name", "bucket and name", "#name", "$name", "~name"
     )
     def test_create_bucket_invalid_name(self, testcase):
         with self.assertRaises(AISError):
-            self._create_bucket(testcase)
+            bck = self.client.bucket(testcase)
+            try:
+                bck.create()
+            finally:
+                bck.delete(missing_ok=True)
 
     def test_bucket_invalid_name(self):
         with self.assertRaises(ErrBckNotFound):
@@ -88,12 +92,9 @@ class TestBucketOps(RemoteEnabledTest):
             self.assertEqual(err.response.status_code, 404)
 
     def test_rename(self):
-        from_bck_name = self.bck_name + "from"
-        to_bck_name = self.bck_name + "to"
-        from_bck = self._create_bucket(from_bck_name)
-        self.client.cluster().list_buckets()
+        from_bck = self._create_bucket()
+        to_bck_name = from_bck.name + "-renamed"
 
-        self.assertEqual(from_bck_name, from_bck.name)
         job_id = from_bck.rename(to_bck_name=to_bck_name)
         self.assertNotEqual(job_id, "")
 
@@ -113,16 +114,14 @@ class TestBucketOps(RemoteEnabledTest):
         self._register_for_post_test_cleanup(names=[to_bck_name], is_bucket=True)
 
     def test_copy(self):
-        from_bck_name = self.bck_name + "from"
-        to_bck_name = self.bck_name + "to"
-        from_bck = self._create_bucket(from_bck_name)
-        to_bck = self._create_bucket(to_bck_name)
+        from_bck = self._create_bucket()
+        to_bck = self._create_bucket()
         prefix = PREFIX_NAME
         new_prefix = "new-"
         content = b"test"
         expected_name = prefix + "-obj"
-        from_bck.object(expected_name).put_content(content)
-        from_bck.object("notprefix-obj").put_content(content)
+        from_bck.object(expected_name).get_writer().put_content(content)
+        from_bck.object("notprefix-obj").get_writer().put_content(content)
 
         job_id = from_bck.copy(to_bck, prefix_filter=prefix, prepend=new_prefix)
 
@@ -152,30 +151,30 @@ class TestBucketOps(RemoteEnabledTest):
         s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=LOREM)
 
         # cold GET, and check
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(LOREM, content.decode("utf-8"))
 
         # out-of-band PUT: 2nd version (overwrite)
         s3_client.put_object(Bucket=self.bucket.name, Key=obj_name, Body=DUIS)
 
         # warm GET and check (expecting the first version's content)
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(LOREM, content.decode("utf-8"))
 
         # warm GET with `--latest` flag, content should be updated
-        content = self.bucket.object(obj_name).get(latest=True).read_all()
+        content = self.bucket.object(obj_name).get_reader(latest=True).read_all()
         self.assertEqual(DUIS, content.decode("utf-8"))
 
         # out-of-band DELETE
         s3_client.delete_object(Bucket=self.bucket.name, Key=obj_name)
 
         # warm GET must be fine
-        content = self.bucket.object(obj_name).get().read_all()
+        content = self.bucket.object(obj_name).get_reader().read_all()
         self.assertEqual(DUIS, content.decode("utf-8"))
 
         # cold GET must result in Error
         with self.assertRaises(AISError):
-            self.bucket.object(obj_name).get(latest=True)
+            self.bucket.object(obj_name).get_reader(latest=True).read_all()
 
     @unittest.skipIf(
         not REMOTE_SET,
@@ -203,7 +202,7 @@ class TestBucketOps(RemoteEnabledTest):
                 self.bucket.evict()
             return
         # Create a local bucket to test with if self.bucket is a cloud bucket
-        local_bucket = self._create_bucket(self.bck_name + "-local")
+        local_bucket = self._create_bucket()
         with self.assertRaises(InvalidBckProvider):
             local_bucket.evict()
 
@@ -221,10 +220,12 @@ class TestBucketOps(RemoteEnabledTest):
         if expect_err:
             for obj_name in expected_res_dict:
                 with self.assertRaises(AISError):
-                    self.bucket.object(self.obj_prefix + obj_name).get()
+                    self.bucket.object(
+                        self.obj_prefix + obj_name
+                    ).get_reader().read_all()
         else:
             for obj_name, expected_data in expected_res_dict.items():
-                res = self.bucket.object(self.obj_prefix + obj_name).get()
+                res = self.bucket.object(self.obj_prefix + obj_name).get_reader()
                 self.assertEqual(expected_data, res.read_all())
 
     def test_put_files_default_args(self):
@@ -277,11 +278,11 @@ class TestBucketOps(RemoteEnabledTest):
             prefix_filter=PREFIX_NAME,
             pattern="*.txt",
         )
-        self.bucket.object(self.obj_prefix + included_filename).get()
+        self.bucket.object(self.obj_prefix + included_filename).get_reader()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_pattern).get()
+            self.bucket.object(excluded_by_pattern).get_reader().read_all()
         with self.assertRaises(AISError):
-            self.bucket.object(excluded_by_prefix).get()
+            self.bucket.object(excluded_by_prefix).get_reader().read_all()
 
     def test_put_files_dry_run(self):
         self._create_put_files_structure(TOP_LEVEL_FILES, LOWER_LEVEL_FILES)
@@ -291,7 +292,7 @@ class TestBucketOps(RemoteEnabledTest):
         # Verify the put files call does not actually create objects
         self._verify_obj_res(TOP_LEVEL_FILES, expect_err=True)
 
-    @test_cases((None, OBJECT_COUNT), (7, 7), (OBJECT_COUNT * 2, OBJECT_COUNT))
+    @cases((None, OBJECT_COUNT), (7, 7), (OBJECT_COUNT * 2, OBJECT_COUNT))
     def test_list_objects(self, test_case):
         page_size, response_size = test_case
         # Only create the bucket entries on the first subtest run
@@ -344,7 +345,7 @@ class TestBucketOps(RemoteEnabledTest):
             self.assertTrue(obj.size > 0)
 
     def test_summary(self):
-        summ_test_bck = self._create_bucket("summary-test")
+        summ_test_bck = self._create_bucket()
 
         # Initially, the bucket should be empty
         bucket_summary = summ_test_bck.summary()
@@ -357,7 +358,7 @@ class TestBucketOps(RemoteEnabledTest):
         # Upload objects to the bucket with different prefixes
         obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
         for obj_name in obj_names:
-            summ_test_bck.object(obj_name).put_content(OBJ_CONTENT)
+            summ_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
 
         # Verify the info with no prefix (should include all objects)
         bck_summ = summ_test_bck.summary()
@@ -387,52 +388,56 @@ class TestBucketOps(RemoteEnabledTest):
             summ_test_bck.summary()
 
     def test_info(self):
-        info_test_bck = self._create_bucket("info-test")
+        info_test_bck = self._create_bucket()
 
         # Initially, the bucket should be empty
         _, bck_info = info_test_bck.info(flt_presence=FLTPresence.FLT_EXISTS)
 
         # For an empty bucket, the object count and total size should be zero
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        self._validate_bck_info(info_test_bck, bck_info, "0", "0")
 
         # Upload objects to the bucket with different prefixes
-        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1", "prefix2_obj2"]
+        obj_names = ["prefix1_obj1", "prefix1_obj2", "prefix2_obj1"]
         for obj_name in obj_names:
-            info_test_bck.object(obj_name).put_content(OBJ_CONTENT)
+            info_test_bck.object(obj_name).get_writer().put_content(OBJ_CONTENT)
 
         # Verify the info with no prefix (should include all objects)
         _, bck_info = info_test_bck.info()
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "4")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(len(obj_names) * len(OBJ_CONTENT))
+        self._validate_bck_info(
+            info_test_bck, bck_info, str(len(obj_names)), content_size
+        )
 
         # Verify the info with prefix1
         _, bck_info = info_test_bck.info(prefix="prefix1")
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(2 * len(OBJ_CONTENT))
+        self._validate_bck_info(info_test_bck, bck_info, "2", content_size)
 
         # Verify the info with prefix2
         _, bck_info = info_test_bck.info(prefix="prefix2")
-        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], "2")
-        self.assertNotEqual(bck_info["TotalSize"]["size_all_present_objs"], "0")
-        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
-        self.assertEqual(bck_info["provider"], "ais")
-        self.assertEqual(bck_info["name"], "info-test")
+        content_size = str(len(OBJ_CONTENT))
+        self._validate_bck_info(info_test_bck, bck_info, "1", content_size)
 
         info_test_bck.delete()
 
         # Accessing the info of a deleted bucket should raise an error
         with self.assertRaises(ErrBckNotFound):
             info_test_bck.summary()
+
+    def _validate_bck_info(
+        self,
+        bck,
+        bck_info,
+        present_obj_count,
+        present_obj_size,
+    ):
+        self.assertEqual(bck_info["ObjCount"]["obj_count_present"], present_obj_count)
+        self.assertEqual(
+            bck_info["TotalSize"]["size_all_present_objs"], present_obj_size
+        )
+        self.assertEqual(bck_info["TotalSize"]["size_all_remote_objs"], "0")
+        self.assertEqual(bck_info["provider"], Provider.AIS.value)
+        self.assertEqual(bck_info["name"], bck.name)
 
     def test_write_dataset(self):
         self.local_test_files.mkdir(exist_ok=True)

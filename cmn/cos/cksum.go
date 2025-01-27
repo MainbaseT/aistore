@@ -1,11 +1,11 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
 import (
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // G501 have to support Cloud's MD5
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding"
@@ -20,11 +20,14 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-// NOTE: not supporting SHA-3 family is its current golang.org/x/crypto/sha3 source
-//       doesn't implement BinaryMarshaler & BinaryUnmarshaler interfaces
-//       (see also https://golang.org/pkg/encoding)
+// [NOTE]
+// - currently, we have only two crypto-secure types: sha256 and sha512
+// - see related object comparison logic in cmn/objattrs
 
-// checksums
+// [TODO]
+// revisit and maybe add SHA-3 family (see golang.org/x/crypto/sha3 for: `BinaryMarshaler`)
+
+// supported checksums
 const (
 	ChecksumNone   = "none"
 	ChecksumXXHash = "xxhash"
@@ -42,6 +45,7 @@ const (
 type (
 	noopHash struct{}
 
+	// in-cluster checksum validation (compare with cmn.ErrInvalidCksum)
 	ErrBadCksum struct {
 		prefix  string
 		a, b    any
@@ -86,6 +90,14 @@ var NoneCksum = NewCksum(ChecksumNone, "")
 // CksumHash //
 ///////////////
 
+// convenience method (compare with xxhash.Checksum64S)
+func ChecksumB2S(in []byte, ty string) string {
+	cksum := NewCksumHash(ty)
+	cksum.H.Write(in)
+	cksum.Finalize()
+	return cksum.Val()
+}
+
 func NewCksumHash(ty string) (ck *CksumHash) {
 	ck = &CksumHash{}
 	ck.Init(ty)
@@ -111,7 +123,7 @@ func (ck *CksumHash) Init(ty string) {
 	case ChecksumXXHash:
 		ck.H = xxhash.New64()
 	case ChecksumMD5:
-		ck.H = md5.New()
+		ck.H = md5.New() //nolint:gosec // G401 ditto (see G501 above)
 	case ChecksumCRC32C:
 		ck.H = NewCRC32C()
 	case ChecksumSHA256:
@@ -123,8 +135,10 @@ func (ck *CksumHash) Init(ty string) {
 	}
 }
 
+// NOTE [caution]: empty checksums are equal
 func (ck *CksumHash) Equal(to *Cksum) bool { return ck.Cksum.Equal(to) }
-func (ck *CksumHash) Sum() []byte          { return ck.sum }
+
+func (ck *CksumHash) Sum() []byte { return ck.sum }
 
 func (ck *CksumHash) Finalize() {
 	ck.sum = ck.H.Sum(nil)
@@ -145,7 +159,9 @@ func (ck *CksumHashSize) Write(b []byte) (n int, err error) {
 // Cksum //
 ///////////
 
-func (ck *Cksum) IsEmpty() bool { return ck == nil || ck.ty == "" || ck.ty == ChecksumNone }
+func (ck *Cksum) IsEmpty() bool {
+	return ck == nil || ck.ty == "" || ck.ty == ChecksumNone || ck.value == ""
+}
 
 func NewCksum(ty, value string) *Cksum {
 	if err := ValidateCksumType(ty, true /*empty OK*/); err != nil {
@@ -157,9 +173,10 @@ func NewCksum(ty, value string) *Cksum {
 	return &Cksum{ty, value}
 }
 
+// NOTE [caution]: empty checksums are also equal (compare with lom.EqCksum and friends)
 func (ck *Cksum) Equal(to *Cksum) bool {
 	if ck.IsEmpty() || to.IsEmpty() {
-		return false
+		return ck.IsEmpty() == to.IsEmpty()
 	}
 	return ck.ty == to.ty && ck.value == to.value
 }
@@ -277,11 +294,12 @@ func (e *ErrBadCksum) Error() string {
 	cka, ok1 := e.a.(*Cksum)
 	ckb, ok2 := e.b.(*Cksum)
 	if ok1 && ok2 {
-		if cka != nil && ckb == nil {
+		switch {
+		case cka != nil && ckb == nil:
 			return fmt.Sprintf("%s (%s != %v)%s", e.prefix, cka, ckb, context)
-		} else if cka == nil && ckb != nil {
+		case cka == nil && ckb != nil:
 			return fmt.Sprintf("%s (%v != %s)%s", e.prefix, cka, ckb, context)
-		} else if cka == nil && ckb == nil {
+		case cka == nil && ckb == nil:
 			return fmt.Sprintf("%s (nil != nil)%s", e.prefix, context)
 		}
 		t1, v1 := cka.Get()

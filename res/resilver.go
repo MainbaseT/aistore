@@ -77,7 +77,7 @@ func (res *Res) _end() {
 	res.end.Store(mono.NanoTime())
 }
 
-func (res *Res) RunResilver(args Args) {
+func (res *Res) RunResilver(args Args, tstats cos.StatsUpdater) {
 	res._begin()
 	defer res._end()
 	if fatalErr, writeErr := fs.PersistMarker(fname.ResilverMarker); fatalErr != nil || writeErr != nil {
@@ -114,10 +114,10 @@ func (res *Res) RunResilver(args Args) {
 	debug.Assert(args.PostDD == nil || (args.Action == apc.ActMountpathDetach || args.Action == apc.ActMountpathDisable))
 
 	if args.SingleRmiJogger {
-		jg = mpather.NewJoggerGroup(opts, config, args.Rmi.Path)
+		jg = mpather.NewJoggerGroup(opts, config, args.Rmi)
 		nlog.Infof("%s, action %q, jogger->(%q)", xres.Name(), args.Action, args.Rmi)
 	} else {
-		jg = mpather.NewJoggerGroup(opts, config, "")
+		jg = mpather.NewJoggerGroup(opts, config, nil)
 		if args.Rmi != nil {
 			nlog.Infof("%s, action %q, rmi %s, num %d", xres.Name(), args.Action, args.Rmi, jg.Num())
 		} else {
@@ -128,7 +128,7 @@ func (res *Res) RunResilver(args Args) {
 	// run and block waiting
 	res.end.Store(0)
 	jg.Run()
-	err = wait(jg, xres)
+	err = wait(jg, xres, tstats)
 	if err != nil {
 		xres.AddErr(err)
 	}
@@ -140,7 +140,7 @@ func (res *Res) RunResilver(args Args) {
 }
 
 // Wait for an abort or for resilvering joggers to finish.
-func wait(jg *mpather.Jgroup, xres *xs.Resilver) (err error) {
+func wait(jg *mpather.Jgroup, xres *xs.Resilver, tstats cos.StatsUpdater) (err error) {
 	for {
 		select {
 		case errCause := <-xres.ChanAbort():
@@ -151,7 +151,7 @@ func wait(jg *mpather.Jgroup, xres *xs.Resilver) (err error) {
 			}
 			return cmn.NewErrAborted(xres.Name(), "", errCause)
 		case <-jg.ListenFinished():
-			if err = fs.RemoveMarker(fname.ResilverMarker); err == nil {
+			if err = fs.RemoveMarker(fname.ResilverMarker, tstats); err == nil {
 				nlog.Infoln(core.T.String()+":", xres.Name(), "removed marker ok")
 			}
 			return
@@ -190,16 +190,17 @@ func (jg *joggerCtx) _mvSlice(ct *core.CT, buf []byte) {
 	if _, _, err = cos.CopyFile(ct.FQN(), destFQN, buf, cos.ChecksumNone); err != nil {
 		errV := fmt.Errorf("failed to copy %q -> %q: %v. Rolling back", ct.FQN(), destFQN, err)
 		jg.xres.AddErr(errV, 0)
-		if err = os.Remove(destMetaFQN); err != nil {
+		if err = cos.RemoveFile(destMetaFQN); err != nil {
 			errV := fmt.Errorf("failed to cleanup metafile %q: %v", destMetaFQN, err)
 			nlog.Infoln("Warning:", errV)
 			jg.xres.AddErr(errV)
 		}
 	}
-	errMeta := os.Remove(srcMetaFQN)
-	errSlice := os.Remove(ct.FQN())
-	if errMeta != nil || errSlice != nil {
-		nlog.Warningf("Failed to cleanup %q: %v, %v", ct.FQN(), errSlice, errMeta)
+	if errMeta := cos.RemoveFile(srcMetaFQN); errMeta != nil {
+		nlog.Warningln("failed to cleanup meta", srcMetaFQN, "[", errMeta, "]")
+	}
+	if errSlice := cos.RemoveFile(ct.FQN()); errSlice != nil {
+		nlog.Warningln("failed to cleanup slice", ct.FQN(), "[", errSlice, "]")
 	}
 }
 

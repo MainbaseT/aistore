@@ -100,17 +100,17 @@ The command has a rather long(ish) short description and multiple subcommands:
 ```console
 $ ais show cluster --help
 NAME:
-   ais show cluster - show cluster nodes and utilization
+   ais show cluster - main dashboard: cluster at-a-glance (nodes, software versions, utilization, capacity, memory and more)
 
 USAGE:
    ais show cluster command [command options] [NODE_ID] | [target [NODE_ID]] | [proxy [NODE_ID]] |
                        [smap [NODE_ID]] | [bmd [NODE_ID]] | [config [NODE_ID]] | [stats [NODE_ID]]
 
 COMMANDS:
-   smap    show Smap (cluster map)
-   bmd     show BMD (bucket metadata)
+   smap    show cluster map (Smap)
+   bmd     show bucket metadata (BMD)
    config  show cluster and node configuration
-   stats   (alias for "ais show performance") show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   stats   (alias for "ais show performance") show performance counters, throughput, latency and more (press <TAB-TAB> to select specific view)
 
 OPTIONS:
    --refresh value   interval for continuous monitoring;
@@ -124,12 +124,14 @@ OPTIONS:
 To quickly exemplify, let's assume the cluster has a (target) node called `t[xyz]`. Then:
 
 
-### show cluster: all nodes (including t[xyz]) and gateways, as well as deployed version and runtime stats
+### Main CLI dashboard: all storage nodes and gateways, deployed version, capacity, memory, and runtime stats:
+
 ```console
 $ ais show cluster
 ```
 
-### show all target (nodes) and, again, runtime statistics, software version, deployment type, K8s pods, and more
+### same as above, with only targets selected
+
 ```console
 $ ais show cluster target
 ```
@@ -264,7 +266,7 @@ counters     throughput   latency      capacity     disk
 
 $ ais show cluster stats --help
 NAME:
-   ais show cluster stats - (alias for "ais show performance") show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   ais show cluster stats - (alias for "ais show performance") show performance counters, throughput, latency and more (press <TAB-TAB> to select specific view)
 
 USAGE:
    ais show cluster stats command [command options] [TARGET_ID]
@@ -273,7 +275,7 @@ COMMANDS:
    counters    show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:
                - numbers of list-objects requests;
                - (GET, PUT, etc.) cumulative and average sizes;
-               - associated error counters, if any, and more.
+               - associated error counters, if any.
    throughput  show GET and PUT throughput, associated (cumulative, average) sizes and counters
    latency     show GET, PUT, and APPEND latencies and average sizes
    capacity    show target mountpaths, disks, and used/available capacity
@@ -360,31 +362,43 @@ Target		Disk	Read		Write		%Util
 
 ## Join a node
 
-`ais cluster add-remove-nodes join --role=proxy IP:PORT`
+```console
+$ ais cluster add-remove-nodes join --help
+NAME:
+   ais cluster add-remove-nodes join - add a node to the cluster
 
-Join a proxy to the cluster.
+USAGE:
+   ais cluster add-remove-nodes join [command options] IP:PORT
 
-`ais cluster add-remove-nodes join --role=target IP:PORT`
+OPTIONS:
+   --role value     role of this AIS daemon: proxy or target
+   --non-electable  this proxy must not be elected as primary (advanced use)
+   --help, -h       show help
+```
 
-Join a target to the cluster.
+AIStore has two kinds of node: proxie (gateways) and targets (storage nodes). That's why `--role` is a mandatory option that must have one of the two values:
+* `--role=proxy`
+or
+* `--role=target`
 
-Note: The node will try to join the cluster using an ID it detects (either in the filesystem's xattrs or on disk) or that it generates for itself.
-If you would like to specify an ID, you can do so while starting the [`aisnode` executable](/docs/command_line.md).
+> Note: aisnode will try to join cluster using its persistent ID. If you need to specify an ID, you can do so via [`aisnode` executable](/docs/command_line.md) command line.
 
-### Examples
-
-#### Join node
-
-Join a proxy node with socket address `192.168.0.185:8086`
+### Example: join a proxy node
 
 ```console
 $ ais cluster add-remove-nodes join --role=proxy 192.168.0.185:8086
 Proxy with ID "23kfa10f" successfully joined the cluster.
 ```
 
+Any proxy can be potentially elected as _primary_; to mark certain proxies as **non-electable**, run (e.g.):
+
+```console
+$ ais cluster add-remove-nodes join 192.168.0.185:8086 --role=proxy --non-electable
+```
+
 ## Remove a node
 
-**Temporarily remove an existing node from the cluster:**
+### Temporarily remove an existing node from the cluster
 
 `ais cluster add-remove-nodes start-maintenance NODE_ID`
 `ais cluster add-remove-nodes stop-maintenance NODE_ID`
@@ -398,8 +412,7 @@ maintenance will revert this.
 Shutting down a node will put the node in maintenance mode first, and then shut down the `aisnode`
 process on the node.
 
-
-**Permanently remove an existing node from the cluster:**
+### Permanently remove an existing node from the cluster
 
 `ais cluster add-remove-nodes decommission NODE_ID`
 

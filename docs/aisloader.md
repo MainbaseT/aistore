@@ -98,7 +98,7 @@ For the most recently updated command-line options and examples, please run `ais
 | -statsdport | `int` | StatsD UDP port | `8125` |
 | -statsdprobe | `bool` | Test-probe StatsD server prior to benchmarks | `true` |
 | -statsinterval | `int` | Interval in seconds to print performance counters; 0 - disabled | `10` |
-| -subdir | `string` | Virtual destination directory for all aisloader-generated objects | `""` |
+| -subdir | `string` | For GET requests, `-subdir` is a prefix that may or may not be an actual [virtual directory](/docs/howto_virt_dirs.md). For PUT, `-subdir` is a virtual destination directory for all aisloader-generated objects. See closely related [CLI](/docs/cli/object.md) `--prefix` option. | `""` |
 | -test-probe | `bool`| Test StatsD server prior to running benchmarks | `false` |
 | -timeout | `string` | Client HTTP timeout; `0` = infinity) | `10m` |
 | -tmpdir | `string` | Local directory to store temporary files | `/tmp/ais` |
@@ -250,12 +250,14 @@ In addition, environment can be used to specify client-side TLS (aka, HTTPS) con
 
 | var name | description |
 | -- | -- |
-| `AIS_CRT`             | X509 certificate |
-| `AIS_CRT_KEY`         | X509 certificate's private key |
+| `AIS_CRT`             | X.509 certificate |
+| `AIS_CRT_KEY`         | X.509 certificate's private key |
 | `AIS_CLIENT_CA`       | Certificate authority that authorized (signed) the certificate |
-| `AIS_SKIP_VERIFY_CRT` | when true, skip X509 cert verification (usually enabled to circumvent limitations of self-signed certs) |
+| `AIS_SKIP_VERIFY_CRT` | when true, skip X.509 cert verification (usually enabled to circumvent limitations of self-signed certs) |
 
-* See also: [TLS: testing with self-signed certificates](/docs/getting_started.md#tls-testing-with-self-signed-certificates)
+See also:
+
+* [HTTPS: loading, reloading, and generating certificates; switching cluster between HTTP and HTTPS](/docs/https.md)
 
 ## Examples
 

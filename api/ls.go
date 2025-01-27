@@ -1,12 +1,10 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,9 +25,9 @@ const (
 
 type (
 	LsoCounter struct {
+		callback  LsoCB
 		startTime int64 // time operation started
 		callAfter int64 // callback after
-		callback  LsoCB
 		count     int
 		done      bool
 	}
@@ -38,8 +36,8 @@ type (
 	// additional and optional list-objects args (compare with: GetArgs, PutArgs)
 	ListArgs struct {
 		Callback  LsoCB
-		CallAfter time.Duration
 		Header    http.Header // to optimize listing very large buckets, e.g.: Header.Set(apc.HdrInventory, "true")
+		CallAfter time.Duration
 		Limit     int64
 	}
 )
@@ -204,7 +202,7 @@ func lsoPage(reqParams *ReqParams) (_ *cmn.LsoRes, err error) {
 		if _, err = reqParams.DoReqAny(page); err == nil {
 			return page, nil
 		}
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if !cos.IsClientTimeout(err) {
 			break
 		}
 		client := *reqParams.BaseParams.Client
@@ -240,26 +238,6 @@ func ListObjectsPage(bp BaseParams, bck cmn.Bck, lsmsg *apc.LsoMsg, args ListArg
 	lsmsg.UUID = page.UUID
 	lsmsg.ContinuationToken = page.ContinuationToken
 	return page, nil
-}
-
-// TODO: obsolete this function after introducing mechanism to detect remote bucket changes.
-func ListObjectsInvalidateCache(bp BaseParams, bck cmn.Bck) error {
-	var (
-		path = apc.URLPathBuckets.Join(bck.Name)
-		q    = url.Values{}
-	)
-	bp.Method = http.MethodPost
-	reqParams := AllocRp()
-	{
-		reqParams.Query = bck.AddToQuery(q)
-		reqParams.BaseParams = bp
-		reqParams.Path = path
-		reqParams.Body = cos.MustMarshal(apc.ActMsg{Action: apc.ActInvalListCache})
-		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
-	}
-	err := reqParams.DoRequest()
-	FreeRp(reqParams)
-	return err
 }
 
 ////////////////

@@ -39,7 +39,7 @@ Complete and most recently updated list of supported jobs can be found in this [
 
 Last (but not the least) is - time. Job execution may take many seconds, sometimes minutes or hours.
 
-Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset, and more.
+Examples include erasure coding or n-way mirroring a dataset, resharding and reshuffling a dataset and more.
 
 Global rebalance gets (automatically) triggered by any membership changes (nodes joining, leaving, powercycling, etc.) that can be further visualized via `ais show rebalance` CLI.
 
@@ -58,9 +58,9 @@ AIS subsystems integrate subsystem-specific stats - e.g.:
 Related CLI documentation:
 
 * [CLI: `ais show job`](/docs/cli/job.md)
-* [CLI: multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges)
+* [CLI: multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
 * [CLI: reading, writing, and listing archives](/docs/cli/object.md)
-* [CLI: copying buckets](/docs/cli/bucket.md#copy-bucket)
+* [CLI: copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 ## Table of Contents
 - [Operations on multiple selected objects](#operations-on-multiple-selected-objects)
@@ -81,7 +81,7 @@ AIStore provides APIs to operate on *batches* of objects:
 | `apc.ActPrefetchObjects` | prefetch --/-- |
 | `apc.ActArchive`         | archive --/-- |
 
-For CLI documentation and examples, please see [Operations on Lists and Ranges](cli/object.md#operations-on-lists-and-ranges).
+For CLI documentation and examples, please see [Operations on Lists and Ranges (and entire buckets)](cli/object.md#operations-on-lists-and-ranges-and-entire-buckets).
 
 There are two distinct ways to specify the objects: **list** them (ie., the names) explicitly, or specify a **template**.
 

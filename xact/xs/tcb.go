@@ -8,6 +8,7 @@ package xs
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -112,10 +113,7 @@ func (p *tcbFactory) newDM(config *cmn.Config, uuid string, sizePDU int32) error
 		SizePDU:     sizePDU,
 	}
 	// in re cmn.OwtPut: see comment inside _recv()
-	dm, err := bundle.NewDataMover(trname+"-"+uuid, p.xctn.recv, p.owt, dmExtra)
-	if err != nil {
-		return err
-	}
+	dm := bundle.NewDM(trname+"-"+uuid, p.xctn.recv, p.owt, dmExtra)
 	if err := dm.RegRecv(); err != nil {
 		return err
 	}
@@ -160,38 +158,48 @@ func (r *XactTCB) TxnAbort(err error) {
 func newTCB(p *tcbFactory, slab *memsys.Slab, config *cmn.Config, smap *meta.Smap) (r *XactTCB) {
 	r = &XactTCB{p: p}
 
-	s1, s2 := r._str(), r.p.args.BckFrom.String()
-	r.nam = r.Base.Name() + " <= " + s2 + s1
-	r.str = r.Base.String() + " <= " + s2 + s1
-
-	var parallel int
+	var (
+		args     = p.args
+		msg      = args.Msg
+		parallel int
+	)
 	if p.kind == apc.ActETLBck {
 		parallel = etlBucketParallelCnt // TODO: optimize with respect to disk bw and transforming computation
 	}
 	mpopts := &mpather.JgroupOpts{
 		CTs:      []string{fs.ObjectType},
 		VisitObj: r.do,
-		Prefix:   p.args.Msg.Prefix,
+		Prefix:   msg.Prefix,
 		Slab:     slab,
 		Parallel: parallel,
 		DoLoad:   mpather.Load,
 		Throttle: true, // always trottling
 	}
-	mpopts.Bck.Copy(p.args.BckFrom.Bucket())
-	r.BckJog.Init(p.UUID(), p.kind, p.args.BckTo, mpopts, config)
+	mpopts.Bck.Copy(args.BckFrom.Bucket())
 
-	if p.args.Msg.Sync {
-		debug.Assert(p.args.Msg.Prepend == "", p.args.Msg.Prepend) // validated (cli, P)
+	{
+		var sb strings.Builder // ctlmsg
+		sb.Grow(64)
+		msg.Str(&sb, args.BckFrom.Cname(msg.Prefix), args.BckTo.Cname(msg.Prepend))
+		r.BckJog.Init(p.UUID(), p.kind, sb.String() /*ctlmsg*/, args.BckTo, mpopts, config)
+
+		r.nam = r.Base.Name() + ": " + sb.String()
+		r.str = r.Base.String() + "<=" + args.BckFrom.Cname(msg.Prefix)
+	}
+
+	if msg.Sync {
+		debug.Assert(msg.Prepend == "", msg.Prepend) // validated (cli, P)
 		{
 			r.prune.parent = r
 			r.prune.smap = smap
-			r.prune.bckFrom = p.args.BckFrom
-			r.prune.bckTo = p.args.BckTo
-			r.prune.prefix = p.args.Msg.Prefix
+			r.prune.bckFrom = args.BckFrom
+			r.prune.bckTo = args.BckTo
+			r.prune.prefix = msg.Prefix
 		}
 		r.prune.init(config)
 	}
-	return
+
+	return r
 }
 
 func (r *XactTCB) WaitRunning() { r.wg.Wait() }
@@ -234,17 +242,19 @@ func (r *XactTCB) Run(wg *sync.WaitGroup) {
 }
 
 func (r *XactTCB) qcb(tot time.Duration) core.QuiRes {
-	// TODO -- FIXME =======================
-	if cnt := r.ErrCnt(); cnt > 0 {
-		// to break quiescence - the waiter will look at r.Err() first anyway
-		return core.QuiTimeout
+	since := mono.Since(r.rxlast.Load())
+
+	// log
+	if (tot > cmn.Rom.MaxKeepalive() || since > cmn.Rom.MaxKeepalive()) &&
+		(cmn.Rom.FastV(4, cos.SmoduleXs) || tot < cmn.Rom.MaxKeepalive()<<1) {
+		nlog.Warningln(r.Name(), "quiescing [", since, tot, "rc", r.refc.Load(), "errs", r.ErrCnt(), "]")
 	}
 
-	since := mono.Since(r.rxlast.Load())
 	if r.refc.Load() > 0 {
 		if since > cmn.Rom.MaxKeepalive() {
+			conf := &r.BckJog.Config.Timeout
 			// idle on the Rx side despite having some (refc > 0) senders
-			if tot > r.BckJog.Config.Timeout.SendFile.D() {
+			if tot > conf.SendFile.D() || (since > conf.MaxHostBusy.D() && tot > conf.MaxHostBusy.D()) {
 				return core.QuiTimeout
 			}
 		}
@@ -264,7 +274,7 @@ func (r *XactTCB) do(lom *core.LOM, buf []byte) (err error) {
 	if cmn.Rom.FastV(5, cos.SmoduleXs) {
 		nlog.Infoln(r.Base.Name()+":", lom.Cname(), "=>", args.BckTo.Cname(toName))
 	}
-	coiParams := core.AllocCOI()
+	coiParams := AllocCOI()
 	{
 		coiParams.DP = args.DP
 		coiParams.Xact = r
@@ -272,13 +282,17 @@ func (r *XactTCB) do(lom *core.LOM, buf []byte) (err error) {
 		coiParams.BckTo = args.BckTo
 		coiParams.ObjnameTo = toName
 		coiParams.Buf = buf
-		coiParams.OWT = r.p.owt
 		coiParams.DryRun = args.Msg.DryRun
 		coiParams.LatestVer = args.Msg.LatestVer
 		coiParams.Sync = args.Msg.Sync
+		coiParams.OWT = r.p.owt
+		coiParams.Finalize = false
+		if coiParams.ObjnameTo == "" {
+			coiParams.ObjnameTo = lom.ObjName
+		}
 	}
-	_, err = core.T.CopyObject(lom, r.dm, coiParams)
-	core.FreeCOI(coiParams)
+	_, err = gcoi.CopyObject(lom, r.dm, coiParams)
+	FreeCOI(coiParams)
 	switch {
 	case err == nil:
 		if args.Msg.Sync {
@@ -347,23 +361,6 @@ func (r *XactTCB) _recv(hdr *transport.ObjHdr, objReader io.Reader, lom *core.LO
 }
 
 func (r *XactTCB) Args() *xreg.TCBArgs { return r.p.args }
-
-func (r *XactTCB) _str() (s string) {
-	msg := &r.p.args.Msg.CopyBckMsg
-	if msg.Prefix != "" {
-		s = ", prefix " + r.p.args.Msg.Prefix
-	}
-	if msg.Prepend != "" {
-		s = ", prepend " + r.p.args.Msg.Prepend
-	}
-	if msg.LatestVer {
-		s = ", latest-ver"
-	}
-	if msg.Sync {
-		s = ", synchronize"
-	}
-	return s
-}
 
 func (r *XactTCB) String() string { return r.str }
 func (r *XactTCB) Name() string   { return r.nam }

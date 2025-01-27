@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# e.g. two disks:
+# deploy/dev/loopback.sh --mountpath /tmp/ais/mp1 --size 1G
+# deploy/dev/loopback.sh --mountpath /tmp/ais/mp2 --size 1G
+
 if ! [ -x "$(command -v losetup)" ]; then
   echo "Error: losetup not installed (apt-get mount or klibc-utils)" >&2
   exit 1
@@ -28,5 +32,7 @@ mkdir -p $mountpath
 dd if=/dev/zero of="${mountpath}.img" bs=1M count=1024
 losetup -fP "${mountpath}.img"
 mkfs.ext4 "${mountpath}.img" > /dev/null
+
 device=$(losetup -l | grep "${mountpath}.img" | awk '{print $1}')
-mount -o loop "${device}" $mountpath
+set -x
+mount "${device}" $mountpath

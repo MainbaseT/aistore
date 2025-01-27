@@ -37,11 +37,19 @@ Rest of this document covers starting, stopping, and otherwise managing job kind
 ### See also
 
 - [static descriptors (source code)](https://github.com/NVIDIA/aistore/blob/main/xact/api.go#L108)
-- [`xact` package README](/xact/README.md).
+- [`xact` package README](https://github.com/NVIDIA/aistore/blob/main/xact/README.md).
 - [`batch jobs`](/docs/batch.md)
 - [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
 - [CLI: `download` from any remote source](/docs/cli/download.md)
 - [built-in `rebalance`](/docs/rebalance.md)
+
+* And more:
+  - [`ais etl`](/docs/cli/etl.md)
+  - [`ais prefetch`](/docs/cli/object.md)
+  - [`ais cp`](#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+  - [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
+  - [reading, writing, and listing archives](/docs/cli/object.md)
+  - [copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 # `ais job` command
 
@@ -118,9 +126,33 @@ $ ais start lru --buckets ais://buck1,aws://buck2 -f
 
 ## Stop job
 
-`ais stop [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
-
 Stop a single job or multiple jobs.
+
+```console
+$ ais stop --help
+NAME:
+   ais stop - (alias for "job stop") terminate a single batch job or multiple jobs, e.g.:
+     - 'stop tco-cysbohAGL'       - terminate a given (multi-object copy/transform) job identified by its unique ID;
+     - 'stop copy-listrange'      - terminate all multi-object copies;
+     - 'stop copy-objects'        - same as above (using display name);
+     - 'stop list'                - stop all list-objects jobs;
+     - 'stop ls'                  - same as above;
+     - 'stop prefetch-listrange'  - stop all prefetch jobs;
+     - 'stop prefetch'            - same as above;
+     - 'stop g731 --force'        - forcefully abort global rebalance g731 (advanced usage only);
+     - 'stop --all'               - terminate all running jobs
+   press <TAB-TAB> to select, '--help' for more options.
+
+USAGE:
+   ais stop [command options] [NAME] [JOB_ID] [NODE_ID] [BUCKET]
+
+OPTIONS:
+   --all          all running jobs
+   --regex value  regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   --force, -f    force execution of the command (caution: advanced usage only)
+   --yes, -y      assume 'yes' to all questions
+   --help, -h     show help
+```
 
 ### Examples stopping a single job:
 
@@ -285,4 +317,4 @@ Run [dSort](/docs/dsort.md).
 `ais start download` or `ais start download`
 
 Run the AIS [Downloader](/docs/README.md).
-[Further reference for this command can be found here.](downloader.md)
+[Further reference for this command can be found here.](/docs/downloader.md)

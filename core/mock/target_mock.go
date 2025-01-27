@@ -21,8 +21,9 @@ const mockID = "mock-id"
 
 // TargetMock provides cluster.Target interface with mocked return values.
 type TargetMock struct {
-	BO meta.Bowner
-	SO meta.Sowner
+	BO       meta.Bowner
+	SO       meta.Sowner
+	Backends map[string]core.Backend
 }
 
 // interface guard
@@ -30,7 +31,7 @@ var _ core.Target = (*TargetMock)(nil)
 
 func NewTarget(bo meta.Bowner) *TargetMock {
 	t := &TargetMock{BO: bo}
-	core.Tinit(t, NewStatsTracker(), false)
+	core.Tinit(t, NewStatsTracker(), nil /*config*/, false /*run HK*/)
 	return t
 }
 
@@ -46,24 +47,31 @@ func (*TargetMock) DataClient() *http.Client { return http.DefaultClient }
 func (*TargetMock) PageMM() *memsys.MMSA     { return memsys.PageMM() }
 func (*TargetMock) ByteMM() *memsys.MMSA     { return memsys.ByteMM() }
 
+func (*TargetMock) MaxUtilLoad() (int64, float64) { return 0, 0 }
+
 func (*TargetMock) GetAllRunning(*core.AllRunningInOut, bool)                      {}
 func (*TargetMock) PutObject(*core.LOM, *core.PutParams) error                     { return nil }
 func (*TargetMock) FinalizeObj(*core.LOM, string, core.Xact, cmn.OWT) (int, error) { return 0, nil }
 func (*TargetMock) EvictObject(*core.LOM) (int, error)                             { return 0, nil }
 func (*TargetMock) DeleteObject(*core.LOM, bool) (int, error)                      { return 0, nil }
 func (*TargetMock) Promote(*core.PromoteParams) (int, error)                       { return 0, nil }
-func (*TargetMock) Backend(*meta.Bck) core.Backend                                 { return nil }
+func (t *TargetMock) Backend(bck *meta.Bck) core.Backend                           { return t.Backends[bck.Provider] }
 func (*TargetMock) HeadObjT2T(*core.LOM, *meta.Snode) bool                         { return false }
 func (*TargetMock) BMDVersionFixup(*http.Request, ...cmn.Bck)                      {}
-func (*TargetMock) FSHC(error, string)                                             {}
-func (*TargetMock) OOS(*fs.CapStatus) fs.CapStatus                                 { return fs.CapStatus{} }
 
-func (*TargetMock) CopyObject(*core.LOM, core.DM, *core.CopyParams) (int64, error) {
-	return 0, nil
+func (*TargetMock) SoftFSHC()                         {}
+func (*TargetMock) FSHC(error, *fs.Mountpath, string) {}
+
+func (*TargetMock) OOS(*fs.CapStatus, *cmn.Config, *fs.Tcdf) fs.CapStatus {
+	return fs.CapStatus{}
 }
 
 func (*TargetMock) GetCold(context.Context, *core.LOM, cmn.OWT) (int, error) {
 	return http.StatusOK, nil
+}
+
+func (*TargetMock) HeadCold(*core.LOM, *http.Request) (*cmn.ObjAttrs, int, error) {
+	return nil, 0, nil
 }
 
 func (*TargetMock) GetColdBlob(*core.BlobParams, *cmn.ObjAttrs) (core.Xact, error) {
@@ -72,4 +80,8 @@ func (*TargetMock) GetColdBlob(*core.BlobParams, *cmn.ObjAttrs) (core.Xact, erro
 
 func (*TargetMock) Health(*meta.Snode, time.Duration, url.Values) ([]byte, int, error) {
 	return nil, 0, nil
+}
+
+func (*TargetMock) ECRestoreReq(*core.CT, *meta.Snode, string) error {
+	return nil
 }

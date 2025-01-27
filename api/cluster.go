@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -169,8 +170,22 @@ func GetRemoteAIS(bp BaseParams) (remais meta.RemAisVec, err error) {
 	return
 }
 
+// (see also enable/disable backend below)
+func GetConfiguredBackends(bp BaseParams) (out []string, err error) {
+	bp.Method = http.MethodGet
+	reqParams := AllocRp()
+	{
+		reqParams.BaseParams = bp
+		reqParams.Path = apc.URLPathClu.S
+		reqParams.Query = url.Values{apc.QparamWhat: []string{apc.WhatBackends}}
+	}
+	_, err = reqParams.DoReqAny(&out)
+	FreeRp(reqParams)
+	return
+}
+
 // JoinCluster add a node to a cluster.
-func JoinCluster(bp BaseParams, nodeInfo *meta.Snode) (rebID, sid string, err error) {
+func JoinCluster(bp BaseParams, nodeInfo *meta.Snode, flags cos.BitFlags) (rebID, sid string, err error) {
 	bp.Method = http.MethodPost
 	reqParams := AllocRp()
 	{
@@ -178,6 +193,9 @@ func JoinCluster(bp BaseParams, nodeInfo *meta.Snode) (rebID, sid string, err er
 		reqParams.Path = apc.URLPathCluUserReg.S
 		reqParams.Body = cos.MustMarshal(nodeInfo)
 		reqParams.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
+		if flags != 0 {
+			reqParams.Header.Set(apc.HdrNodeFlags, strconv.FormatUint(uint64(flags), 10))
+		}
 	}
 
 	var info apc.JoinNodeResult
@@ -188,13 +206,20 @@ func JoinCluster(bp BaseParams, nodeInfo *meta.Snode) (rebID, sid string, err er
 
 // SetPrimaryProxy given a daemonID sets that corresponding proxy as the
 // primary proxy of the cluster.
-func SetPrimaryProxy(bp BaseParams, newPrimaryID string, force bool) error {
+func SetPrimary(bp BaseParams, newPrimaryID, newPrimaryURL string, force bool) error {
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
 	reqParams.BaseParams = bp
 	reqParams.Path = apc.URLPathCluProxy.Join(newPrimaryID)
-	if force {
-		reqParams.Query = url.Values{apc.QparamForce: []string{"true"}}
+	if force || newPrimaryURL != "" {
+		q := make(url.Values, 2)
+		if force {
+			q.Set(apc.QparamForce, "true")
+		}
+		if newPrimaryURL != "" {
+			q.Set(apc.QparamPrimaryCandidate, newPrimaryURL)
+		}
+		reqParams.Query = q
 	}
 	err := reqParams.DoRequest()
 	FreeRp(reqParams)
@@ -232,7 +257,7 @@ func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToSet, tr
 		msg = apc.ActMsg{Action: apc.ActSetConfig, Value: configToUpdate}
 	)
 	if transient {
-		q.Set(apc.ActTransient, "true")
+		q = url.Values{apc.ActTransient: []string{"true"}}
 	}
 	bp.Method = http.MethodPut
 	reqParams := AllocRp()
@@ -248,6 +273,23 @@ func SetClusterConfigUsingMsg(bp BaseParams, configToUpdate *cmn.ConfigToSet, tr
 	return err
 }
 
+func setRebalance(bp BaseParams, enabled bool) error {
+	configToSet := &cmn.ConfigToSet{
+		Rebalance: &cmn.RebalanceConfToSet{
+			Enabled: apc.Ptr(enabled),
+		},
+	}
+	return SetClusterConfigUsingMsg(bp, configToSet, false /*transient*/)
+}
+
+func EnableRebalance(bp BaseParams) error {
+	return setRebalance(bp, true)
+}
+
+func DisableRebalance(bp BaseParams) error {
+	return setRebalance(bp, false)
+}
+
 // all nodes: reset configuration to cluster defaults
 func ResetClusterConfig(bp BaseParams) error {
 	return _putCluster(bp, apc.ActMsg{Action: apc.ActResetConfig})
@@ -255,6 +297,10 @@ func ResetClusterConfig(bp BaseParams) error {
 
 func RotateClusterLogs(bp BaseParams) error {
 	return _putCluster(bp, apc.ActMsg{Action: apc.ActRotateLogs})
+}
+
+func ReloadBackendCreds(bp BaseParams, provider string) error {
+	return _putCluster(bp, apc.ActMsg{Action: apc.ActReloadBackendCreds, Name: provider})
 }
 
 func _putCluster(bp BaseParams, msg apc.ActMsg) error {
@@ -322,12 +368,13 @@ func DetachRemoteAIS(bp BaseParams, alias string) error {
 
 //
 // Backend (enable | disable)
+// see also GetConfiguredBackends above
 //
 
 func EnableBackend(bp BaseParams, provider string) error {
 	np := apc.NormalizeProvider(provider)
 	if !apc.IsCloudProvider(np) {
-		return fmt.Errorf("can only enable cloud backend (have %q)", provider)
+		return fmt.Errorf("can only enable cloud backend (have %q)", provider) // TODO: this check can be removed, if need be
 	}
 	path := apc.URLPathCluBendEnable.Join(np)
 	return _backend(bp, path)

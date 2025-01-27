@@ -25,15 +25,25 @@ const statsdir = "/sys/class/block"
 
 // public
 type (
+	FsDisks map[string]int64 // disk name => sector size
+
 	IOS interface {
 		GetAllMpathUtils() *MpathUtil
 		GetMpathUtil(mpath string) int64
-		AddMpath(mpath, fs string, label Label, config *cmn.Config) (FsDisks, error)
+		AddMpath(mpath, fs string, label cos.MountpathLabel, config *cmn.Config, blockDevs BlockDevices) (FsDisks, error)
+		RescanDisks(mpath, fs string, disks []string) RescanDisksResult
 		RemoveMpath(mpath string, testingEnv bool)
-		FillDiskStats(m AllDiskStats)
+		DiskStats(m cos.AllDiskStats)
 	}
-	FsDisks   map[string]int64 // disk name => sector size
+
 	MpathUtil sync.Map
+
+	RescanDisksResult struct {
+		FsDisks  FsDisks
+		Fatal    error
+		Lost     []error
+		Attached []error
+	}
 )
 
 // internal
@@ -63,7 +73,6 @@ type (
 		disk2mpath  cos.StrKVs
 		disk2sysfn  cos.StrKVs
 		blockStats  allBlockStats
-		lsblk       ratomic.Pointer[LsBlk]
 		cache       ratomic.Pointer[cache]
 		cacheHst    [16]*cache
 		cacheIdx    int
@@ -95,7 +104,7 @@ func (x *MpathUtil) Set(mpath string, util int64) {
 // ios //
 /////////
 
-func New(num int) IOS {
+func New(num int) (IOS, BlockDevices) {
 	ios := &ios{
 		mpath2disks: make(map[string]FsDisks, num),
 		disk2mpath:  make(cos.StrKVs, num),
@@ -109,17 +118,12 @@ func New(num int) IOS {
 	ios.cacheIdx = 0
 	ios.busy.Store(false) // redundant on purpose
 
-	// once (cleared via Clblk)
-	if res := lsblk("new-ios", true); res != nil {
-		ios.lsblk.Store(res)
+	blockDevs, err := _lsblk("", nil /*parent*/)
+	if err != nil {
+		cos.Errorln(err)
 	}
 
-	return ios
-}
-
-func Clblk(i IOS) {
-	ios := i.(*ios)
-	ios.lsblk.Store(nil)
+	return ios, blockDevs
 }
 
 func newCache(num int) *cache {
@@ -147,38 +151,34 @@ func (ios *ios) _put(cache *cache) { ios.cache.Store(cache) }
 // add mountpath
 //
 
-func (ios *ios) AddMpath(mpath, fs string, label Label, config *cmn.Config) (fsdisks FsDisks, err error) {
+func (ios *ios) AddMpath(mpath, fs string, label cos.MountpathLabel, config *cmn.Config, blockDevs BlockDevices) (fsdisks FsDisks, err error) {
 	var (
 		warn       string
 		testingEnv = config.TestingEnv()
 		fspaths    = config.LocalConfig.FSP.Paths
 	)
-	if pres := ios.lsblk.Load(); pres != nil {
-		res := *pres
-		fsdisks, err = fs2disks(&res, fs, label, len(fspaths), testingEnv)
-	} else {
-		res := lsblk(fs, testingEnv)
-		if res != nil {
-			fsdisks, err = fs2disks(res, fs, label, len(fspaths), testingEnv)
-		}
+	fsdisks, err = fs2disks(mpath, fs, label, blockDevs, len(fspaths), testingEnv)
+	if err != nil || len(fsdisks) == 0 {
+		return fsdisks, err
 	}
-	if len(fsdisks) == 0 || err != nil {
-		return
+	// NOTE: no need to lock when starting up (see via volume.Init and fs.New)
+	if blockDevs == nil {
+		ios.mu.Lock()
 	}
-	ios.mu.Lock()
 	warn, err = ios._add(mpath, label, fsdisks, fspaths, testingEnv)
-	ios.mu.Unlock()
-
+	if blockDevs == nil {
+		ios.mu.Unlock()
+	}
 	if err != nil {
 		nlog.Errorln(err)
 	}
 	if warn != "" {
 		nlog.Infoln(warn)
 	}
-	return
+	return fsdisks, err
 }
 
-func (ios *ios) _add(mpath string, label Label, fsdisks FsDisks, fspaths cos.StrKVs, testingEnv bool) (warn string, _ error) {
+func (ios *ios) _add(mpath string, label cos.MountpathLabel, fsdisks FsDisks, fspaths cos.StrKVs, testingEnv bool) (warn string, _ error) {
 	if dd, ok := ios.mpath2disks[mpath]; ok {
 		return "", fmt.Errorf("duplicate mountpath %s (disks %s, %s)", mpath, dd._str(), fsdisks._str())
 	}
@@ -189,9 +189,9 @@ func (ios *ios) _add(mpath string, label Label, fsdisks FsDisks, fspaths cos.Str
 			if label.IsNil() {
 				return "", fmt.Errorf("disk %s is shared between mountpaths %s and %s", disk, mpath, mp)
 			}
-			var otherLabel Label
+			var otherLabel cos.MountpathLabel
 			if o, ok := fspaths[mp]; ok {
-				otherLabel = Label(o)
+				otherLabel = cos.MountpathLabel(o)
 			}
 			warn = fmt.Sprintf("Warning: disk %s is shared between %s%s and %s%s",
 				disk, mpath, label.ToLog(), mp, otherLabel.ToLog())
@@ -237,6 +237,43 @@ func (ios *ios) _add(mpath string, label Label, fsdisks FsDisks, fspaths cos.Str
 		}
 	}
 	return warn, nil
+}
+
+// at runtime:
+// - resolve (mpath, filesystem) => disks
+// - revalidate disk(s)
+// - note: part of the alerting mechanism, via filesystem health checker (FSHC)
+func (ios *ios) RescanDisks(mpath, fs string, disks []string) (out RescanDisksResult) {
+	debug.Assert(len(disks) > 0)
+
+	var err error
+	out.FsDisks, err = fs2disks(mpath, fs, cos.MountpathLabel(""), nil, len(disks), false /*no-disks is ok*/)
+	if err != nil {
+		out.Fatal = err
+		return out
+	}
+	fsdisks := out.FsDisks
+	for _, d := range disks {
+		if _, ok := fsdisks[d]; !ok {
+			out.Lost = append(out.Lost, cmn.NewErrMpathLostDisk(mpath, fs, d, disks, fsdisks.ToSlice()))
+		}
+	}
+	for d := range fsdisks {
+		if !cos.StringInSlice(d, disks) {
+			out.Attached = append(out.Attached, cmn.NewErrMpathNewDisk(mpath, fs, disks, fsdisks.ToSlice()))
+
+			// TODO -- FIXME: under lock: update ios.mpath2disks and related state; log
+			ios._update(mpath, fsdisks, disks)
+		}
+	}
+
+	// TODO -- FIXME: read/write a few bytes, and check that block stats increment
+
+	return out
+}
+
+func (ios *ios) _update(mpath string, fsdisks FsDisks, disks []string) {
+	debug.Assert(false, "not implemented yet", mpath, fsdisks, disks, ios.mpath2disks)
 }
 
 //
@@ -309,10 +346,10 @@ func (ios *ios) GetMpathUtil(mpath string) int64 {
 	return ios.GetAllMpathUtils().Get(mpath)
 }
 
-func (ios *ios) FillDiskStats(m AllDiskStats) {
+func (ios *ios) DiskStats(m cos.AllDiskStats) {
 	cache := ios.refresh()
 	for disk := range cache.ioms {
-		m[disk] = DiskStats{
+		m[disk] = cos.DiskStats{
 			RBps: cache.rbps[disk],
 			Ravg: cache.ravg[disk],
 			WBps: cache.wbps[disk],
@@ -443,18 +480,21 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 			ncache.rbps[disk] = statsCache.rbps[disk]
 			ncache.wbps[disk] = statsCache.wbps[disk]
 		}
-		if reads > 0 {
+		// averages
+		switch {
+		case reads > 0:
 			ncache.ravg[disk] = cos.DivRound(readBytes, reads)
-		} else if elapsedSeconds == 0 {
+		case elapsedSeconds == 0:
 			ncache.ravg[disk] = statsCache.ravg[disk]
-		} else {
+		default:
 			ncache.ravg[disk] = 0
 		}
-		if writes > 0 {
+		switch {
+		case writes > 0:
 			ncache.wavg[disk] = cos.DivRound(writeBytes, writes)
-		} else if elapsedSeconds == 0 {
+		case elapsedSeconds == 0:
 			ncache.wavg[disk] = statsCache.wavg[disk]
-		} else {
+		default:
 			ncache.wavg[disk] = 0
 		}
 	}
@@ -489,7 +529,21 @@ func (ios *ios) _ref(config *cmn.Config) (ncache *cache, maxUtil int64, missingI
 	return
 }
 
-func (disks FsDisks) _str() string {
-	s := fmt.Sprintf("%v", disks) // with sector sizes
+/////////////
+// FsDisks //
+/////////////
+
+func (fsdisks FsDisks) ToSlice() (disks []string) {
+	disks = make([]string, len(fsdisks))
+	var i int
+	for d := range fsdisks {
+		disks[i] = d
+		i++
+	}
+	return disks
+}
+
+func (fsdisks FsDisks) _str() string {
+	s := fmt.Sprintf("%v", fsdisks) // with sector sizes
 	return strings.TrimPrefix(s, "map")
 }

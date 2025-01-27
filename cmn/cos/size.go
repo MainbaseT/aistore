@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects.
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -34,7 +34,7 @@ const (
 	TB = 1000 * GB
 )
 
-var suffX = []string{"KIB", "MIB", "GIB", "TIB", "KB", "MB", "GB", "TB", "K", "M", "G", "T", "B"}
+var unitx = [...]string{"KIB", "MIB", "GIB", "TIB", "KB", "MB", "GB", "TB", "KI", "MI", "GI", "TI", "K", "M", "G", "T", "B"}
 
 /////////////
 // SizeIEC //
@@ -96,12 +96,12 @@ func ParseSize(size, units string) (int64, error) {
 		s      = strings.ToUpper(strings.TrimSpace(size))
 		suffix = _suffix(s)
 	)
-	if suffix == "KIB" || suffix == "MIB" || suffix == "GIB" || suffix == "TIB" {
+	if strings.IndexByte(suffix, 'I') > 0 { // IEC
 		u = UnitsIEC
 		if units != "" && units != UnitsIEC {
 			return 0, fmt.Errorf("ParseSize %q error: %q vs %q units", size, u, units)
 		}
-	} else if suffix != "" && suffix != "B" {
+	} else if suffix != "" && suffix != "B" { // SI
 		u = UnitsSI
 		if units != "" {
 			if units == UnitsRaw {
@@ -130,7 +130,7 @@ func ParseSize(size, units string) (int64, error) {
 }
 
 func _suffix(s string) string {
-	for _, suffix := range suffX {
+	for _, suffix := range unitx {
 		if strings.HasSuffix(s, suffix) {
 			return suffix
 		}

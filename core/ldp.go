@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -12,6 +12,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/feat"
 )
 
 // NOTE: compare with ext/etl/dp.go
@@ -116,7 +117,7 @@ remote:
 // - [Sync] when Sync option is used (via bucket config and/or `sync` argument) caller MUST take wlock or rlock
 // - [MAY] delete remotely-deleted (non-existing) object and increment associated stats counter
 //
-// Returns NotFound also after having removed local replica (the Sync option)
+// also returns `NotFound` after removing local replica - the Sync option
 func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRMD) {
 	bck := lom.Bck()
 	if !bck.HasVersioningMD() {
@@ -125,18 +126,24 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRM
 		return CRMD{Eq: true}
 	}
 
-	oa, ecode, err := T.Backend(bck).HeadObj(context.Background(), lom, origReq)
+	oa, ecode, err := T.HeadCold(lom, origReq)
 	if err == nil {
-		debug.Assert(ecode == 0, ecode)
-		return CRMD{ObjAttrs: oa, Eq: lom.Equal(oa), ErrCode: ecode}
-	}
-
-	if ecode == http.StatusNotFound {
+		e := lom.CheckEq(oa)
+		if !lom.IsFeatureSet(feat.DisableColdGET) || e == nil {
+			debug.Assert(ecode == 0, ecode)
+			return CRMD{ObjAttrs: oa, Eq: e == nil, ErrCode: ecode}
+		}
+		// Cold Get disabled and metadata doesn't match, so we must treat
+		// it as if the object doesn't really exist.
+		err = cmn.NewErrRemoteMetadataMismatch(e)
+		ecode = http.StatusNotFound
+	} else if ecode == http.StatusNotFound {
 		err = cos.NewErrNotFound(T, lom.Cname())
 	}
+
 	if !locked {
 		// return info (neq and, possibly, not-found), and be done
-		return CRMD{ErrCode: ecode, Err: err}
+		return CRMD{ObjAttrs: oa, ErrCode: ecode, Err: err}
 	}
 
 	// rm remotely-deleted
@@ -145,14 +152,15 @@ func (lom *LOM) CheckRemoteMD(locked, sync bool, origReq *http.Request) (res CRM
 		if errDel != nil {
 			ecode, err = 0, errDel
 		} else {
-			g.tstats.Inc(RemoteDeletedDelCount)
+			vlabs := map[string]string{"bucket": lom.Bck().Cname("")} // TODO -- FIXME: cannot import stats
+			g.tstats.AddWith(cos.NamedVal64{Name: RemoteDeletedDelCount, Value: 1, VarLabs: vlabs})
 		}
 		debug.Assert(err != nil)
 		return CRMD{ErrCode: ecode, Err: err}
 	}
 
 	lom.Uncache()
-	return CRMD{ErrCode: ecode, Err: err}
+	return CRMD{ObjAttrs: oa, ErrCode: ecode, Err: err}
 }
 
 // NOTE: Sync is false (ie., not deleting)

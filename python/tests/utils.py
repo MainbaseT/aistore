@@ -2,14 +2,86 @@ import os
 import random
 import shutil
 import string
-import tempfile
 import tarfile
 import io
+from itertools import product
 from pathlib import Path
+from unittest.mock import Mock
+
+from typing import Dict, List, Iterator
+from requests.exceptions import ChunkedEncodingError
 
 from aistore.sdk import Client
 from aistore.sdk.const import UTF_ENCODING
-from aistore.sdk.errors import ErrBckNotFound
+from aistore.sdk.provider import Provider
+from aistore.sdk.obj.content_iterator import ContentIterator
+
+
+# pylint: disable=too-few-public-methods
+class BadContentStream(io.BytesIO):
+    """
+    Simulates a stream that fails intermittently with a specified error after a set number of reads.
+
+    Args:
+        data (bytes): The data to be streamed.
+        fail_on_read (int): The number of reads after which the error is raised.
+        error (Exception): The error instance to raise after `fail_on_read` reads.
+    """
+
+    def __init__(self, data: bytes, fail_on_read: int, error: Exception):
+        super().__init__(data)
+        self.read_count = 0
+        self.fail_on_read = fail_on_read
+        self.error = error
+
+    def read(self, size: int = -1) -> bytes:
+        """Overrides `BytesIO.read` to raise an error after a specific number of reads."""
+        self.read_count += 1
+        if self.read_count == self.fail_on_read:
+            raise self.error
+        return super().read(size)
+
+
+# pylint: disable=too-few-public-methods
+class BadContentIterator(ContentIterator):
+    """
+    Simulates a ContentIterator that streams data in chunks and intermittently raises errors
+    via a `BadContentStream`.
+
+    Args:
+        data (bytes): The data to be streamed in chunks.
+        fail_on_read (int): The number of reads after which an error will be raised.
+        chunk_size (int): The size of each chunk to be read from the data.
+        error (Exception): The error instance to raise after `fail_on_read` reads.
+    """
+
+    def __init__(
+        self,
+        data: bytes,
+        fail_on_read: int,
+        chunk_size: int,
+        error: Exception = ChunkedEncodingError("Simulated ChunkedEncodingError"),
+    ):
+        super().__init__(client=Mock(), chunk_size=chunk_size)
+        self.data = data
+        self.fail_on_read = fail_on_read
+        self.error = error
+        self.read_position = 0
+
+    def iter(self, offset: int = 0) -> Iterator[bytes]:
+        """Streams data using `BadContentStream`, starting from `offset`."""
+        stream = BadContentStream(
+            self.data[offset:], fail_on_read=self.fail_on_read, error=self.error
+        )
+        self.read_position = offset
+
+        def iterator():
+            while self.read_position < len(self.data):
+                chunk = stream.read(self._chunk_size)
+                self.read_position += len(chunk)
+                yield chunk
+
+        return iterator()
 
 
 # pylint: disable=unused-variable
@@ -17,30 +89,29 @@ def random_string(length: int = 10):
     return "".join(random.choices(string.ascii_lowercase, k=length))
 
 
+def string_to_dict(input_string: str) -> Dict:
+    pairs = input_string.split(", ")
+    result_dict = {
+        key_value.split("=")[0]: key_value.split("=")[1] for key_value in pairs
+    }
+    return result_dict
+
+
 # pylint: disable=unused-variable
 def create_and_put_object(
     client: Client,
     bck_name: str,
     obj_name: str,
-    provider: str = "ais",
+    provider: Provider = Provider.AIS,
     obj_size: int = 0,
 ):
     obj_size = obj_size if obj_size else random.randrange(10, 20)
     obj_body = "".join(random.choices(string.ascii_letters, k=obj_size))
     content = obj_body.encode(UTF_ENCODING)
-    temp_file = Path(tempfile.gettempdir()).joinpath(os.urandom(24).hex())
-    with open(temp_file, "wb") as file:
-        file.write(content)
-        file.flush()
-        client.bucket(bck_name, provider=provider).object(obj_name).put_file(file.name)
+    client.bucket(bck_name, provider=provider).object(
+        obj_name
+    ).get_writer().put_content(content)
     return content
-
-
-def destroy_bucket(client: Client, bck_name: str):
-    try:
-        client.bucket(bck_name).delete()
-    except ErrBckNotFound:
-        pass
 
 
 def cleanup_local(path: str):
@@ -67,12 +138,24 @@ def create_and_put_objects(
     return obj_names
 
 
-def test_cases(*args):
+def cases(*args):
     def decorator(func):
         def wrapper(self, *inner_args, **kwargs):
             for arg in args:
                 with self.subTest(arg=arg):
                     func(self, arg, *inner_args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def case_matrix(*args_list):
+    def decorator(func):
+        def wrapper(self, *inner_args, **kwargs):
+            for args in product(*args_list):
+                with self.subTest(args=args):
+                    func(self, *args, *inner_args, **kwargs)
 
         return wrapper
 
@@ -94,23 +177,20 @@ def create_archive(archive_name, content_dict):
 def create_random_tarballs(
     num_files: int, num_extensions: int, min_shard_size: int, dest_dir: str
 ):
-    def generate_random_string(length: int) -> str:
-        return "".join(random.choices(string.ascii_letters + string.digits, k=length))
-
     def generate_random_content(min_size: int = 1024, max_size: int = 10240) -> bytes:
         size = random.randint(min_size, max_size)
         return os.urandom(size)
 
-    def generate_files(num_files: int, num_extensions: int, dest_dir: str) -> list:
+    def generate_files(num_files: int, num_extensions: int, dest_dir: str) -> List:
         files_list = []
         filenames_list = []
 
         dest_dir_path = Path(dest_dir)
         dest_dir_path.mkdir(parents=True, exist_ok=True)
 
-        extension_list = [generate_random_string(3) for _ in range(num_extensions)]
+        extension_list = [random_string(3) for _ in range(num_extensions)]
         for _ in range(num_files):
-            filename = generate_random_string(10)
+            filename = random_string(10)
             filenames_list.append(filename)
 
             for ext in extension_list:
@@ -121,7 +201,7 @@ def create_random_tarballs(
 
         return files_list, extension_list
 
-    def create_tarballs(min_shard_size: int, dest_dir: str, files_list: list) -> None:
+    def create_tarballs(min_shard_size: int, dest_dir: str, files_list: List) -> None:
         num_input_shards = 0
         current_size = 0
         dest_dir_path = Path(dest_dir).resolve()

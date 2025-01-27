@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -73,7 +73,7 @@ func TestETLMultiObj(t *testing.T) {
 
 		if bcktest.srcRemote {
 			if bcktest.evictRemoteSrc {
-				tlog.Logf("evicting %s\n", m.bck)
+				tlog.Logf("evicting %s\n", m.bck.String())
 				//
 				// evict all _cached_ data from the "local" cluster
 				// keep the src bucket in the "local" BMD though
@@ -83,7 +83,7 @@ func TestETLMultiObj(t *testing.T) {
 			}
 		}
 
-		tlog.Logf("PUT %d objects (size %d) => %s/test/a-*\n", objCnt, objSize, m.bck)
+		tlog.Logf("PUT %d objects (size %d) => %s/test/a-*\n", objCnt, objSize, m.bck.String())
 		for i := range objCnt {
 			r, _ := readers.NewRand(objSize, cksumType)
 			_, err := api.PutObject(&api.PutArgs{
@@ -143,16 +143,16 @@ func testETLMultiObj(t *testing.T, etlName string, bckFrom, bckTo cmn.Bck, fileR
 		proxyURL   = tools.RandomProxyURL(t)
 		baseParams = tools.BaseAPIParams(proxyURL)
 
-		objList        = pt.ToSlice()
-		objCnt         = len(objList)
+		lst            = pt.ToSlice()
+		objCnt         = len(lst)
 		requestTimeout = 30 * time.Second
-		tcomsg         = cmn.TCObjsMsg{ToBck: bckTo}
+		tcomsg         = cmn.TCOMsg{ToBck: bckTo}
 	)
 	tcomsg.Transform.Name = etlName
 	tcomsg.Transform.Timeout = cos.Duration(requestTimeout)
 
 	if opType == "list" {
-		tcomsg.ListRange.ObjNames = objList
+		tcomsg.ListRange.ObjNames = lst
 	} else {
 		tcomsg.ListRange.Template = fileRange
 	}
@@ -174,7 +174,7 @@ func testETLMultiObj(t *testing.T, etlName string, bckFrom, bckTo cmn.Bck, fileR
 	list, err := api.ListObjects(baseParams, bckTo, nil, api.ListArgs{})
 	tassert.CheckFatal(t, err)
 	tassert.Errorf(t, len(list.Entries) == objCnt, "expected %d objects from offline ETL, got %d", objCnt, len(list.Entries))
-	for _, objName := range objList {
+	for _, objName := range lst {
 		err := api.DeleteObject(baseParams, bckTo, objName)
 		tassert.CheckError(t, err)
 		tlog.Logf("%s\n", bckTo.Cname(objName))

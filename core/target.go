@@ -17,7 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
-	"github.com/NVIDIA/aistore/transport"
 )
 
 //
@@ -26,12 +25,6 @@ import (
 
 // intra-cluster data path: control structures and types
 type (
-	OnFinishObj = func(lom *LOM, err error)
-
-	DM interface {
-		Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.Snode) error
-	}
-
 	PutParams struct {
 		Reader  io.ReadCloser
 		Cksum   *cos.Cksum // checksum to check
@@ -50,19 +43,6 @@ type (
 		Xact            Xact        // responsible xaction
 		apc.PromoteArgs             // all of the above
 	}
-	CopyParams struct {
-		DP        DP // copy or transform via data provider, see impl-s: (ext/etl/dp.go, core/ldp.go)
-		Xact      Xact
-		Config    *cmn.Config
-		BckTo     *meta.Bck
-		ObjnameTo string
-		Buf       []byte
-		OWT       cmn.OWT
-		Finalize  bool // copies and EC (as in poi.finalize())
-		DryRun    bool
-		LatestVer bool // can be used without changing bucket's 'versioning.validate_warm_get'; see also: QparamLatestVer
-		Sync      bool // ditto -  bucket's 'versioning.synchronize'
-	}
 
 	// blob
 	WriteSGL func(*memsys.SGL) error
@@ -78,19 +58,15 @@ type (
 )
 
 type (
-	NodeCapacity interface {
+	// a node that can also write objects
+	TargetPut interface {
 		Node
 
 		// Space
-		OOS(*fs.CapStatus) fs.CapStatus
+		OOS(*fs.CapStatus, *cmn.Config, *fs.Tcdf) fs.CapStatus
 
 		// xactions (jobs) now
 		GetAllRunning(inout *AllRunningInOut, periodic bool)
-	}
-
-	// a node that can also write objects
-	TargetPut interface {
-		NodeCapacity
 
 		// PUT params.Reader => lom
 		PutObject(lom *LOM, params *PutParams) (err error)
@@ -103,11 +79,12 @@ type (
 	TargetLoc interface {
 		TargetPut
 
+		fs.HC
+
 		// backend
 		Backend(*meta.Bck) Backend
 
-		// FS health and Health
-		FSHC(err error, path string)
+		// Node health
 		Health(si *meta.Snode, timeout time.Duration, query url.Values) (body []byte, ecode int, err error)
 	}
 
@@ -125,9 +102,12 @@ type (
 
 		GetCold(ctx context.Context, lom *LOM, owt cmn.OWT) (ecode int, err error)
 
-		CopyObject(lom *LOM, dm DM, coi *CopyParams) (int64, error)
+		HeadCold(lom *LOM, origReq *http.Request) (objAttrs *cmn.ObjAttrs, ecode int, err error)
+
 		Promote(params *PromoteParams) (ecode int, err error)
 		HeadObjT2T(lom *LOM, si *meta.Snode) bool
+
+		ECRestoreReq(ct *CT, si *meta.Snode, uuid string) error
 
 		BMDVersionFixup(r *http.Request, bck ...cmn.Bck)
 	}

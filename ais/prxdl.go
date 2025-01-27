@@ -1,12 +1,11 @@
 // Package ais provides core functionality for the AIStore object storage.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,7 +22,7 @@ import (
 )
 
 // [METHOD] /v1/download
-func (p *proxy) downloadHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) dloadHandler(w http.ResponseWriter, r *http.Request) {
 	if !p.ClusterStarted() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -87,7 +86,7 @@ func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
 
 	jobID := dload.PrefixJobID + cos.GenUUID() // prefix to visually differentiate vs. xaction IDs
 
-	body, err := io.ReadAll(r.Body)
+	body, err := cos.ReadAllN(r.Body, r.ContentLength)
 	if err != nil {
 		p.writeErrStatusf(w, r, http.StatusInternalServerError, "failed to receive download request: %v", err)
 		return
@@ -112,8 +111,16 @@ func (p *proxy) httpdlpost(w http.ResponseWriter, r *http.Request) {
 		p.writeErrStatusf(w, r, ecode, "Error starting download: %v", err)
 		return
 	}
+
+	// HACK:
+	// download _job_ vs download xaction, see abortReq() in ais/prxnotif
 	smap := p.owner.smap.get()
-	nl := dload.NewDownloadNL(jobID, string(dlb.Type), &smap.Smap, progressInterval)
+	nl := dload.NewDownloadNL(
+		jobID,            // jobID != xid
+		string(dlb.Type), // instead of apc.ActDownload xaction kind
+		&smap.Smap,
+		progressInterval,
+	)
 	nl.SetOwner(equalIC)
 	p.ic.registerEqual(regIC{nl: nl, smap: smap})
 

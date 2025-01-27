@@ -25,18 +25,19 @@ type (
 		ErrCode  int
 	}
 	LsoInvCtx struct {
-		Lom    *LOM
 		Lmfh   cos.LomReader
+		Lom    *LOM
+		SGL    *memsys.SGL
 		Name   string
 		ID     string
 		Schema []string
-		SGL    *memsys.SGL
 		Size   int64
 		EOF    bool
 	}
 
 	Backend interface {
 		Provider() string
+		MetricName(string) string
 
 		CreateBucket(bck *meta.Bck) (ecode int, err error)
 		ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode int, err error)

@@ -21,7 +21,6 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/fs/mpather"
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
@@ -121,7 +120,8 @@ func (*lruFactory) New(args xreg.Args, _ *meta.Bck) xreg.Renewable {
 
 func (p *lruFactory) Start() error {
 	p.xctn = &XactLRU{}
-	p.xctn.InitBase(p.UUID(), apc.ActLRU, nil)
+	ctlmsg := p.Args.Custom.(string)
+	p.xctn.InitBase(p.UUID(), apc.ActLRU, ctlmsg, nil)
 	return nil
 }
 
@@ -260,7 +260,7 @@ func (j *lruJ) jogBcks(bcks []cmn.Bck, force bool) (err error) {
 		var size int64
 		j.bck = bck
 		if j.allowDelObj, err = j.allow(); err != nil {
-			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck)
+			nlog.Errorf("%s: %v - skipping %s (Hint: run 'ais storage cleanup' to cleanup)", j, err, bck.String())
 			err = nil
 			continue
 		}
@@ -412,18 +412,19 @@ func (j *lruJ) postRemove(prev, size int64) (capCheck int64, err error) {
 }
 
 func (j *lruJ) _throttle(usedPct int64) (err error) {
-	if j.mi.IsIdle(j.config) {
+	if u := j.mi.GetUtil(); u >= 0 && u < j.config.Disk.DiskUtilLowWM {
 		return
 	}
-	// throttle self
-	ratioCapacity := cos.Ratio(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
-	curr := fs.GetMpathUtil(j.mi.Path)
-	ratioUtilization := cos.Ratio(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
-	if ratioUtilization > ratioCapacity {
+	var (
+		ratioCap  = cos.RatioPct(j.config.Space.HighWM, j.config.Space.LowWM, usedPct)
+		curr      = fs.GetMpathUtil(j.mi.Path)
+		ratioUtil = cos.RatioPct(j.config.Disk.DiskUtilHighWM, j.config.Disk.DiskUtilLowWM, curr)
+	)
+	if ratioUtil > ratioCap {
 		if usedPct < (j.config.Space.LowWM+j.config.Space.HighWM)/2 {
 			j.throttle = true
 		}
-		time.Sleep(mpather.ThrottleMaxDur)
+		time.Sleep(fs.Throttle100ms)
 		err = j.yieldTerm()
 	}
 	return
@@ -469,7 +470,7 @@ func (j *lruJ) yieldTerm() error {
 		return cmn.NewErrAborted(xlru.Name(), "", nil)
 	default:
 		if j.throttle {
-			time.Sleep(mpather.ThrottleMinDur)
+			time.Sleep(fs.Throttle1ms)
 		}
 		break
 	}
