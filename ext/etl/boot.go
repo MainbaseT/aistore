@@ -1,6 +1,6 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
@@ -172,7 +172,7 @@ func (b *etlBootstrapper) createEntity(entity string) error {
 	}
 
 	if err != nil {
-		err = cmn.NewErrETL(b.errCtx, "failed to create %s (err: %v)", entity, err)
+		err = cmn.NewErrETLf(b.errCtx, "failed to create %s (err: %v)", entity, err)
 	}
 	return err
 }
@@ -183,21 +183,21 @@ func (b *etlBootstrapper) createEntity(entity string) error {
 // `readinessProbe` config specified the last step gets skipped.
 //
 // NOTE: currently, we do require readinessProbe config in the ETL spec.
-func (b *etlBootstrapper) waitPodReady() error {
+func (b *etlBootstrapper) waitPodReady(podCtx context.Context) error {
 	var (
 		timeout     = b.msg.Timeout.D()
 		interval    = cos.ProbingFrequency(timeout)
 		client, err = k8s.GetClient()
 	)
 	if err != nil {
-		return cmn.NewErrETL(b.errCtx, "%v", err)
+		return cmn.NewErrETL(b.errCtx, err.Error())
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleETL) {
 		nlog.Infof("waiting pod %q ready (%+v, %s) timeout=%v ival=%v",
 			b.pod.Name, b.msg.String(), b.errCtx, timeout, interval)
 	}
 	// wait
-	err = wait.PollUntilContextTimeout(context.Background(), interval, timeout, false, /*immediate*/
+	err = wait.PollUntilContextTimeout(podCtx, interval, timeout, false, /*immediate*/
 		func(context.Context) (ready bool, err error) {
 			return checkPodReady(client, b.pod.Name)
 		},
@@ -208,18 +208,17 @@ func (b *etlBootstrapper) waitPodReady() error {
 	}
 	pod, _ := client.Pod(b.pod.Name)
 	if pod == nil {
-		return cmn.NewErrETL(b.errCtx, "%v", err)
+		return cmn.NewErrETL(b.errCtx, err.Error())
 	}
-	err = cmn.NewErrETL(b.errCtx,
-		`%v (pod phase: %q, pod conditions: %s; expected condition: %s)`,
+	err = cmn.NewErrETLf(b.errCtx,
+		`%v (pod phase: %q, pod conditions: %s`,
 		err, pod.Status.Phase, podConditionsToString(pod.Status.Conditions),
-		podConditionToString(&corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}),
 	)
 	return err
 }
 
 func (b *etlBootstrapper) setupXaction(xid string) {
-	rns := xreg.RenewETL(b.msg, xid)
+	rns := xreg.RenewETL(&b.msg, xid)
 	debug.AssertNoErr(rns.Err)
 	debug.Assert(!rns.IsRunning())
 	b.xctn = rns.Entry.Get()

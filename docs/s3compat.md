@@ -17,7 +17,7 @@ This document talks about the 2. and 3. - about AIS providing S3 compatible API 
 
 There's a separate, albeit closely related, [document](/docs/s3cmd.md) that explains how to configure `s3cmd` and then maybe tweak AIStore configuration to work with it:
 
-* [Getting Started with `s3cmd`](/docs/s3cmd.md) - also contains configuration, tips, usage examples, and more.
+* [Getting Started with `s3cmd`](/docs/s3cmd.md) - also contains configuration, tips, usage examples and more.
 
 For additional background, see:
 
@@ -31,6 +31,11 @@ For additional background, see:
   - [GET(object)](#getobject)
   - [HEAD(object)](#headobject)
 - [Presigned S3 requests](#presigned-s3-requests)
+  - [1. Enable presigned S3 requests](#1-enable-presigned-s3-requests)
+  - [2. Create presigned S3 request](#2-create-presigned-s3-request)
+  - [3. Execute presigned S3 request](#3-execute-presigned-s3-request)
+  - [4. Finally, check the status](#4-finally-check-the-status)
+  - [Using Go client to execute presigned S3 requests](#using-go-client-to-execute-presigned-s3-requests)
 - [Quick example using Internet Browser](#quick-example-using-internet-browser)
 - [`s3cmd` command line](#s3cmd-command-line)
 - [ETag and MD5](#etag-and-md5)
@@ -107,33 +112,71 @@ $ aws s3api --endpoint-url http://localhost:8080/s3 head-object --bucket abc --k
 
 AIStore also supports (passing through) [presigned S3 requests](https://docs.aws.amazon.com/search/doc-search.html?searchPath=documentation-guide&searchQuery=presigned&this_doc_product=Amazon%20Simple%20Storage%20Service&this_doc_guide=User%20Guide).
 
-To use this _feature_, you need to enable it - as follows:
+To use this _feature_, you need to enable it first - as follows:
 
-```commandline
+### 1. Enable presigned S3 requests
+
+```console
 $ ais config cluster features S3-Presigned-Request
 ```
 
-Once we have our cluster configured we can prepare and issue presigned S3 request:
-1. First create a signed S3 request.
-   ```commandline
-   $ aws s3 presign s3://bucket/test.txt
-   https://bucket.s3.us-west-2.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE123456789%2F20210621%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20210621T041609Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=EXAMBLE1234494d5fba3fed607f98018e1dfc62e2529ae96d844123456
-   ```
+Rest of this section uses [curl](https://curl.se/); more (and easier to use) examples can be found at:
 
-2. Issue request against AIStore:
-   ```commandline
-   $ curl -L -X -d 'testing 1 2 3' PUT https://localhost:8080/s3/bucket/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE123456789%2F20210621%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20210621T041609Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=EXAMBLE1234494d5fba3fed607f98018e1dfc62e2529ae96d844123456
-   ```
-   At this point, AIStore will send the presigned (PUT) URL to S3 and, if successful, store the object in cluster.
+* [Assorted Curl](/docs/getting_started.md#assorted-curl)
 
-3. Check status of the object:
-   ```commandline
-   ais bucket ls s3://bucket
-   NAME          SIZE   CACHED  STATUS
-   test.txt      13B    yes     ok
-   ```
+### 2. Create presigned S3 request
 
-It is also possible to achieve the same using a Go client. You will need to define a custom `RoundTripper` that changes URL from S3 to AIStore, e.g.:
+Once we have our cluster configured to execute presigned requests we can then start creating them and sending to AIStore.
+
+```console
+$ aws s3 presign s3://bucket/test.txt
+
+https://bucket.s3.us-west-2.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE123456789%2F20210621%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20210621T041609Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=EXAMBLE1234494d5fba3fed607f98018e1dfc62e2529ae96d844123456
+```
+
+> [!NOTE] 
+> In some cases signed request may be in form of `https://s3.us-west-2.amazonaws.com/bucket/test.txt?...` (`path` style) and not `https://bucket.s3.us-west-2.amazonaws.com/test.txt?...` (`virtual-hosted` style).
+> If your requests are signed this way, they might fail when sending to AIStore as it has no way of knowing which style was used to sign, and it always assumes the `virtual-hosted` style by default.
+> To fix this you need to provide `ais-s3-signed-request-style: path` header to instruct AIStore to use `path` style.
+
+### 3. Execute presigned S3 request
+
+Let's assumes that there's S3 bucket called `s3://bucket`, and we have read/write access to it.
+
+Further, `https://localhost:8080` address (below) simply indicates [Local Playground](/docs/getting_started.md#local-playground) and must be understood as a demonstration-only placeholder for an _arbitrary_ AIStore endpoint (`AIS_ENDPOINT`).
+
+```console
+$ curl -L -X PUT -d 'testing 1 2 3' "https://localhost:8080/s3/bucket/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE123456789%2F20210621%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20210621T041609Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=EXAMBLE1234494d5fba3fed607f98018e1dfc62e2529ae96d844123456"
+```
+
+(as it was pointed in previous step, you might need to pass `-H "ais-s3-signed-request-style: path"` option in case your requests were signed with `path` style)
+
+At this point, AIStore will send the presigned (PUT) URL to S3 and, if successful, store the object in cluster.
+
+**NOTE:** when using HTTPS (as in: `AIS_USE_HTTPS`) and having AIS deployed with a self-signed TLS certificate you may get the following `curl` failure:
+
+```sh
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+More details here: https://curl.se/docs/sslcerts.html
+```
+
+In this case, simply ask it to skip checking, e.g.: `echo insecure >> ~/.curlrc`
+
+### 4. Finally, check the status
+
+Finally (and optionally), let's check the status of the new object - `s3://bucket/test.txt`, in this case:
+
+```console
+$ ais bucket ls s3://bucket
+NAME          SIZE   CACHED  STATUS
+test.txt      13B    yes     ok
+```
+
+### Using Go client to execute presigned S3 requests
+
+In the previous section, we used `curl` client. Of course, it is also possible to achieve the same using many other HTTP clients - for instance, Go.
+
+In Go, you will need to define a custom `RoundTripper` that changes URL from S3 to AIStore, e.g.:
 
 ```go
 type customTransport struct {
@@ -201,17 +244,19 @@ Specifically - since in this document we are talking about s3-compatible API - h
 
 > In re `/s3 endpoint` mentioned above, the corresponding request URL in the browser's address bar would look something like `ais-gateway-host:port/s3`.
 
-## `s3cmd` command line
+## `s3cmd` Command Line
 
-The following table enumerates some of the `s3cmd` options that may appear to be useful:
+For a detailed `s3cmd` setup guide, please refer to this [documentation](/docs/s3cmd.md).
 
-| Options | Usage | Example |
+Below is a table outlining some key `s3cmd` options that can be particularly useful when working with AIStore:
+
+| Option | Description | Example |
 | --- | --- | --- |
-| `--host` | Define an AIS cluster endpoint | `--host=10.10.0.1:51080/s3` |
-| `--host-bucket` | Define URL path to access a bucket of an AIS cluster | `--host-bucket="10.10.0.1:51080/s3/%(bucket)"` |
+| `--host` | Set the AIS cluster endpoint | `--host=10.10.0.1:51080/s3` |
+| `--host-bucket` | Define the URL path for accessing a bucket in the AIS cluster | `--host-bucket="10.10.0.1:51080/s3/"` |
 | `--no-ssl` | Use HTTP instead of HTTPS | |
-| `--no-check-certificate` | Disable checking server's certificate in case of self-signed ones | |
-| `--region` | Define a bucket region | `--region=us-west-1` |
+| `--no-check-certificate` | Disable certificate verification (useful for self-signed certificates) | |
+| `--region` | Specify the region for a bucket | `--region=us-west-1` |
 
 ## ETag and MD5
 
@@ -424,7 +469,7 @@ atime            30 Aug 54 17:47 LMT
 cached           yes
 checksum         md5[a38030ea13e1b59c...]
 copies           1 [/tmp/ais/mp3/11]
-custom           map[ETag:"e3be082db698af7c15b0502f6a88265d-16" source:aws version:3QEKSH7LowuRB2OnUHjWCFsp58aZpsC2]
+custom           [source:aws ETag:"e3be082db698af7c15b0502f6a88265d-16" version:3QEKSH7LowuRB2OnUHjWCFsp58aZpsC2]
 ec               -
 location         t[MKpt8091]:mp[/tmp/ais/mp3/11, nvme0n1]
 name             s3://abc/aisnode
@@ -532,32 +577,15 @@ and a few more. The following table summarizes S3 APIs and provides the correspo
 * CORS
 * Website endpoints
 * CloudFront CDN
-
+* S3 ACLs (table above)
 
 ## Boto3 Compatibility
 
 Arguably, extremely few HTTP client-side libraries do _not_ follow [HTTP redirects](https://www.rfc-editor.org/rfc/rfc7231#page-54), and Amazon's [botocore](https://github.com/boto/botocore), used by [Boto3](https://github.com/boto/boto3), just happens to be one of those (libraries).
 
-AIStore provides a shim that you can use to alter `botocore` and `boto3`'s behavior to work as expected with AIStore.
+AIStore provides a patch to modify `botocore` and `boto3` behavior, making them compatible with AIStore’s redirect-based load balancing.
 
-To use `boto3` or `botocore` as client libraries for AIStore:
-
- - Install the [aistore python package](/docs/s3cmd.md) with the `botocore` extra.
-
-```shell
-$ pip install aistore[botocore]
-```
-
- - Import `aistore.botocore_patch.botocore` in your source code alongside `botocore` and / or `boto3`.
-
-```python
-import boto3
-from aistore.botocore_patch import botocore
-```
-
-For more context, see perhaps the following `aws-cli` ticket and discussion at:
-
-* [Support S3 HTTP redirects to non-Amazon URI's](https://github.com/aws/aws-cli/issues/6559)
+To use `boto3` or `botocore` with AIStore, refer [here](/python/aistore/botocore_patch/README.md) for detailed instructions.
 
 ## Amazon CLI tools
 

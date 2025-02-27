@@ -1,6 +1,6 @@
 // Package teb contains templates and (templated) tables to format CLI output.
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package teb
 
@@ -63,7 +63,7 @@ func NewMpathCapTab(st StstMap, c *PerfTabCtx, showMpaths bool) *Table {
 	}
 	table := newTable(cols...)
 
-	tids := st.sortedSIDs()
+	tids := st.sortSIDs()
 	for _, tid := range tids {
 		ds := st[tid]
 		if c.Sid != "" && c.Sid != tid {
@@ -85,10 +85,10 @@ func NewMpathCapTab(st StstMap, c *PerfTabCtx, showMpaths bool) *Table {
 
 		if showMpaths {
 			var (
-				i, num = 0, len(ds.TargetCDF.Mountpaths)
+				i, num = 0, len(ds.Tcdf.Mountpaths)
 				mpaths = make([]string, 0, num)
 			)
-			for mp := range ds.TargetCDF.Mountpaths {
+			for mp := range ds.Tcdf.Mountpaths {
 				mpaths = append(mpaths, mp)
 			}
 			sort.Strings(mpaths)
@@ -100,11 +100,11 @@ func NewMpathCapTab(st StstMap, c *PerfTabCtx, showMpaths bool) *Table {
 				} else {
 					row = append(row, "")
 				}
-				cdf := ds.TargetCDF.Mountpaths[mp]
+				cdf := ds.Tcdf.Mountpaths[mp]
 				row = mpathRow(c, cols, mp, cdf, row)
 				if _idx(cols, colCapStatus) >= 0 {
 					if i == 0 {
-						row = append(row, _capStatus(ds.TargetCDF))
+						row = append(row, _capStatus(ds.Tcdf))
 					} else {
 						row = append(row, "")
 					}
@@ -136,11 +136,12 @@ func mpathRow(c *PerfTabCtx, cols []*header, mpath string, cdf *fs.CDF, row []st
 		row = append(row, FmtSize(int64(cdf.Avail), c.Units, 2))
 	}
 	if _idx(cols, colDisk) >= 0 {
-		if len(cdf.Disks) > 1 {
+		switch {
+		case len(cdf.Disks) > 1:
 			row = append(row, fmt.Sprintf("%v", cdf.Disks))
-		} else if len(cdf.Disks) == 1 {
+		case len(cdf.Disks) == 1:
 			row = append(row, cdf.Disks[0])
-		} else {
+		default:
 			row = append(row, unknownVal)
 		}
 	}
@@ -151,7 +152,7 @@ func mpathRow(c *PerfTabCtx, cols []*header, mpath string, cdf *fs.CDF, row []st
 }
 
 func numMpathsRow(ds *stats.NodeStatus, c *PerfTabCtx, cols []*header, row []string) []string {
-	tcdf := ds.TargetCDF
+	tcdf := ds.Tcdf
 	if _idx(cols, colNumMpaths) >= 0 {
 		debug.Assert(_idx(cols, colMountpath) < 0)
 		row = append(row, strconv.Itoa(len(tcdf.Mountpaths)))
@@ -173,7 +174,7 @@ func numMpathsRow(ds *stats.NodeStatus, c *PerfTabCtx, cols []*header, row []str
 	return row
 }
 
-func _capStatus(tcdf fs.TargetCDF) (s string) {
+func _capStatus(tcdf fs.Tcdf) (s string) {
 	if tcdf.CsErr == "" {
 		if len(tcdf.Mountpaths) == 1 {
 			s = "good"
@@ -200,7 +201,7 @@ func _fmtMpathDisks(cdfs map[string]*fs.CDF, idx int) (s string) {
 
 func _inclStatus(st StstMap) bool {
 	for _, ds := range st {
-		if ds.Status != NodeOnline || ds.TargetCDF.CsErr != "" {
+		if ds.Status != NodeOnline || ds.Tcdf.CsErr != "" {
 			return true
 		}
 	}
@@ -208,7 +209,7 @@ func _inclStatus(st StstMap) bool {
 }
 
 // compare with "total num disks" (daeclu.go)
-func _sumupMpathsAvail(cdf fs.TargetCDF, deploymentType string) (avail uint64) {
+func _sumupMpathsAvail(cdf fs.Tcdf, deploymentType string) (avail uint64) {
 	for _, c := range cdf.Mountpaths {
 		avail += c.Capacity.Avail
 		if deploymentType == apc.DeploymentDev {

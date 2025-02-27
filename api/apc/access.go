@@ -1,6 +1,6 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
@@ -80,9 +80,6 @@ const (
 	AllowReadWriteAccess = "rw"
 
 	AccessNone = AccessAttrs(0)
-
-	// permission to perform cluster-level ops
-	AccessCluster = AceListBuckets | AceCreateBucket | AceDestroyBucket | AceMoveBucket | AceAdmin
 )
 
 // verbs

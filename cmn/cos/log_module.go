@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects.
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -19,7 +19,7 @@ const (
 	SmoduleTransport = 1 << iota
 	SmoduleAIS
 	SmoduleMemsys
-	SmoduleCluster
+	SmoduleCore
 	SmoduleFS
 	SmoduleReb
 	SmoduleEC
@@ -33,6 +33,7 @@ const (
 	SmoduleDload
 	SmoduleETL
 	SmoduleS3
+	SmoduleKalive
 
 	// NOTE: the last
 	_smoduleLast
@@ -41,10 +42,11 @@ const (
 const maxLevel = 5
 
 // NOTE: keep in-sync with the above
-var Smodules = []string{
+var Smodules = [...]string{
 	"transport", "ais", "memsys", "cluster", "fs", "reb", "ec", "stats",
 	"ios", "xs", "backend", "space", "mirror", "dsort", "downloader", "etl",
 	"s3",
+	"kalive",
 }
 
 type LogLevel string

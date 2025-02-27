@@ -65,7 +65,7 @@ NAME:
    ais - AIS CLI: command-line management utility for AIStore
 
 USAGE:
-   ais [global options] command [command options] [arguments...]
+   ais [global options] command [arguments...] [command options]
 
 VERSION:
    1.1.950525a50
@@ -90,7 +90,7 @@ COMMANDS:
    storage         monitor and manage clustered storage
    archive         Create multi-object archive, append files to an existing archive
    log             show log
-   performance     show performance counters, throughput, latency, and more (press <TAB-TAB> to select specific view)
+   performance     show performance counters, throughput, latency and more (press <TAB-TAB> to select specific view)
    remote-cluster  show attached AIS clusters
    alias           manage top-level aliases
    put             (alias for "object put") PUT or APPEND one file or one directory, or multiple files and/or directories.

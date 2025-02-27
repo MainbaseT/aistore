@@ -1,13 +1,12 @@
 // Package authn is authentication server for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package main
 
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -29,20 +28,17 @@ const (
 func (m *mgr) validateSecret(clu *authn.CluACL) (err error) {
 	const tag = "validate-secret"
 	var (
-		secret = Conf.Secret()
-		cksum  = cos.NewCksumHash(cos.ChecksumSHA256)
+		secret   = Conf.Secret()
+		cksumVal = cos.ChecksumB2S(cos.UnsafeB(secret), cos.ChecksumSHA256)
+		body     = cos.MustMarshal(&authn.ServerConf{Secret: cksumVal})
 	)
-	cksum.H.Write([]byte(secret))
-	cksum.Finalize()
-
-	body := cos.MustMarshal(&authn.ServerConf{Secret: cksum.Val()})
 	for _, u := range clu.URLs {
 		if err = m.call(http.MethodPost, u, apc.Tokens, body, tag); err == nil {
 			return
 		}
 		err = fmt.Errorf("failed to %s with %s: %v", tag, clu, err)
 	}
-	return
+	return err
 }
 
 // update list of revoked token on all clusters
@@ -55,9 +51,9 @@ func (m *mgr) broadcastRevoked(token string) {
 // broadcast the request to all clusters. If a cluster has a few URLS,
 // it sends to the first working one. Clusters are processed in parallel.
 func (m *mgr) broadcast(method, path string, body []byte, tag string) {
-	clus, err := m.clus()
+	clus, code, err := m.clus()
 	if err != nil {
-		nlog.Errorf("Failed to read cluster list: %v", err)
+		nlog.Errorf("Failed to read cluster list: %v (%d)", err, code)
 		return
 	}
 	wg := &sync.WaitGroup{}
@@ -82,9 +78,9 @@ func (m *mgr) broadcast(method, path string, body []byte, tag string) {
 // Send valid and non-expired revoked token list to a cluster.
 func (m *mgr) syncTokenList(clu *authn.CluACL) {
 	const tag = "sync-tokens"
-	tokenList, err := m.generateRevokedTokenList()
+	tokenList, code, err := m.generateRevokedTokenList()
 	if err != nil {
-		nlog.Errorf("failed to sync token list with %q(%q): %v", clu.ID, clu.Alias, err)
+		nlog.Errorf("failed to sync token list with %q(%q): %v (%d)", clu.ID, clu.Alias, err, code)
 		return
 	}
 	if len(tokenList) == 0 {
@@ -123,10 +119,12 @@ func (m *mgr) call(method, proxyURL, path string, injson []byte, tag string) err
 		}
 		req.Header.Set(cos.HdrContentType, cos.ContentJSON)
 		resp, err := client.Do(req)
-		if resp != nil {
-			if resp.Body != nil {
-				msg, _ = io.ReadAll(resp.Body)
-				resp.Body.Close()
+		if resp != nil && resp.Body != nil {
+			var e error
+			msg, e = cos.ReadAllN(resp.Body, resp.ContentLength)
+			resp.Body.Close()
+			if err == nil {
+				err = e
 			}
 		}
 		if err == nil {

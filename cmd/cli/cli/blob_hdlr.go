@@ -55,8 +55,8 @@ func blobDownloadHandler(c *cli.Context) error {
 			return err
 		}
 	}
-	if flagIsSet(c, numWorkersFlag) {
-		msg.NumWorkers = parseIntFlag(c, numWorkersFlag)
+	if flagIsSet(c, numBlobWorkersFlag) {
+		msg.NumWorkers = parseIntFlag(c, numBlobWorkersFlag)
 	}
 	msg.LatestVer = flagIsSet(c, latestVerFlag)
 
@@ -145,7 +145,7 @@ func blobStartAll(c *cli.Context, bck cmn.Bck, objNames []string, msg *apc.BlobM
 		xid, err = api.BlobDownload(apiBP, bck, objName, msg)
 		if err != nil {
 			for _, xid = range xids {
-				errN := api.AbortXaction(apiBP, &xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl})
+				errN := xstop(&xact.ArgsMsg{ID: xid, Kind: apc.ActBlobDl})
 				if errN != nil {
 					actionWarn(c, errN.Error())
 				}

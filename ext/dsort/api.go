@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -64,9 +64,9 @@ type RequestSpec struct {
 	// Default: alphanumeric, increasing
 	Algorithm Algorithm `json:"algorithm" yaml:"algorithm"`
 	// Default: ""
-	OrderFileURL string `json:"order_file" yaml:"order_file"`
+	EKMFileURL string `json:"ekm_file" yaml:"ekm_file"`
 	// Default: "\t"
-	OrderFileSep string `json:"order_file_sep" yaml:"order_file_sep"`
+	EKMFileSep string `json:"ekm_file_sep" yaml:"ekm_file_sep"`
 	// Default: "80%"
 	MaxMemUsage string `json:"max_mem_usage" yaml:"max_mem_usage"`
 	// Default: calcMaxLimit()

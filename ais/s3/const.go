@@ -1,10 +1,13 @@
 // Package s3 provides Amazon S3 compatibility layer
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package s3
 
-import "fmt"
+import (
+	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
+)
 
 const (
 	// AWS URL params
@@ -32,12 +35,12 @@ const (
 	QparamSignature   = "Signature"
 	QparamXID         = "x-id"
 
-	HeaderAlgorithm     = "X-Amz-Algorithm"
-	HeaderCredentials   = "X-Amz-Credential" //nolint:gosec // This is just a header name definition...
-	HeaderDate          = "X-Amz-Date"
-	HeaderExpires       = "X-Amz-Expires"
-	HeaderSignedHeaders = "X-Amz-SignedHeaders"
-	HeaderSignature     = "X-Amz-Signature"
+	HeaderPrefix = "X-Amz-"
+
+	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html#UserMetadata
+	HeaderMetaPrefix = cmn.AwsHeaderMetaPrefix
+
+	HeaderCredentials = "X-Amz-Credential" //nolint:gosec // This is just a header name definition...
 
 	versioningEnabled  = "Enabled"
 	versioningDisabled = "Suspended"
@@ -46,13 +49,10 @@ const (
 	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
 	MaxPartsPerUpload = 10000
 
+	DefaultPartSize = 128 * cos.MiB
+
 	s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01"
-	s3URL       = "https://%s.s3.%s.amazonaws.com/%s?%s"
 
 	AISRegion = "ais"
 	AISServer = "AIStore"
 )
-
-func makeS3URL(region, bucketName, objectName, query string) string {
-	return fmt.Sprintf(s3URL, bucketName, region, objectName, query)
-}

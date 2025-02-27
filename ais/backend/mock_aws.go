@@ -15,10 +15,11 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/stats"
 )
 
-func NewAWS(_ core.TargetPut) (core.Backend, error) {
-	return nil, newErrInitBackend(apc.AWS)
+func NewAWS(core.TargetPut, stats.Tracker, bool) (core.Backend, error) {
+	return nil, &cmn.ErrInitBackend{Provider: apc.AWS}
 }
 
 func StartMpt(*core.LOM, *http.Request, url.Values) (string, int, error) {
@@ -29,8 +30,8 @@ func PutMptPart(*core.LOM, io.ReadCloser, *http.Request, url.Values, string, int
 	return "", http.StatusBadRequest, cmn.NewErrUnsupp("put-mpt-part", mock)
 }
 
-func CompleteMpt(*core.LOM, *http.Request, url.Values, string, *s3types.CompleteMptUpload) (string, int, error) {
-	return "", http.StatusBadRequest, cmn.NewErrUnsupp("complete-part", mock)
+func CompleteMpt(*core.LOM, *http.Request, url.Values, string, []byte, *s3types.CompleteMptUpload) (string, string, int, error) {
+	return "", "", http.StatusBadRequest, cmn.NewErrUnsupp("complete-part", mock)
 }
 
 func AbortMpt(*core.LOM, *http.Request, url.Values, string) (int, error) {

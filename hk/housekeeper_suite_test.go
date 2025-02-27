@@ -14,8 +14,8 @@ import (
 )
 
 func TestHousekeeper(t *testing.T) {
-	hk.TestInit()
-	go hk.DefaultHK.Run()
+	hk.Init(false)
+	go hk.HK.Run()
 	hk.WaitStarted()
 	RegisterFailHandler(Fail)
 	RunSpecs(t, t.Name())

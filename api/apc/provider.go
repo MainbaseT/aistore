@@ -14,9 +14,10 @@ const (
 	AWS   = "aws"
 	Azure = "azure"
 	GCP   = "gcp"
-	HTTP  = "ht"
+	OCI   = "oci"
+	HT    = "ht"
 
-	AllProviders = "ais, aws (s3://), gcp (gs://), azure (az://), ht://" // NOTE: must include all
+	AllProviders = "ais, aws (s3://), gcp (gs://), azure (az://), oci (oc://), ht://" // NOTE: must include all
 
 	NsUUIDPrefix = '@' // BEWARE: used by on-disk layout
 	NsNamePrefix = '#' // BEWARE: used by on-disk layout
@@ -26,23 +27,26 @@ const (
 
 	// scheme://
 	DefaultScheme = "https"
+	OCIScheme     = "oc"
 	GSScheme      = "gs"
 	S3Scheme      = "s3"
 	AZScheme      = "az"
 	AISScheme     = "ais"
 )
 
-var Providers = cos.NewStrSet(AIS, GCP, AWS, Azure, HTTP)
+const RemAIS = "remais" // to differentiate ais vs "remote" ais; also, default (remote ais cluster) alias
+
+var Providers = cos.NewStrSet(AIS, GCP, AWS, Azure, OCI, HT)
 
 func IsProvider(p string) bool { return Providers.Contains(p) }
 
 func IsCloudProvider(p string) bool {
-	return p == AWS || p == GCP || p == Azure
+	return p == AWS || p == GCP || p == Azure || p == OCI
 }
 
-// not to confuse w/ bck.IsRemote()
+// NOTE: not to confuse w/ bck.IsRemote() which also includes remote AIS
 func IsRemoteProvider(p string) bool {
-	return IsCloudProvider(p) || p == HTTP
+	return IsCloudProvider(p) || p == HT
 }
 
 func ToScheme(p string) string {
@@ -53,6 +57,8 @@ func ToScheme(p string) string {
 		return AZScheme
 	case GCP:
 		return GSScheme
+	case OCI:
+		return OCIScheme
 	default:
 		return p
 	}
@@ -67,6 +73,8 @@ func NormalizeProvider(p string) string {
 		return AIS // NOTE: ais is the default provider
 	case S3Scheme:
 		return AWS
+	case OCIScheme:
+		return OCI
 	case AZScheme:
 		return Azure
 	case GSScheme:
@@ -86,7 +94,9 @@ func DisplayProvider(p string) string {
 		return "Azure"
 	case GCP, GSScheme:
 		return "GCP"
-	case HTTP:
+	case OCI, OCIScheme:
+		return "OCI"
+	case HT:
 		return "HTTP(S)"
 	default:
 		return p

@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -63,7 +63,7 @@ def transform(input_bytes):
 	msg := etl.InitCodeMsg{
 		InitMsgBase: etl.InitMsgBase{IDX: "etl-build-conn-err", Timeout: etlBucketTimeout},
 		Code:        []byte(timeoutFunc),
-		Runtime:     runtime.Py38,
+		Runtime:     runtime.Py39,
 		ChunkSize:   0,
 	}
 	msg.Funcs.Transform = "transform"
@@ -177,11 +177,11 @@ def transform(input_bytes):
 			{name: "spec-echo-golang", ty: etl.Spec, etlSpecName: tetl.EchoGolang},
 
 			{
-				name: "code-echo-py38",
+				name: "code-echo-py313",
 				ty:   etl.Code,
 				etlCodeMsg: etl.InitCodeMsg{
 					Code:      []byte(echoPythonTransform),
-					Runtime:   runtime.Py38,
+					Runtime:   runtime.Py313,
 					ChunkSize: 0,
 				},
 			},
@@ -255,11 +255,11 @@ def transform(input_bytes):
 			tassert.CheckFatal(t, err)
 			tlog.Logf("Transforming bucket %s took %v\n", bckFrom.Cname(""), total)
 
-			objList, err := api.ListObjects(baseParams, bckTo, nil, api.ListArgs{})
+			lst, err := api.ListObjects(baseParams, bckTo, nil, api.ListArgs{})
 			tassert.CheckFatal(t, err)
 			tassert.Fatalf(
-				t, len(objList.Entries) == m.num,
-				"expected %d objects to be transformed, got %d", m.num, len(objList.Entries),
+				t, len(lst.Entries) == m.num,
+				"expected %d objects to be transformed, got %d", m.num, len(lst.Entries),
 			)
 		})
 	}

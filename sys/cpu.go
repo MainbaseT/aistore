@@ -1,17 +1,23 @@
 // Package sys provides methods to read system information
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package sys
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 
 	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
-const maxProcsEnvVar = "GOMAXPROCS"
+// used with MaxLoad()
+// floating point; HighLoad < HighLoadWM() < ExtremeLoad
+const (
+	ExtremeLoad = 92
+	HighLoad    = 82
+)
 
 type LoadAvg struct {
 	One, Five, Fifteen float64
@@ -28,7 +34,7 @@ func init() {
 		if c, err := containerNumCPU(); err == nil {
 			contCPUs = c
 		} else {
-			nlog.Errorln(err)
+			fmt.Fprintln(os.Stderr, err) // (cannot nlog yet)
 		}
 	}
 }
@@ -36,16 +42,39 @@ func init() {
 func Containerized() bool { return containerized }
 func NumCPU() int         { return contCPUs }
 
-// SetMaxProcs sets GOMAXPROCS = NumCPU unless already overridden via Go environment
-func SetMaxProcs() {
-	if val, exists := os.LookupEnv(maxProcsEnvVar); exists {
-		nlog.Warningf("GOMAXPROCS is set via Go environment %q: %q", maxProcsEnvVar, val)
+// number of intra-cluster broadcasting goroutines
+func MaxParallelism() int { return max(NumCPU(), 4) }
+
+func GoEnvMaxprocs() {
+	if val, exists := os.LookupEnv("GOMEMLIMIT"); exists {
+		nlog.Warningln("Go environment: GOMEMLIMIT =", val) // soft memory limit for the runtime (IEC units or raw bytes)
+	}
+	if val, exists := os.LookupEnv("GOMAXPROCS"); exists {
+		nlog.Warningln("Go environment: GOMAXPROCS =", val)
 		return
 	}
+
 	maxprocs := runtime.GOMAXPROCS(0)
 	ncpu := NumCPU()
 	if maxprocs > ncpu {
-		nlog.Warningf("Reducing GOMAXPROCS (%d) to %d (num CPUs)", maxprocs, ncpu)
+		nlog.Warningf("Reducing GOMAXPROCS (prev = %d) to %d", maxprocs, ncpu)
 		runtime.GOMAXPROCS(ncpu)
 	}
+}
+
+// "high-load watermark", to maybe throttle when MaxLoad() is above
+// see also (ExtremeLoad, HighLoad) defaults
+func HighLoadWM() int {
+	ncpu := NumCPU()
+	return max(ncpu-ncpu>>3, 1)
+}
+
+// return max(1 minute, 5 minute) load average
+func MaxLoad() (load float64) {
+	avg, err := LoadAverage()
+	if err != nil {
+		nlog.ErrorDepth(1, err) // unlikely
+		return 100
+	}
+	return max(avg.One, avg.Five)
 }

@@ -54,7 +54,11 @@ const (
 type (
 	global struct {
 		tstats stats.Tracker
-		mm     *memsys.MMSA
+		mem    *memsys.MMSA
+
+		// internal
+		mg   *managerGroup
+		once sync.Once // reg housekeep upon the first usage
 	}
 	buildingShardInfo struct {
 		shardName string
@@ -80,7 +84,7 @@ type (
 		Metrics     *Metrics       `json:"metrics"`
 		Pars        *parsedReqSpec `json:"pars"`
 
-		mg                 *ManagerGroup // parent
+		mg                 *managerGroup // parent
 		mu                 sync.Mutex
 		smap               *meta.Smap
 		recm               *shard.RecordManager
@@ -134,14 +138,14 @@ func Pinit(si core.Node, config *cmn.Config) {
 }
 
 func Tinit(tstats stats.Tracker, db kvdb.Driver, config *cmn.Config) {
-	Managers = NewManagerGroup(db, false)
+	g.mg = newManagerGroup(db)
 
 	xreg.RegBckXact(&factory{})
 
-	debug.Assert(g.mm == nil) // only once
+	debug.Assert(g.mem == nil) // only once
 	{
 		g.tstats = tstats
-		g.mm = core.T.PageMM()
+		g.mem = core.T.PageMM()
 	}
 	fs.CSM.Reg(ct.DsortFileType, &ct.DsortFile{})
 	fs.CSM.Reg(ct.DsortWorkfileType, &ct.DsortFile{})
@@ -259,7 +263,7 @@ func (m *Manager) initStreams() error {
 		Extra: &transport.Extra{
 			Compression: config.Dsort.Compression,
 			Config:      config,
-			WorkChBurst: 1024,
+			ChanBurst:   1024,
 		},
 	}
 	if err := transport.Handle(trname, m.recvShard); err != nil {
@@ -364,7 +368,7 @@ func (m *Manager) finalCleanup() {
 	// that this can be freed once we cleanup streams - streams are asynchronous
 	// and we may have race between in-flight request and cleanup.
 	// Also, NOTE:
-	// recm.Cleanup => gmm.freeMemToOS => cos.FreeMemToOS to forcefully free memory to the OS
+	// recm.Cleanup => gmm.freeMemToOS => oom.FreeToOS to forcefully free memory to the OS
 	m.recm.Cleanup()
 
 	m.creationPhase.metadata.SendOrder = nil
@@ -618,6 +622,9 @@ func (m *Manager) recvShard(hdr *transport.ObjHdr, objReader io.Reader, err erro
 	}
 	if err == nil {
 		if lom.EqCksum(hdr.ObjAttrs.Cksum) {
+			//
+			// compare with: coi.isNOP, "PUT is a no-op", and reb/recv.go no-op
+			//
 			if cmn.Rom.FastV(4, cos.SmoduleDsort) {
 				nlog.Infof("[dsort] %s shard (%s) already exists and checksums are equal, skipping",
 					m.ManagerUUID, lom)

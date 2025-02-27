@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -267,8 +267,8 @@ func TestNamespace(t *testing.T) {
 					)
 				}
 			}
-			tassert.Errorf(t, bck1Found, "%s not found in %v summ", m1.bck, summaries)
-			tassert.Errorf(t, bck2Found, "%s not found in %v summ", m2.bck, summaries)
+			tassert.Errorf(t, bck1Found, "%s not found in %v summ", m1.bck.String(), summaries)
+			tassert.Errorf(t, bck2Found, "%s not found in %v summ", m2.bck.String(), summaries)
 			m1.gets(nil, false)
 			m2.gets(nil, false)
 

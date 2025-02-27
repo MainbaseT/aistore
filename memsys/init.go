@@ -32,16 +32,13 @@ func Init(gmmName, smmName string, config *cmn.Config) {
 	debug.Assert(gmm == nil && smm == nil)
 
 	// page mmsa config (see also "AIS_MINMEM_FREE" and related environment)
-	defBufSize := int64(DefaultBufSize)
-	if config.Memsys.DefaultBufSize != 0 {
-		defBufSize = int64(config.Memsys.DefaultBufSize)
-	}
+	defBufSize := cos.NonZero(int64(config.Memsys.DefaultBufSize), int64(DefaultBufSize))
 	gmm = &MMSA{Name: gmmName + ".gmm", defBufSize: defBufSize, slabIncStep: PageSlabIncStep}
 	gmm.MinFree = uint64(config.Memsys.MinFree)
 	gmm.MinPctTotal = config.Memsys.MinPctTotal
 	gmm.MinPctFree = config.Memsys.MinPctFree
 
-	// hk config
+	// hk tunables
 	if config.Memsys.SizeToGC != 0 {
 		sizeToGC = int64(config.Memsys.SizeToGC)
 	}
@@ -70,7 +67,7 @@ func NewMMSA(name string, silent bool) (mem *MMSA, err error) {
 	}
 	err = mem.Init(0)
 	if !silent {
-		cos.Infof("%s", mem.Str(&mem.mem))
+		cos.Infoln(mem.Str(&mem.mem))
 	}
 	return
 }
@@ -199,27 +196,24 @@ func (r *MMSA) Init(maxUse int64) (err error) {
 	if !r.isPage() {
 		r.maxSlabSize, r.numSlabs = MaxSmallSlabSize, NumSmallSlabs
 	}
-	r.slabStats = &slabStats{}
-	r.statsSnapshot = &Stats{}
 	r.rings = make([]*Slab, r.numSlabs)
-	r.sorted = make([]*Slab, r.numSlabs)
 	for i := range r.numSlabs {
 		bufSize := r.slabIncStep * int64(i+1)
 		slab := &Slab{
 			m:       r,
 			tag:     r.Name + "." + cos.ToSizeIEC(bufSize, 0),
 			bufSize: bufSize,
+			idx:     i,
 			get:     make([][]byte, 0, optDepth),
 			put:     make([][]byte, 0, optDepth),
 		}
 		slab.pMinDepth = &r.optDepth
 		r.rings[i] = slab
-		r.sorted[i] = slab
 	}
 	return
 }
 
-// terminate this MMSA instance and, possibly, GC as well
+// [tests only] terminate this MMSA instance, run GC
 func (r *MMSA) Terminate(unregHK bool) {
 	var freed int64
 	if unregHK {
@@ -229,6 +223,6 @@ func (r *MMSA) Terminate(unregHK bool) {
 		freed += s.cleanup()
 	}
 	r.toGC.Add(freed)
-	r.freeMemToOS(sizeToGC, true /*force*/)
+	r.freeMemToOS(sizeToGC, PressureLow, true /*force*/)
 	debug.Infof("%s terminated", r)
 }

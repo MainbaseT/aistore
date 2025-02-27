@@ -1,13 +1,14 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -56,12 +57,13 @@ type (
 		BID         uint64          `json:"bid,string" list:"omit"`         // unique ID
 		Created     int64           `json:"created,string" list:"readonly"` // creation timestamp
 		Versioning  VersionConf     `json:"versioning"`                     // versioning (see "inherit")
+		RateLimit   RateLimitConf   `json:"rate_limit"`                     // adaptive rate limiting (front, back) if enabled
 	}
 
 	ExtraProps struct {
-		AWS  ExtraPropsAWS  `json:"aws,omitempty" list:"omitempty"`
 		HTTP ExtraPropsHTTP `json:"http,omitempty" list:"omitempty"`
 		HDFS ExtraPropsHDFS `json:"hdfs,omitempty" list:"omitempty"` // NOTE: obsolete; rm with meta-version
+		AWS  ExtraPropsAWS  `json:"aws,omitempty" list:"omitempty"`
 	}
 	ExtraToSet struct { // ref. bpropsFilterExtra
 		AWS  *ExtraPropsAWSToSet  `json:"aws"`
@@ -88,12 +90,19 @@ type (
 		// vs OpenStack Swift: 10,000
 		// - https://docs.openstack.org/swift/latest/api/pagination.html
 		MaxPageSize int64 `json:"max_pagesize,omitempty"`
+
+		// Multipart upload size threshold must be greater or equal 5MB
+		// - https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/feature/s3/manager
+		// - for the AIS default, see `DefaultPartSize` in ais/s3/const
+		// - NOTE: the threshold is, effectively, one of the **performance tunables**
+		MultiPartSize cos.SizeIEC `json:"multipart_size,omitempty"`
 	}
 	ExtraPropsAWSToSet struct {
-		CloudRegion *string `json:"cloud_region"`
-		Endpoint    *string `json:"endpoint"`
-		Profile     *string `json:"profile"`
-		MaxPageSize *int64  `json:"max_pagesize"`
+		CloudRegion   *string      `json:"cloud_region,omitempty"`
+		Endpoint      *string      `json:"endpoint,omitempty"`
+		Profile       *string      `json:"profile,omitempty"`
+		MaxPageSize   *int64       `json:"max_pagesize,omitempty"`
+		MultiPartSize *cos.SizeIEC `json:"multipart_size,omitempty"`
 	}
 
 	ExtraPropsHTTP struct {
@@ -123,6 +132,7 @@ type (
 		Mirror      *MirrorConfToSet      `json:"mirror,omitempty"`
 		EC          *ECConfToSet          `json:"ec,omitempty"`
 		Access      *apc.AccessAttrs      `json:"access,string,omitempty"`
+		RateLimit   *RateLimitConfToSet   `json:"rate_limit,omitempty"`
 		Features    *feat.Flags           `json:"features,string,omitempty"`
 		WritePolicy *WritePolicyConfToSet `json:"write_policy,omitempty"`
 		Extra       *ExtraToSet           `json:"extra,omitempty"`
@@ -135,9 +145,9 @@ type (
 	}
 )
 
-/////////////////
-// Bprops //
-/////////////////
+//
+// bucket props (Bprops)
+//
 
 // By default, created buckets inherit their properties from the cluster (global) configuration.
 // Global configuration, in turn, is protected versioned, checksummed, and replicated across the entire cluster.
@@ -167,6 +177,8 @@ func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 	if wp.Data.IsImmediate() {
 		wp.Data = apc.WriteImmediate
 	}
+
+	// inherit cluster defaults (w/ override via api.CreateBucket and api.SetBucketProps)
 	return &Bprops{
 		Cksum:       cksum,
 		LRU:         lru,
@@ -175,6 +187,7 @@ func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 		Access:      apc.AccessAll,
 		EC:          c.EC,
 		WritePolicy: wp,
+		RateLimit:   c.RateLimit,
 		Features:    c.Features,
 	}
 }
@@ -202,33 +215,34 @@ func (bp *Bprops) Validate(targetCnt int) error {
 	debug.Assert(apc.IsProvider(bp.Provider))
 	if !bp.BackendBck.IsEmpty() {
 		if bp.Provider != apc.AIS {
-			return fmt.Errorf("wrong bucket provider %q: only AIS buckets can have remote backend (%q)",
-				bp.Provider, bp.BackendBck)
+			return fmt.Errorf("invalid provider %q: only ais:// buckets can have remote backend (%q)", bp.Provider, bp.BackendBck.String())
 		}
 		if bp.BackendBck.Provider == "" {
-			return fmt.Errorf("backend bucket %q: provider is empty", bp.BackendBck)
+			// (compare with `ErrEmptyProvider`)
+			return fmt.Errorf("backend bucket %q: provider is empty", bp.BackendBck.String())
 		}
 		if bp.BackendBck.Name == "" {
-			return fmt.Errorf("backend bucket %q name is empty", bp.BackendBck)
+			return fmt.Errorf("backend bucket %q: name is empty", bp.BackendBck.String())
 		}
 		if !bp.BackendBck.IsRemote() {
-			return fmt.Errorf("backend bucket %q must be remote", bp.BackendBck)
+			return fmt.Errorf("backend bucket %q must be remote", bp.BackendBck.String())
 		}
 	}
 
 	// run assorted props validators
 	var softErr error
-	for _, pv := range []PropsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy} {
+	for _, pv := range []PropsValidator{&bp.Cksum, &bp.Mirror, &bp.EC, &bp.Extra, &bp.WritePolicy, &bp.RateLimit} {
 		var err error
-		if pv == &bp.EC {
+		switch {
+		case pv == &bp.EC:
 			err = bp.EC.ValidateAsProps(targetCnt)
-		} else if pv == &bp.Extra {
+		case pv == &bp.Extra:
 			err = bp.Extra.ValidateAsProps(bp.Provider)
-		} else {
+		default:
 			err = pv.ValidateAsProps()
 		}
 		if err != nil {
-			if !IsErrSoft(err) {
+			if !IsErrWarning(err) {
 				return err
 			}
 			softErr = err
@@ -249,7 +263,7 @@ func (bp *Bprops) Validate(targetCnt int) error {
 }
 
 func (bp *Bprops) Apply(propsToSet *BpropsToSet) {
-	err := copyProps(propsToSet, bp, apc.Daemon)
+	err := CopyProps(propsToSet, bp, apc.Daemon)
 	debug.AssertNoErr(err)
 }
 
@@ -279,8 +293,11 @@ func NewBpropsToSet(nvs cos.StrKVs) (props *BpropsToSet, err error) {
 func (c *ExtraProps) ValidateAsProps(arg ...any) error {
 	provider, ok := arg[0].(string)
 	debug.Assert(ok)
-	if provider == apc.HTTP && c.HTTP.OrigURLBck == "" {
+	if provider == apc.HT && c.HTTP.OrigURLBck == "" {
 		return errors.New("original bucket URL must be set for a bucket with HTTP provider")
+	}
+	if provider == apc.AWS && c.AWS.MultiPartSize != 0 && (c.AWS.MultiPartSize < 5*cos.MB || c.AWS.MultiPartSize > cos.TB) {
+		return fmt.Errorf("invalid aws.multipart_size %d (expecting range 5MB to 1TB)", c.AWS.MultiPartSize)
 	}
 	return nil
 }
@@ -317,12 +334,8 @@ func (s AllBsummResults) Aggregate(from *BsummResult) AllBsummResults {
 
 // across targets
 func aggr(from, to *BsummResult) {
-	if from.ObjSize.Min < to.ObjSize.Min {
-		to.ObjSize.Min = from.ObjSize.Min
-	}
-	if from.ObjSize.Max > to.ObjSize.Max {
-		to.ObjSize.Max = from.ObjSize.Max
-	}
+	to.ObjSize.Min = min(from.ObjSize.Min, to.ObjSize.Min)
+	to.ObjSize.Max = max(from.ObjSize.Max, to.ObjSize.Max)
 	to.ObjCount.Present += from.ObjCount.Present
 	to.ObjCount.Remote += from.ObjCount.Remote
 	to.TotalSize.OnDisk += from.TotalSize.OnDisk
@@ -334,6 +347,7 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 	var totalDisksSize uint64
 	for _, tsiz := range dsize {
 		totalDisksSize += tsiz
+		// TODO -- FIXME: (local-playground + losetup, etc.)
 		if testingEnv {
 			break
 		}
@@ -342,7 +356,12 @@ func (s AllBsummResults) Finalize(dsize map[string]uint64, testingEnv bool) {
 		if summ.ObjCount.Present > 0 {
 			summ.ObjSize.Avg = int64(cos.DivRoundU64(summ.TotalSize.PresentObjs, summ.ObjCount.Present))
 		}
-		summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		if summ.ObjSize.Min == math.MaxInt64 {
+			summ.ObjSize.Min = 0
+		}
+		if totalDisksSize > 0 {
+			summ.UsedPct = cos.DivRoundU64(summ.TotalSize.OnDisk*100, totalDisksSize)
+		}
 	}
 }
 
@@ -363,9 +382,9 @@ type (
 	}
 
 	//  Multi-object copy & transform (see also: TCBMsg)
-	TCObjsMsg struct {
+	TCOMsg struct {
 		ToBck Bck `json:"tobck"`
-		apc.TCObjsMsg
+		apc.TCOMsg
 	}
 )
 

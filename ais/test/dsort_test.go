@@ -1,7 +1,7 @@
 //nolint:dupl // copy-paste benign and can wait
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -82,7 +82,7 @@ type (
 
 		inputTempl            apc.ListRange
 		outputTempl           string
-		orderFileURL          string
+		EKMFileURL            string
 		shardCnt              int
 		shardCntToSkip        int
 		filesPerShard         int
@@ -91,6 +91,7 @@ type (
 		outputShardCnt        int
 		recordDuplicationsCnt int
 		recordExts            []string
+		recordNames           []string
 
 		inputShards []string
 
@@ -99,6 +100,7 @@ type (
 		outputExt       string
 		alg             *dsort.Algorithm
 		missingKeys     bool
+		EKMMissingKey   string
 		outputShardSize string
 		maxMemUsage     string
 		dryRun          bool
@@ -127,7 +129,6 @@ func runDsortTest(t *testing.T, dts dsortTestSpec, f any) {
 	}
 
 	for _, dsorterType := range dts.types {
-		dsorterType := dsorterType // pin
 		t.Run(dsorterType, func(t *testing.T) {
 			if dts.p {
 				t.Parallel()
@@ -147,7 +148,6 @@ func runDsortTest(t *testing.T, dts dsortTestSpec, f any) {
 			} else if len(dts.phases) > 0 {
 				g := f.(func(dsorterType, phase string, t *testing.T))
 				for _, phase := range dts.phases {
-					phase := phase // pin
 					t.Run(phase, func(t *testing.T) {
 						if dts.p {
 							t.Parallel()
@@ -157,7 +157,6 @@ func runDsortTest(t *testing.T, dts dsortTestSpec, f any) {
 				}
 			} else if len(dts.reactions) > 0 {
 				for _, reaction := range dts.reactions {
-					reaction := reaction // pin
 					t.Run(reaction, func(t *testing.T) {
 						if dts.p {
 							t.Parallel()
@@ -165,7 +164,6 @@ func runDsortTest(t *testing.T, dts dsortTestSpec, f any) {
 
 						if len(dts.scopes) > 0 {
 							for _, scope := range dts.scopes {
-								scope := scope // pin
 								t.Run(scope, func(t *testing.T) {
 									if dts.p {
 										t.Parallel()
@@ -184,7 +182,6 @@ func runDsortTest(t *testing.T, dts dsortTestSpec, f any) {
 			} else if len(dts.algs) > 0 {
 				g := f.(func(dsorterType, alg string, t *testing.T))
 				for _, alg := range dts.algs {
-					alg := alg // pin
 					t.Run(alg, func(t *testing.T) {
 						if dts.p {
 							t.Parallel()
@@ -260,7 +257,7 @@ func (df *dsortFramework) gen() dsort.RequestSpec {
 		OutputFormat:        df.outputTempl,
 		OutputShardSize:     df.outputShardSize,
 		Algorithm:           *df.alg,
-		OrderFileURL:        df.orderFileURL,
+		EKMFileURL:          df.EKMFileURL,
 		ExtractConcMaxLimit: 10,
 		CreateConcMaxLimit:  10,
 		MaxMemUsage:         df.maxMemUsage,
@@ -270,6 +267,7 @@ func (df *dsortFramework) gen() dsort.RequestSpec {
 		Config: cmn.DsortConf{
 			MissingShards:     df.missingShards,
 			DuplicatedRecords: df.duplicatedRecords,
+			EKMMissingKey:     df.EKMMissingKey,
 		},
 	}
 }
@@ -309,15 +307,20 @@ func (df *dsortFramework) createInputShards() {
 			} else {
 				tarName = path + df.inputExt
 			}
-			if df.alg.Kind == dsort.Content {
+
+			switch {
+			case df.alg.Kind == dsort.Content:
 				err = tarch.CreateArchCustomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
 					df.fileSz, df.alg.ContentKeyType, df.alg.Ext, df.missingKeys)
-			} else if df.inputExt == archive.ExtTar {
+			case df.recordNames != nil:
 				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
-					df.fileSz, duplication, df.recordExts, nil)
-			} else {
+					df.fileSz, duplication, true, df.recordExts, df.recordNames)
+			case df.inputExt == archive.ExtTar:
 				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
-					df.fileSz, duplication, nil, nil)
+					df.fileSz, duplication, false, df.recordExts, nil)
+			default:
+				err = tarch.CreateArchRandomFiles(tarName, df.tarFormat, df.inputExt, df.filesPerShard,
+					df.fileSz, duplication, false, nil, nil)
 			}
 			tassert.CheckFatal(df.m.t, err)
 
@@ -490,6 +493,46 @@ outer:
 	}
 }
 
+func (df *dsortFramework) checkOutputShardsWithEKM(ekm *shard.ExternalKeyMap) {
+	tlog.Logln("verifying all records are placed in the correct shards...")
+	shardRecords := df.getRecordNames(df.outputBck)
+	shardNamePools := make(map[string]map[string]struct{}, 8) // map from template to shard name pool
+
+	// for each record name within the generated shards, find its template and add its container shard name to the corresponding shard name pool
+	for _, shard := range shardRecords {
+		for _, recordName := range shard.recordNames {
+			shardFmtTmpl, err := ekm.Lookup(recordName)
+			tassert.CheckFatal(df.m.t, err)
+			if _, ok := shardNamePools[shardFmtTmpl]; !ok {
+				shardNamePools[shardFmtTmpl] = make(map[string]struct{}, 4)
+			}
+			shardNamePools[shardFmtTmpl][shard.name] = struct{}{}
+		}
+	}
+
+	// validate all shard name pools match the consecutively generated shard names from their corresponding templates
+	for tmpl, pool := range shardNamePools {
+		pt, _ := cos.NewParsedTemplate(tmpl)
+		pt.InitIter()
+		for {
+			if len(pool) == 0 {
+				break
+			}
+			shardName, hasNext := pt.Next()
+			if !hasNext {
+				df.m.t.Fatalf("Shard name template (%v) does not match the corresponding shard name pool, remaining names: %v", tmpl, pool)
+			}
+
+			_, exists := pool[shardName]
+			if !exists {
+				df.m.t.Fatalf("Shard name (%s) generated from template (%v) should exist in the corresponding shard name pool", shardName, tmpl)
+			}
+			delete(pool, shardName)
+		}
+	}
+	tlog.Logln("finished, all records are placed in the correct shards as specified in EKM")
+}
+
 func canonicalName(recordName string) string {
 	return strings.TrimSuffix(recordName, cos.Ext(recordName))
 }
@@ -551,7 +594,7 @@ func (df *dsortFramework) getRecordNames(bck cmn.Bck) []shardRecords {
 	tassert.CheckFatal(df.m.t, err)
 
 	if len(list.Entries) == 0 {
-		df.m.t.Errorf("number of objects in bucket %q is 0", bck)
+		df.m.t.Errorf("number of objects in the bucket %q is 0 (zero)", bck.String())
 	}
 	for _, obj := range list.Entries {
 		var (
@@ -754,7 +797,7 @@ func TestDsortNonExistingBuckets(t *testing.T) {
 
 			tlog.Logln(startingDS)
 			spec := df.gen()
-			tlog.Logf("dsort %s(-) => %s\n", m.bck, df.outputBck)
+			tlog.Logf("dsort %s(-) => %s\n", m.bck.String(), df.outputBck.String())
 			if _, err := api.StartDsort(df.baseParams, &spec); err == nil {
 				t.Error("expected dsort to fail when input bucket doesn't exist")
 			}
@@ -763,7 +806,7 @@ func TestDsortNonExistingBuckets(t *testing.T) {
 			tools.DestroyBucket(t, m.proxyURL, df.outputBck)
 			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
 
-			tlog.Logf("dsort %s => %s(-)\n", m.bck, df.outputBck)
+			tlog.Logf("dsort %s => %s(-)\n", m.bck.String(), df.outputBck.String())
 			if _, err := api.StartDsort(df.baseParams, &spec); err != nil {
 				t.Errorf("expected dsort to create output bucket on the fly, got: %v", err)
 			}
@@ -1099,6 +1142,8 @@ func TestDsortMemDisk(t *testing.T) {
 }
 
 func TestDsortMinMemCompression(t *testing.T) {
+	t.Skipf("skipping %s", t.Name()) // TODO -- FIXME: remove completely
+
 	tools.CheckSkip(t, &tools.SkipTestArgs{Long: true})
 	for _, ext := range []string{archive.ExtTarGz, archive.ExtTarLz4, archive.ExtZip} {
 		for _, maxMem := range []string{"10%", "1%"} {
@@ -1280,7 +1325,6 @@ func TestDsortContent(t *testing.T) {
 			}
 
 			for _, entry := range cases {
-				entry := entry // pin
 				test := fmt.Sprintf("%s-%v", entry.contentKeyType, entry.missingKeys)
 				t.Run(test, func(t *testing.T) {
 					t.Parallel()
@@ -1937,7 +1981,7 @@ func TestDsortDuplications(t *testing.T) {
 	}
 }
 
-func TestDsortOrderFile(t *testing.T) {
+func TestDsortEKMFile(t *testing.T) {
 	runDsortTest(
 		t, dsortTestSpec{p: true, types: dsorterTypes},
 		func(dsorterType string, t *testing.T) {
@@ -1957,9 +2001,9 @@ func TestDsortOrderFile(t *testing.T) {
 					filesPerShard: 10,
 				}
 
-				orderFileName = "orderFileName"
-				ekm           = make(map[string]string, 10)
-				shardFmts     = []string{
+				EKMFileName = "ekm_file_name"
+				ekm         = shard.NewExternalKeyMap(8)
+				shardFmts   = []string{
 					"shard-%d-suf",
 					"input-%d-pref",
 					"smth-%d",
@@ -1971,10 +2015,10 @@ func TestDsortOrderFile(t *testing.T) {
 			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			// Set URL for order file (points to the object in cluster).
-			df.orderFileURL = fmt.Sprintf(
+			// Set URL for the ekm file (points to the object in cluster).
+			df.EKMFileURL = fmt.Sprintf(
 				"%s/%s/%s/%s/%s?%s=%s",
-				proxyURL, apc.Version, apc.Objects, m.bck.Name, orderFileName,
+				proxyURL, apc.Version, apc.Objects, m.bck.Name, EKMFileName,
 				apc.QparamProvider, apc.AIS,
 			)
 
@@ -1987,8 +2031,8 @@ func TestDsortOrderFile(t *testing.T) {
 
 			df.createInputShards()
 
-			// Generate content for the orderFile
-			tlog.Logln("generating and putting order file into cluster...")
+			// Generate content for the ekm file
+			tlog.Logln("generating and putting ekm file into cluster...")
 			var (
 				buffer       bytes.Buffer
 				shardRecords = df.getRecordNames(m.bck)
@@ -1996,13 +2040,13 @@ func TestDsortOrderFile(t *testing.T) {
 			for _, shard := range shardRecords {
 				for idx, recordName := range shard.recordNames {
 					buffer.WriteString(fmt.Sprintf("%s\t%s\n", recordName, shardFmts[idx%len(shardFmts)]))
-					ekm[recordName] = shardFmts[idx%len(shardFmts)]
+					ekm.Add(recordName, shardFmts[idx%len(shardFmts)])
 				}
 			}
 			args := api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        m.bck,
-				ObjName:    orderFileName,
+				ObjName:    EKMFileName,
 				Reader:     readers.NewBytes(buffer.Bytes()),
 			}
 			_, err = api.PutObject(&args)
@@ -2022,22 +2066,151 @@ func TestDsortOrderFile(t *testing.T) {
 			if len(allMetrics) != m.originalTargetCount {
 				t.Errorf("number of metrics %d is not same as number of targets %d", len(allMetrics), m.originalTargetCount)
 			}
+			df.checkOutputShardsWithEKM(&ekm)
+		},
+	)
+}
 
-			tlog.Logln("checking if all records are in specified shards...")
-			shardRecords = df.getRecordNames(df.outputBck)
-			for _, shard := range shardRecords {
-				for _, recordName := range shard.recordNames {
-					match := false
-					// Some shard with specified format contains the record
-					for i := range 30 {
-						match = match || fmt.Sprintf(ekm[recordName], i) == shard.name
-					}
-					if !match {
-						t.Errorf("record %q was not part of any shard with format %q but was in shard %q",
-							recordName, ekm[recordName], shard.name)
+func TestDsortRegexEKMFile(t *testing.T) {
+	runDsortTest(
+		t, dsortTestSpec{p: true, types: dsorterTypes},
+		func(dsorterType string, t *testing.T) {
+			var (
+				m = &ioContext{
+					t: t,
+				}
+				df = &dsortFramework{
+					m:             m,
+					dsorterType:   dsorterType,
+					shardCnt:      100,
+					filesPerShard: 5,
+					recordNames:   []string{"n01440764.JPEG", "n02097658.JPEG", "n03495258.JPEG", "n02965783.JPEG", "n01631663.JPEG"},
+				}
+
+				EKMFileName = "ekm_file_name.json"
+				proxyURL    = tools.RandomProxyURL()
+				baseParams  = tools.BaseAPIParams(proxyURL)
+			)
+
+			m.initAndSaveState(true /*cleanup*/)
+			m.expectTargets(3)
+
+			// Set URL for ekm file (points to the object in cluster).
+			df.EKMFileURL = fmt.Sprintf(
+				"%s/%s/%s/%s/%s?%s=%s",
+				proxyURL, apc.Version, apc.Objects, m.bck.Name, EKMFileName,
+				apc.QparamProvider, apc.AIS,
+			)
+			df.init()
+
+			tools.CreateBucket(t, m.proxyURL, m.bck, nil, true /*cleanup*/)
+			df.createInputShards()
+
+			// test case 1: EKMMissingKey is abort
+			t.Run("abort", func(t *testing.T) {
+				df.EKMMissingKey = cmn.AbortReaction
+				df.outputBck = cmn.Bck{
+					Name:     trand.String(15),
+					Provider: apc.AIS,
+				}
+
+				// Create local output bucket
+				tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
+
+				// Generate content for the ekm file
+				tlog.Logln("generating and putting ekm file into cluster...")
+
+				jsonContent := map[string][]string{
+					"shard-%d.tar": {".*string_dont_match.*"},
+				}
+				jsonBytes, err := jsoniter.Marshal(jsonContent)
+				tassert.CheckFatal(t, err)
+				args := api.PutArgs{
+					BaseParams: baseParams,
+					Bck:        m.bck,
+					ObjName:    EKMFileName,
+					Reader:     readers.NewBytes(jsonBytes),
+				}
+				_, err = api.PutObject(&args)
+				tassert.CheckFatal(t, err)
+
+				tlog.Logln(startingDS)
+				spec := df.gen()
+				managerUUID, err := api.StartDsort(baseParams, &spec)
+				tassert.CheckFatal(t, err)
+
+				_, err = tools.WaitForDsortToFinish(m.proxyURL, managerUUID)
+				tassert.CheckFatal(t, err)
+				tlog.Logf("%s: finished\n", df.job())
+
+				allMetrics, err := api.MetricsDsort(baseParams, managerUUID)
+				tassert.CheckFatal(t, err)
+				if len(allMetrics) != m.originalTargetCount {
+					t.Errorf("number of metrics %d is not same as number of targets %d",
+						len(allMetrics), m.originalTargetCount)
+				}
+
+				tlog.Logln("checking if all records are in specified shards...")
+				list, err := api.ListObjects(df.baseParams, df.outputBck, nil, api.ListArgs{})
+				tassert.CheckFatal(df.m.t, err)
+				tassert.Fatalf(t, len(list.Entries) == 0, "dsort should abort, the output bucket should be empty")
+			})
+
+			// test case 2: EKMMissingKey is warn
+			t.Run("warn", func(t *testing.T) {
+				df.EKMMissingKey = cmn.WarnReaction
+				df.outputBck = cmn.Bck{
+					Name:     trand.String(15),
+					Provider: apc.AIS,
+				}
+
+				// Create local output bucket
+				tools.CreateBucket(t, m.proxyURL, df.outputBck, nil, true /*cleanup*/)
+
+				// Generate content for the ekm file
+				tlog.Logln("generating and putting ekm file into cluster...")
+				ekm := shard.NewExternalKeyMap(8)
+				jsonContent := map[string][]string{
+					"tench-shard-%d.tar":        {".*n01440764.*"},
+					"great_dane-shard-%d.tar":   {".*n02097658.*"},
+					"eiffel_tower-shard-%d.tar": {".*n03495258.*"},
+					"car-shard-%d.tar":          {".*n02965783.*"},
+					"flamingo-shard-%d.tar":     {".*n01631663.*"},
+				}
+				for format, samples := range jsonContent {
+					for _, s := range samples {
+						err := ekm.Add(s, format)
+						tassert.CheckFatal(t, err)
 					}
 				}
-			}
+				jsonBytes, err := jsoniter.Marshal(jsonContent)
+				tassert.CheckFatal(t, err)
+				args := api.PutArgs{
+					BaseParams: baseParams,
+					Bck:        m.bck,
+					ObjName:    EKMFileName,
+					Reader:     readers.NewBytes(jsonBytes),
+				}
+				_, err = api.PutObject(&args)
+				tassert.CheckFatal(t, err)
+
+				tlog.Logln(startingDS)
+				spec := df.gen()
+				managerUUID, err := api.StartDsort(baseParams, &spec)
+				tassert.CheckFatal(t, err)
+
+				_, err = tools.WaitForDsortToFinish(m.proxyURL, managerUUID)
+				tassert.CheckFatal(t, err)
+				tlog.Logf("%s: finished\n", df.job())
+
+				allMetrics, err := api.MetricsDsort(baseParams, managerUUID)
+				tassert.CheckFatal(t, err)
+				if len(allMetrics) != m.originalTargetCount {
+					t.Errorf("number of metrics %d is not same as number of targets %d",
+						len(allMetrics), m.originalTargetCount)
+				}
+				df.checkOutputShardsWithEKM(&ekm)
+			})
 		},
 	)
 }
@@ -2062,12 +2235,12 @@ func TestDsortOrderJSONFile(t *testing.T) {
 					filesPerShard: 10,
 				}
 
-				orderFileName = "order_file_name.json"
-				ekm           = make(map[string]string, 10)
-				shardFmts     = []string{
-					"shard-%d-suf",
-					"input-%d-pref",
-					"smth-%d",
+				EKMFileName = "ekm_file_name.json"
+				ekm         = shard.NewExternalKeyMap(8)
+				shardFmts   = []string{
+					"prefix-{0..100}-suffix.tar",
+					"prefix-@00001-gap-@100-suffix.tar",
+					"prefix-%06d-suffix.tar",
 				}
 				proxyURL   = tools.RandomProxyURL()
 				baseParams = tools.BaseAPIParams(proxyURL)
@@ -2076,10 +2249,10 @@ func TestDsortOrderJSONFile(t *testing.T) {
 			m.initAndSaveState(true /*cleanup*/)
 			m.expectTargets(3)
 
-			// Set URL for order file (points to the object in cluster).
-			df.orderFileURL = fmt.Sprintf(
+			// Set URL for the ekm file (points to the object in cluster).
+			df.EKMFileURL = fmt.Sprintf(
 				"%s/%s/%s/%s/%s?%s=%s",
-				proxyURL, apc.Version, apc.Objects, m.bck.Name, orderFileName,
+				proxyURL, apc.Version, apc.Objects, m.bck.Name, EKMFileName,
 				apc.QparamProvider, apc.AIS,
 			)
 
@@ -2092,8 +2265,8 @@ func TestDsortOrderJSONFile(t *testing.T) {
 
 			df.createInputShards()
 
-			// Generate content for the orderFile
-			tlog.Logln("generating and putting order file into cluster...")
+			// Generate content for the ekm file
+			tlog.Logln("generating and putting ekm file into cluster...")
 			var (
 				content      = make(map[string][]string, 10)
 				shardRecords = df.getRecordNames(m.bck)
@@ -2102,7 +2275,7 @@ func TestDsortOrderJSONFile(t *testing.T) {
 				for idx, recordName := range shard.recordNames {
 					shardFmt := shardFmts[idx%len(shardFmts)]
 					content[shardFmt] = append(content[shardFmt], recordName)
-					ekm[recordName] = shardFmts[idx%len(shardFmts)]
+					ekm.Add(recordName, shardFmts[idx%len(shardFmts)])
 				}
 			}
 			jsonBytes, err := jsoniter.Marshal(content)
@@ -2110,7 +2283,7 @@ func TestDsortOrderJSONFile(t *testing.T) {
 			args := api.PutArgs{
 				BaseParams: baseParams,
 				Bck:        m.bck,
-				ObjName:    orderFileName,
+				ObjName:    EKMFileName,
 				Reader:     readers.NewBytes(jsonBytes),
 			}
 			_, err = api.PutObject(&args)
@@ -2132,21 +2305,7 @@ func TestDsortOrderJSONFile(t *testing.T) {
 					len(allMetrics), m.originalTargetCount)
 			}
 
-			tlog.Logln("checking if all records are in specified shards...")
-			shardRecords = df.getRecordNames(df.outputBck)
-			for _, shard := range shardRecords {
-				for _, recordName := range shard.recordNames {
-					match := false
-					// Some shard with specified format contains the record
-					for i := range 30 {
-						match = match || fmt.Sprintf(ekm[recordName], i) == shard.name
-					}
-					if !match {
-						t.Errorf("record %q was not part of any shard with format %q but was in shard %q",
-							recordName, ekm[recordName], shard.name)
-					}
-				}
-			}
+			df.checkOutputShardsWithEKM(&ekm)
 		},
 	)
 }

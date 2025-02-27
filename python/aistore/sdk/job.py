@@ -2,13 +2,12 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
 #
 
-from __future__ import annotations  # pylint: disable=unused-variable
-
 import itertools
-import logging
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 import time
+
+from dateutil.parser import isoparse
 
 from aistore.sdk.bucket import Bucket
 from aistore.sdk.const import (
@@ -25,10 +24,11 @@ from aistore.sdk.const import (
 from aistore.sdk.errors import Timeout, JobInfoNotFound
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import JobStatus, JobArgs, ActionMsg, JobSnapshot, BucketModel
-from aistore.sdk.utils import probing_frequency
+from aistore.sdk.utils import probing_frequency, get_logger
+
+logger = get_logger(__name__)
 
 
-# pylint: disable=unused-variable
 class Job:
     """
     A class containing job-related functions.
@@ -39,7 +39,6 @@ class Job:
         job_kind (str, optional): Specific kind of job, empty for all kinds
     """
 
-    # pylint: disable=duplicate-code
     def __init__(self, client: RequestClient, job_id: str = "", job_kind: str = ""):
         self._client = client
         self._job_id = job_id
@@ -106,7 +105,6 @@ class Job:
             requests.ReadTimeout: Timed out waiting response from AIStore
             errors.Timeout: Timeout while waiting for the job to finish
         """
-        logger = logging.getLogger(f"{__name__}.wait")
         logger.disabled = not verbose
         passed = 0
         sleep_time = probing_frequency(timeout)
@@ -157,10 +155,8 @@ class Job:
             errors.JobInfoNotFound: Raised when information on a job's status could not be found on the AIS cluster
         """
         action = f"job '{self._job_id}' to reach idle state"
-        logger_name = "wait_for_idle"
-        self._wait_for_condition(
-            self._check_job_idle, action, logger_name, verbose, timeout
-        )
+        logger.disabled = not verbose
+        self._wait_for_condition(self._check_job_idle, action, timeout)
 
     def wait_single_node(
         self,
@@ -185,11 +181,9 @@ class Job:
             errors.Timeout: Timeout while waiting for the job to finish
             errors.JobInfoNotFound: Raised when information on a job's status could not be found on the AIS cluster
         """
-        logger_name = "wait_single_node"
         action = f"job '{self._job_id}' to finish"
-        self._wait_for_condition(
-            self._check_snapshot_finished, action, logger_name, verbose, timeout
-        )
+        logger.disabled = not verbose
+        self._wait_for_condition(self._check_snapshot_finished, action, timeout)
 
     def start(
         self,
@@ -220,7 +214,7 @@ class Job:
         if buckets and len(buckets) > 0:
             bucket_models = [
                 BucketModel(
-                    name=bck.name, provider=bck.provider, namespace=bck.namespace
+                    name=bck.name, provider=bck.provider.value, namespace=bck.namespace
                 )
                 for bck in buckets
             ]
@@ -237,41 +231,34 @@ class Job:
         return resp.text
 
     def get_within_timeframe(
-        self, start_time: datetime.time, end_time: datetime.time
+        self, start_time: datetime, end_time: Optional[datetime] = None
     ) -> List[JobSnapshot]:
         """
-        Checks for jobs that started and finished within a specified timeframe
+        Retrieves jobs that started after a specified start_time and optionally ended before a specified end_time.
 
         Args:
-            start_time (datetime.time): The start of the timeframe for monitoring jobs
-            end_time (datetime.time): The end of the timeframe for monitoring jobs
+            start_time (datetime): The start of the timeframe for monitoring jobs.
+            end_time (datetime, optional): The end of the timeframe for monitoring jobs.
 
         Returns:
-            list: A list of jobs that have finished within the specified timeframe
+            List[JobSnapshot]: A list of jobs that meet the specified timeframe criteria.
 
         Raises:
-            requests.RequestException: "There was an ambiguous exception that occurred while handling..."
-            requests.ConnectionError: Connection error
-            requests.ConnectionTimeout: Timed out connecting to AIStore
-            requests.ReadTimeout: Timed out waiting response from AIStore
-            errors.Timeout: Timeout while waiting for the job to finish
-            errors.JobInfoNotFound: Raised when information on a job's status could not be found on the AIS cluster
+            JobInfoNotFound: Raised when no relevant job info is found.
         """
-
         snapshots = self._query_job_snapshots()
         jobs_found = []
         for snapshot in snapshots:
             if snapshot.id == self.job_id or snapshot.kind == self.job_kind:
-                snapshot_start_time = datetime.fromisoformat(
-                    snapshot.start_time[:26]
-                ).time()
-                snapshot_end_time = datetime.fromisoformat(
-                    snapshot.end_time[:26]
-                ).time()
-                if snapshot_start_time >= start_time and snapshot_end_time <= end_time:
-                    jobs_found.append(snapshot)
-                    print(snapshot)
-        if len(jobs_found) == 0:
+                snapshot_start_time = isoparse(snapshot.start_time)
+                if snapshot_start_time >= start_time:
+                    if end_time is None:
+                        jobs_found.append(snapshot)
+                    else:
+                        snapshot_end_time = isoparse(snapshot.end_time)
+                        if snapshot_end_time <= end_time:
+                            jobs_found.append(snapshot)
+        if not jobs_found:
             raise JobInfoNotFound("No relevant job info found")
         return jobs_found
 
@@ -288,7 +275,7 @@ class Job:
         snapshots = list(itertools.chain.from_iterable(snapshot_lists))
         return snapshots
 
-    def _check_snapshot_finished(self, snapshots, logger):
+    def _check_snapshot_finished(self, snapshots):
         job_found = False
         snapshot = None
         for snap in snapshots:
@@ -301,7 +288,7 @@ class Job:
         if not job_found:
             raise JobInfoNotFound(f"No info found for job {self._job_id}")
 
-        end_time = datetime.fromisoformat(snapshot.end_time.rstrip("Z")).time()
+        end_time = isoparse(snapshot.end_time).time()
         if snapshot.end_time != "0001-01-01T00:00:00Z" and not snapshot.aborted:
             logger.info("Job '%s' finished at time '%s'", self.job_id, end_time)
             return True
@@ -310,7 +297,7 @@ class Job:
             return True
         return False
 
-    def _check_job_idle(self, snapshots, logger):
+    def _check_job_idle(self, snapshots):
         job_found = False
         for snap in snapshots:
             if snap.id != self._job_id:
@@ -324,18 +311,14 @@ class Job:
         logger.info("Job '%s' reached idle state", self._job_id)
         return True
 
-    # pylint: disable=too-many-arguments
-    def _wait_for_condition(self, condition_fn, action, logger_name, verbose, timeout):
-        logger = logging.getLogger(f"{__name__}.{logger_name}")
-        logger.disabled = not verbose
+    def _wait_for_condition(self, condition_fn, action, timeout):
         passed = 0
         sleep_time = probing_frequency(timeout)
 
         while True:
-            snapshots = []
             snapshots = self._query_job_snapshots()
             try:
-                if condition_fn(snapshots, logger):
+                if condition_fn(snapshots):
                     return
             except JobInfoNotFound:
                 logger.info("No information found for job %s, retrying", self._job_id)

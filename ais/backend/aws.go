@@ -2,7 +2,7 @@
 
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -29,6 +29,8 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/stats"
+	"github.com/NVIDIA/aistore/tracing"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -64,14 +66,19 @@ var _ core.Backend = (*s3bp)(nil)
 
 // environment variables => static defaults that can still be overridden via bck.Props.Extra.AWS
 // in addition to these two (below), default bucket region = env.AwsDefaultRegion()
-func NewAWS(t core.TargetPut) (core.Backend, error) {
-	s3Endpoint = os.Getenv(env.AWS.Endpoint)
-	awsProfile = os.Getenv(env.AWS.Profile)
-	return &s3bp{
+func NewAWS(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
+	s3Endpoint = os.Getenv(env.AWSEndpoint)
+	awsProfile = os.Getenv(env.AWSProfile)
+	bp := &s3bp{
 		t:    t,
 		mm:   t.PageMM(),
-		base: base{apc.AWS},
-	}, nil
+		base: base{provider: apc.AWS},
+	}
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
+	// reset clients map
+	clients.Clear()
+	return bp, nil
 }
 
 // as core.Backend --------------------------------------------------------------
@@ -281,13 +288,14 @@ none:
 const versionedPageSize = 20
 
 func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode int, _ error) {
+	const tag = "list_objects"
 	var (
 		h          = cmn.BackendHelpers.Amazon
 		cloudBck   = bck.RemoteBck()
 		sessConf   = sessConf{bck: cloudBck}
 		versioning bool
 	)
-	svc, err := sessConf.s3client("[list_objects]")
+	svc, err := sessConf.s3client(tag)
 	if err != nil {
 		return 0, err
 	}
@@ -302,7 +310,9 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 		params.ContinuationToken = aws.String(msg.ContinuationToken)
 	}
 
-	versioning = bck.Props != nil && bck.Props.Versioning.Enabled && msg.WantProp(apc.GetPropsVersion)
+	if bck.Props != nil && bck.Props.Versioning.Enabled {
+		versioning = msg.WantProp(apc.GetPropsVersion) && bck.Props.Features.IsSet(feat.S3ListObjectVersions)
+	}
 	msg.PageSize = calcPageSize(msg.PageSize, bck.MaxPageSize())
 	if versioning {
 		msg.PageSize = min(versionedPageSize, msg.PageSize)
@@ -312,25 +322,21 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 	resp, err := svc.ListObjectsV2(context.Background(), params)
 	if err != nil {
 		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
-			nlog.Infoln("list_objects", cloudBck.Name, err)
+			nlog.Infoln(tag, cloudBck.Name, err)
 		}
 		ecode, err = awsErrorToAISError(err, cloudBck, "")
 		return ecode, err
 	}
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
 	)
-	if wantCustom {
-		custom = make(cos.StrKVs, 2) // reuse
-	}
 	lst.Entries = lst.Entries[:0]
 	for _, obj := range resp.Contents {
 		en := cmn.LsoEnt{Name: *obj.Key, Size: *obj.Size}
 		// rarely
 		if en.Size == 0 && cos.IsLastB(en.Name, '/') {
-			if msg.IsFlagSet(apc.LsNoDirs) {
+			if msg.IsFlagSet(apc.LsNoDirs) { // do not return virtual subdirectories
 				continue
 			}
 			en.Flags = apc.EntryIsDir
@@ -339,10 +345,8 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 				en.Checksum = v
 			}
 			if wantCustom {
-				custom[cmn.ETag] = en.Checksum
 				mtime := *(obj.LastModified)
-				custom[cmn.LastModified] = fmtTime(mtime)
-				en.Custom = cmn.CustomMD2S(custom)
+				en.Custom = cmn.CustomProps2S(cmn.ETag, en.Checksum, cmn.LastModified, fmtTime(mtime))
 			}
 		}
 		lst.Entries = append(lst.Entries, &en)
@@ -361,7 +365,7 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 
 	if len(lst.Entries) == 0 || !versioning {
 		if cmn.Rom.FastV(4, cos.SmoduleBackend) {
-			nlog.Infoln("[list_objects]", cloudBck.Name, len(lst.Entries))
+			nlog.Infoln(tag, cloudBck.Name, len(lst.Entries))
 		}
 		return 0, nil
 	}
@@ -379,7 +383,8 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 		if err != nil {
 			return awsErrorToAISError(err, cloudBck, "")
 		}
-		for _, vers := range verResp.Versions {
+		for i := range verResp.Versions {
+			vers := &verResp.Versions[i]
 			if latest := *(vers.IsLatest); !latest {
 				continue
 			}
@@ -392,7 +397,7 @@ func (*s3bp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (ecode
 		}
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleBackend) {
-		nlog.Infoln("[list_objects]", cloudBck.Name, len(lst.Entries), num)
+		nlog.Infoln(tag, cloudBck.Name, len(lst.Entries), num)
 	}
 	return 0, nil
 }
@@ -435,6 +440,7 @@ func (*s3bp) ListBuckets(cmn.QueryBcks) (bcks cmn.Bcks, ecode int, _ error) {
 //
 
 func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *cmn.ObjAttrs, ecode int, err error) {
+	const tag = "[head_object]"
 	var (
 		svc        *s3.Client
 		headOutput *s3.HeadObjectOutput
@@ -446,7 +452,7 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 	if lom.IsFeatureSet(feat.S3PresignedRequest) && oreq != nil {
 		q := oreq.URL.Query() // TODO: optimize-out
 		pts := aiss3.NewPresignedReq(oreq, lom, nil, q)
-		resp, err := pts.Do(core.T.DataClient())
+		resp, err := pts.DoHead(core.T.DataClient())
 		if err != nil {
 			return nil, resp.StatusCode, err
 		}
@@ -456,7 +462,7 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 		}
 	}
 
-	svc, err = sessConf.s3client("[head_object]")
+	svc, err = sessConf.s3client(tag)
 	if err != nil {
 		return
 	}
@@ -476,17 +482,11 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 		lom.SetCustomKey(cmn.VersionObjMD, v)
 		oa.SetVersion(v)
 	}
-	if v, ok := h.EncodeCksum(headOutput.ETag); ok {
+	if v, ok := h.EncodeETag(headOutput.ETag); ok {
 		oa.SetCustomKey(cmn.ETag, v)
-		// assuming SSE-S3 or plaintext encryption
-		// from https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html:
-		// - "The entity tag is a hash of the object. The ETag reflects changes only
-		//    to the contents of an object, not its metadata."
-		// - "The ETag may or may not be an MD5 digest of the object data. Whether or
-		//    not it is depends on how the object was created and how it is encrypted..."
-		if !cmn.IsS3MultipartEtag(v) {
-			oa.SetCustomKey(cmn.MD5ObjMD, v)
-		}
+	}
+	if v, ok := h.EncodeCksum(headOutput.ETag); ok {
+		oa.SetCustomKey(cmn.MD5ObjMD, v)
 	}
 
 	// AIS custom (see also: PutObject, GetObjReader)
@@ -511,7 +511,7 @@ func (*s3bp) HeadObj(_ context.Context, lom *core.LOM, oreq *http.Request) (oa *
 
 exit:
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
-		nlog.Infoln("[head_object]", cloudBck.Cname(lom.ObjName))
+		nlog.Infoln(tag, cloudBck.Cname(lom.ObjName))
 	}
 	return
 }
@@ -614,13 +614,15 @@ func _getCustom(lom *core.LOM, obj *s3.GetObjectOutput) (md5 *cos.Cksum) {
 		lom.SetVersion(v)
 		lom.SetCustomKey(cmn.VersionObjMD, v)
 	}
-	// see ETag/MD5 NOTE above
-	if v, ok := h.EncodeCksum(obj.ETag); ok {
+	if v, ok := h.EncodeETag(obj.ETag); ok {
 		lom.SetCustomKey(cmn.ETag, v)
-		if !cmn.IsS3MultipartEtag(v) {
-			md5 = cos.NewCksum(cos.ChecksumMD5, v)
-			lom.SetCustomKey(cmn.MD5ObjMD, v)
-		}
+	}
+	if v, ok := h.EncodeCksum(obj.ETag); ok {
+		md5 = cos.NewCksum(cos.ChecksumMD5, v)
+		lom.SetCustomKey(cmn.MD5ObjMD, v)
+	}
+	for k, v := range h.EncodeMetadata(obj.Metadata) {
+		lom.SetCustomKey(k, v)
 	}
 	mtime := *(obj.LastModified)
 	lom.SetCustomKey(cmn.LastModified, fmtTime(mtime))
@@ -632,6 +634,7 @@ func _getCustom(lom *core.LOM, obj *s3.GetObjectOutput) (md5 *cos.Cksum) {
 //
 
 func (*s3bp) PutObj(r io.ReadCloser, lom *core.LOM, oreq *http.Request) (ecode int, err error) {
+	const tag = "[put_object]"
 	var (
 		svc                   *s3.Client
 		uploader              *s3manager.Uploader
@@ -651,21 +654,28 @@ func (*s3bp) PutObj(r io.ReadCloser, lom *core.LOM, oreq *http.Request) (ecode i
 		}
 		if resp != nil {
 			uploadOutput = &s3manager.UploadOutput{
-				ETag: aws.String(resp.Header.Get(cos.HdrETag)),
+				VersionID: aws.String(resp.Header.Get(cos.S3VersionHeader)),
+				ETag:      aws.String(resp.Header.Get(cos.HdrETag)),
 			}
 			goto exit
 		}
 	}
 
-	svc, err = sessConf.s3client("[put_object]")
+	svc, err = sessConf.s3client(tag)
 	if err != nil {
 		return
 	}
 
 	md[cos.S3MetadataChecksumType] = cksumType
 	md[cos.S3MetadataChecksumVal] = cksumValue
+	if oreq != nil {
+		for k, v := range cmn.BackendHelpers.Amazon.DecodeMetadata(oreq.Header) {
+			md[k] = v
+		}
+	}
 
 	uploader = s3manager.NewUploader(svc)
+	uploader.PartSize = cos.NonZero(int64(lom.Bprops().Extra.AWS.MultiPartSize), aiss3.DefaultPartSize)
 	uploadOutput, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
 		Bucket:   aws.String(cloudBck.Name),
 		Key:      aws.String(lom.ObjName),
@@ -679,20 +689,26 @@ func (*s3bp) PutObj(r io.ReadCloser, lom *core.LOM, oreq *http.Request) (ecode i
 	}
 
 exit:
-	// compare with setCustomS3() above
+	// compare with _getCustom() above
 	if v, ok := h.EncodeVersion(uploadOutput.VersionID); ok {
 		lom.SetCustomKey(cmn.VersionObjMD, v)
 		lom.SetVersion(v)
 	}
-	if v, ok := h.EncodeCksum(uploadOutput.ETag); ok {
+	if v, ok := h.EncodeETag(uploadOutput.ETag); ok {
 		lom.SetCustomKey(cmn.ETag, v)
-		// see ETag/MD5 NOTE above
-		if !cmn.IsS3MultipartEtag(v) {
-			lom.SetCustomKey(cmn.MD5ObjMD, v)
+	}
+	if v, ok := h.EncodeCksum(uploadOutput.ETag); ok {
+		lom.SetCustomKey(cmn.MD5ObjMD, v)
+	}
+	if oreq != nil {
+		for header := range oreq.Header {
+			if strings.HasPrefix(header, aiss3.HeaderMetaPrefix) {
+				lom.SetCustomKey(header, oreq.Header.Get(header))
+			}
 		}
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
-		nlog.Infoln("[put_object]", lom.String())
+		nlog.Infoln(tag, lom.String())
 	}
 	cos.Close(r)
 	return
@@ -702,13 +718,19 @@ exit:
 // DELETE OBJECT
 //
 
+// [NOTE]
+// - returns (0, nil) when the object does not exist
+// - `s3.DeleteObjectOutput` does not help to differentiate
+// - to fight it, specify some sort of matching criteria as per:
+// - https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html#ExampleVersionObjectDelete
 func (*s3bp) DeleteObj(lom *core.LOM) (ecode int, err error) {
+	const tag = "[delete_object]"
 	var (
 		svc      *s3.Client
 		cloudBck = lom.Bck().RemoteBck()
 		sessConf = sessConf{bck: cloudBck}
 	)
-	svc, err = sessConf.s3client("[delete_object]")
+	svc, err = sessConf.s3client(tag)
 	if err != nil {
 		return
 	}
@@ -721,7 +743,7 @@ func (*s3bp) DeleteObj(lom *core.LOM) (ecode int, err error) {
 		return
 	}
 	if cmn.Rom.FastV(5, cos.SmoduleBackend) {
-		nlog.Infoln("[delete_object]", lom.String())
+		nlog.Infoln(tag, lom.String())
 	}
 	return
 }
@@ -730,12 +752,12 @@ func (*s3bp) DeleteObj(lom *core.LOM) (ecode int, err error) {
 // static helpers
 //
 
-// newClient creates new S3 client on a per-region basis or, more precisely,
-// per (region, endpoint) pair - and note that s3 endpoint is per-bucket configurable.
-// If the client already exists newClient simply returns it.
+// s3client creates or loads an existing S3 client for each triplet of profile/region/endpoint.
+// Note that each property is configurable per-bucket.
 // From S3 SDK:
 // "S3 methods are safe to use concurrently. It is not safe to modify mutate
 // any of the struct's properties though."
+// TODO: use config.Net.HTTP.IdleConnTimeout and friends (https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk/custom-http)
 func (sessConf *sessConf) s3client(tag string) (*s3.Client, error) {
 	var (
 		endpoint = s3Endpoint
@@ -803,7 +825,11 @@ func (sessConf *sessConf) options(options *s3.Options) {
 }
 
 func _cid(profile, region, endpoint string) string {
-	sb := &strings.Builder{}
+	var (
+		sb strings.Builder
+		l  = len(profile) + 1 + len(region) + 1 + len(endpoint)
+	)
+	sb.Grow(l)
 	if profile != "" {
 		sb.WriteString(profile)
 	}
@@ -823,7 +849,7 @@ func loadConfig(endpoint, profile string) (aws.Config, error) {
 	// NOTE: The AWS SDK for Go v2, uses lower case header maps by default.
 	cfg, err := config.LoadDefaultConfig(
 		context.Background(),
-		config.WithHTTPClient(cmn.NewClient(cmn.TransportArgs{})),
+		config.WithHTTPClient(tracing.NewTraceableClient(cmn.NewClient(cmn.TransportArgs{}))),
 		config.WithSharedConfigProfile(profile),
 	)
 	if err != nil {
@@ -872,6 +898,7 @@ func awsErrorToAISError(awsError error, bck *cmn.Bck, objName string) (int, erro
 		return http.StatusInternalServerError, _awsErr(awsError, "")
 	}
 
+	code := reqErr.ErrorCode()
 	switch reqErr.(type) {
 	case *types.NoSuchBucket:
 		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
@@ -879,15 +906,28 @@ func awsErrorToAISError(awsError error, bck *cmn.Bck, objName string) (int, erro
 		e := fmt.Errorf("%s[%s: %s]", aiss3.ErrPrefix, reqErr.ErrorCode(), bck.Cname(objName))
 		return http.StatusNotFound, e
 	default:
-		var (
-			rspErr *awshttp.ResponseError
-			code   = reqErr.ErrorCode()
-		)
-		if errors.As(awsError, &rspErr) {
-			return rspErr.HTTPStatusCode(), _awsErr(awsError, code)
+		var rspErr *awshttp.ResponseError
+		if !errors.As(awsError, &rspErr) {
+			return http.StatusBadRequest, _awsErr(awsError, code)
 		}
-
-		return http.StatusBadRequest, _awsErr(awsError, code)
+		// handle assorted status codes
+		switch status := rspErr.HTTPStatusCode(); status {
+		case http.StatusMovedPermanently:
+			// [BUG] when bucket does not exist or isn't accessible AWS may return
+			// 301 ("MovedPermanently") with code == "PermanentRedirect" which is 308
+			err := cmn.NewErrRemoteBckNotFound(bck)
+			err.Set(" (PermanentRedirect)")
+			return http.StatusNotFound, err
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			if code == "" {
+				debug.Assert(false, "empty error code in ", awsError.Error()) // (unlikely)
+				code = strconv.Itoa(status)
+			}
+			e := fmt.Errorf("%s[%s: %s]", aiss3.ErrPrefix, code, bck.Cname(objName))
+			return status, cmn.NewErrTooManyRequests(e, status)
+		default:
+			return status, _awsErr(awsError, code)
+		}
 	}
 }
 

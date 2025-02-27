@@ -1,6 +1,6 @@
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -23,6 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/stats"
 )
 
 // NOTE: some of the methods here are part of the of the *extended* native AIS API outside
@@ -44,14 +45,15 @@ type (
 		url  string
 		uuid string
 		bp   api.BaseParams
+		bpL  api.BaseParams // long & list
 	}
 	AISbp struct {
-		t             core.TargetPut
-		remote        map[string]*remAis // by UUID
-		alias         cos.StrKVs         // alias => UUID
-		mu            sync.RWMutex
-		appliedCfgVer int64
+		t      core.TargetPut
+		alias  cos.StrKVs         // alias => UUID
+		remote map[string]*remAis // by UUID
 		base
+		appliedCfgVer int64
+		mu            sync.RWMutex
 	}
 )
 
@@ -62,16 +64,18 @@ var (
 	preg, treg *regexp.Regexp
 )
 
-func NewAIS(t core.TargetPut) *AISbp {
+func NewAIS(t core.TargetPut, tstats stats.Tracker, startingUp bool) *AISbp {
 	suff := regexp.QuoteMeta(meta.SnameSuffix)
 	preg = regexp.MustCompile(regexp.QuoteMeta(meta.PnamePrefix) + `\S*` + suff + ": ")
 	treg = regexp.MustCompile(regexp.QuoteMeta(meta.TnamePrefix) + `\S*` + suff + ": ")
-	return &AISbp{
+	bp := &AISbp{
 		t:      t,
 		remote: make(map[string]*remAis),
 		alias:  make(cos.StrKVs),
-		base:   base{apc.AIS},
+		base:   base{provider: apc.AIS},
 	}
+	bp.base.init(t.Snode(), tstats, startingUp)
+	return bp
 }
 
 func (r *remAis) String() string {
@@ -90,6 +94,9 @@ func unsetUUID(bck *cmn.Bck) { bck.Ns.UUID = "" }
 func extractErrCode(e error, uuid string) (int, error) {
 	if e == nil {
 		return http.StatusOK, nil
+	}
+	if cos.IsClientTimeout(e) {
+		return http.StatusRequestTimeout, e
 	}
 	herr := cmn.Err2HTTPErr(e)
 	if herr == nil {
@@ -254,7 +261,9 @@ func (r *remAis) init(alias string, confURLs []string, cfg *cmn.ClusterConfig) (
 	var (
 		url           string
 		remSmap, smap *meta.Smap
-		cliH, cliTLS  = remaisClients(&cfg.Client)
+
+		clientL      http.Client
+		cliH, cliTLS = remaisClients(&cfg.Client)
 	)
 	for _, u := range confURLs {
 		client := cliH
@@ -286,10 +295,17 @@ func (r *remAis) init(alias string, confURLs []string, cfg *cmn.ClusterConfig) (
 	r.smap, r.url = remSmap, url
 	if cos.IsHTTPS(url) {
 		r.bp = api.BaseParams{Client: cliTLS, URL: url, UA: ua}
+		clientL = *cliTLS
 	} else {
 		r.bp = api.BaseParams{Client: cliH, URL: url, UA: ua}
+		clientL = *cliH
 	}
+
+	r.bpL = r.bp
+	clientL.Timeout = cfg.Client.TimeoutLong.D()
+	r.bpL.Client = &clientL
 	r.uuid = remSmap.UUID
+
 	return
 }
 
@@ -430,6 +446,7 @@ func (m *AISbp) ListObjects(remoteBck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRe
 	}
 	remoteMsg := msg.Clone()
 	remoteMsg.PageSize = calcPageSize(remoteMsg.PageSize, remoteBck.MaxPageSize())
+	remoteMsg.ClearFlag(apc.LsDiff | apc.LsCached)
 
 	// TODO:
 	// Currently, not encoding xaction (aka request) `UUID` from the remote cluster
@@ -443,7 +460,7 @@ func (m *AISbp) ListObjects(remoteBck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRe
 	unsetUUID(&bck)
 
 	var lstRes *cmn.LsoRes
-	if lstRes, err = api.ListObjectsPage(remAis.bp, bck, remoteMsg, api.ListArgs{}); err != nil {
+	if lstRes, err = api.ListObjectsPage(remAis.bpL, bck, remoteMsg, api.ListArgs{}); err != nil {
 		ecode, err = extractErrCode(err, remAis.uuid)
 		return
 	}
@@ -526,7 +543,8 @@ func (m *AISbp) HeadObj(_ context.Context, lom *core.LOM, _ *http.Request) (oa *
 		return
 	}
 	unsetUUID(&remoteBck)
-	if op, err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent, true /*silent*/); err != nil {
+	if op, err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName,
+		api.HeadArgs{FltPresence: apc.FltPresent, Silent: true}); err != nil {
 		ecode, err = extractErrCode(err, remAis.uuid)
 		return
 	}
@@ -536,6 +554,7 @@ func (m *AISbp) HeadObj(_ context.Context, lom *core.LOM, _ *http.Request) (oa *
 	return
 }
 
+// TODO: retry
 func (m *AISbp) GetObj(_ context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Request) (ecode int, err error) {
 	var (
 		remAis    *remAis
@@ -547,7 +566,7 @@ func (m *AISbp) GetObj(_ context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Re
 		return
 	}
 	unsetUUID(&remoteBck)
-	if r, size, err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, nil /*api.GetArgs*/); err != nil {
+	if r, size, err = api.GetObjectReader(remAis.bpL, remoteBck, lom.ObjName, nil /*api.GetArgs*/); err != nil {
 		return extractErrCode(err, remAis.uuid)
 	}
 	params := core.AllocPutParams()
@@ -560,6 +579,9 @@ func (m *AISbp) GetObj(_ context.Context, lom *core.LOM, owt cmn.OWT, _ *http.Re
 	}
 	err = m.t.PutObject(lom, params)
 	core.FreePutParams(params)
+
+	// TODO: retry upon 'unreachable' or timeout
+
 	return extractErrCode(err, remAis.uuid)
 }
 
@@ -583,7 +605,8 @@ func (m *AISbp) GetObjReader(_ context.Context, lom *core.LOM, offset, length in
 			Query:  url.Values{apc.QparamSilent: []string{"true"}},
 		}
 	} else {
-		if op, res.Err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, apc.FltPresent, true /*silent*/); res.Err != nil {
+		hargs := api.HeadArgs{FltPresence: apc.FltPresent, Silent: true}
+		if op, res.Err = api.HeadObject(remAis.bp, remoteBck, lom.ObjName, hargs); res.Err != nil {
 			res.ErrCode, res.Err = extractErrCode(res.Err, remAis.uuid)
 			return
 		}
@@ -594,11 +617,12 @@ func (m *AISbp) GetObjReader(_ context.Context, lom *core.LOM, offset, length in
 		res.ExpCksum = oa.Cksum
 		lom.SetCksum(nil)
 	}
-	res.R, res.Size, res.Err = api.GetObjectReader(remAis.bp, remoteBck, lom.ObjName, args)
+	res.R, res.Size, res.Err = api.GetObjectReader(remAis.bpL, remoteBck, lom.ObjName, args)
 	res.ErrCode, res.Err = extractErrCode(res.Err, remAis.uuid)
 	return
 }
 
+// TODO: retry upon 'unreachable' or timeout
 func (m *AISbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (ecode int, err error) {
 	var (
 		oah       api.ObjAttrs
@@ -612,7 +636,7 @@ func (m *AISbp) PutObj(r io.ReadCloser, lom *core.LOM, _ *http.Request) (ecode i
 	unsetUUID(&remoteBck)
 	size := lom.Lsize(true) // _special_ as it's still a workfile at this point
 	args := api.PutArgs{
-		BaseParams: remAis.bp,
+		BaseParams: remAis.bpL,
 		Bck:        remoteBck,
 		ObjName:    lom.ObjName,
 		Cksum:      lom.Checksum(),

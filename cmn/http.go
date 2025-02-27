@@ -1,29 +1,24 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
-	"github.com/NVIDIA/aistore/sys"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -34,21 +29,6 @@ const (
 )
 
 type (
-	// usage 1: initialize and fill out HTTP request.
-	// usage 2: intra-cluster control-plane (except streams)
-	// usage 3: PUT and APPEND API
-	// BodyR optimizes-out allocations - if non-nil and implements `io.Closer`, will always be closed by `client.Do`
-	HreqArgs struct {
-		BodyR    io.Reader
-		Header   http.Header // request headers
-		Query    url.Values  // query, e.g. ?a=x&b=y&c=z
-		RawQuery string      // raw query
-		Method   string
-		Base     string // base URL, e.g. http://xyz.abc
-		Path     string // path URL, e.g. /x/y/z
-		Body     []byte
-	}
-
 	RetryArgs struct {
 		Call    func() (int, error)
 		IsFatal func(error) bool
@@ -86,20 +66,40 @@ func MakeRangeHdr(start, length int64) string {
 	return fmt.Sprintf("%s%d-%d", cos.HdrRangeValPrefix, start, start+length-1)
 }
 
+// Ref: https://www.rfc-editor.org/rfc/rfc7233#section-4.2
+func ParseRangeHdr(contentRange string) (start, length, objectSize int64, err error) {
+	var (
+		end int64
+		n   int
+	)
+	n, err = fmt.Sscanf(contentRange, "bytes %d-%d/%d", &start, &end, &objectSize)
+	if n != 3 {
+		err = fmt.Errorf("contentRange (\"%s\") malformed", contentRange)
+		return
+	}
+	length = end + 1 - start
+	return
+}
+
 // ParseURL splits URL path at "/" and matches resulting items against the specified, if any.
 // - splitAfter == true:  strings.Split() the entire path;
 // - splitAfter == false: strings.SplitN(len(itemsPresent)+itemsAfter)
 // Returns all items that follow the specified `items`.
+
+const maxItems = 1000
+
 func ParseURL(path string, itemsPresent []string, itemsAfter int, splitAfter bool) ([]string, error) {
+	// path.Clean(string) reduced to this:
+	for path != "" && path[0] == '/' {
+		path = path[1:]
+	}
+
 	var (
 		split []string
 		l     = len(itemsPresent)
 	)
-	if path != "" && path[0] == '/' {
-		path = path[1:] // remove leading slash
-	}
 	if splitAfter {
-		split = strings.Split(path, "/")
+		split = strings.SplitN(path, "/", maxItems)
 	} else {
 		split = strings.SplitN(path, "/", l+max(1, itemsAfter))
 	}
@@ -132,7 +132,7 @@ func ParseURL(path string, itemsPresent []string, itemsAfter int, splitAfter boo
 func ReadBytes(r *http.Request) (b []byte, err error) {
 	var e error
 
-	b, e = io.ReadAll(r.Body)
+	b, e = cos.ReadAllN(r.Body, r.ContentLength)
 	if e != nil {
 		err = fmt.Errorf("failed to read %s request, err: %v", r.Method, e)
 		if e == io.EOF {
@@ -204,7 +204,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 	for hardErrCnt, softErrCnt, iter = uint(0), uint(0), uint(1); ; iter++ {
 		if status, err = args.Call(); err == nil {
 			if args.Verbosity == RetryLogVerbose && (hardErrCnt > 0 || softErrCnt > 0) {
-				nlog.Warningf("%s Successful %s after (soft/hard errors: %d/%d, last: %v)",
+				nlog.Warningf("%s successful %s after (soft/hard errors: %d/%d, last: %v)",
 					callerStr, args.Action, softErrCnt, hardErrCnt, nonEmptyErr)
 			}
 			return
@@ -215,7 +215,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 			return
 		}
 		if args.Verbosity == RetryLogVerbose {
-			nlog.Errorf("%s Failed to %s, iter %d, err: %v(%d)", callerStr, args.Action, iter, err, status)
+			nlog.Errorf("%s failed to %s, iter %d, err: %v(%d)", callerStr, args.Action, iter, err, status)
 		}
 		if cos.IsRetriableConnErr(err) {
 			softErrCnt++
@@ -236,7 +236,7 @@ func NetworkCallWithRetry(args *RetryArgs) (err error) {
 	}
 	// Quiet: print once the summary (Verbose: no need)
 	if args.Verbosity == RetryLogQuiet {
-		nlog.Errorf("%sFailed to %s (soft/hard errors: %d/%d, last: %v)",
+		nlog.Errorf("%sfailed to %s (soft/hard errors: %d/%d, last: %v)",
 			callerStr, args.Action, softErrCnt, hardErrCnt, err)
 	}
 	return
@@ -255,84 +255,3 @@ func ParseReadHeaderTimeout() (_ time.Duration, isSet bool) {
 	}
 	return timeout, true
 }
-
-//////////////
-// HreqArgs //
-//////////////
-
-var (
-	hraPool sync.Pool
-	hra0    HreqArgs
-)
-
-func AllocHra() (a *HreqArgs) {
-	if v := hraPool.Get(); v != nil {
-		a = v.(*HreqArgs)
-		return
-	}
-	return &HreqArgs{}
-}
-
-func FreeHra(a *HreqArgs) {
-	*a = hra0
-	hraPool.Put(a)
-}
-
-func (u *HreqArgs) URL() string {
-	url := cos.JoinPath(u.Base, u.Path)
-	if u.RawQuery != "" {
-		return url + "?" + u.RawQuery
-	}
-	if rawq := u.Query.Encode(); rawq != "" {
-		return url + "?" + rawq
-	}
-	return url
-}
-
-func (u *HreqArgs) Req() (*http.Request, error) {
-	r := u.BodyR
-	if r == nil && u.Body != nil {
-		r = bytes.NewBuffer(u.Body)
-	}
-	req, err := http.NewRequest(u.Method, u.URL(), r)
-	if err != nil {
-		return nil, err
-	}
-	if u.Header != nil {
-		copyHeaders(u.Header, &req.Header)
-	}
-	return req, nil
-}
-
-// ReqWithCancel creates request with ability to cancel it.
-func (u *HreqArgs) ReqWithCancel() (*http.Request, context.Context, context.CancelFunc, error) {
-	req, err := u.Req()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if u.Method == http.MethodPost || u.Method == http.MethodPut {
-		req.Header.Set(cos.HdrContentType, cos.ContentJSON)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
-	return req, ctx, cancel, nil
-}
-
-func (u *HreqArgs) ReqWithTimeout(timeout time.Duration) (*http.Request, context.Context, context.CancelFunc, error) {
-	req, err := u.Req()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if u.Method == http.MethodPost || u.Method == http.MethodPut {
-		req.Header.Set(cos.HdrContentType, cos.ContentJSON)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	req = req.WithContext(ctx)
-	return req, ctx, cancel, nil
-}
-
-//
-// number of intra-cluster broadcasting goroutines
-//
-
-func MaxParallelism() int { return max(sys.NumCPU(), 4) }

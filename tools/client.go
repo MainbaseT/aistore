@@ -1,6 +1,6 @@
 // Package tools provides common tools and utilities for all unit and integration tests
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tools
 
@@ -64,6 +64,7 @@ type PutObjectsArgs struct {
 	CksumType string
 	ObjSize   uint64
 	ObjCnt    int
+	ObjNameLn int
 	WorkerCnt int
 	FixedSize bool
 	Ordered   bool // true - object names make sequence, false - names are random
@@ -75,7 +76,7 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 		defer wg.Done()
 	}
 	if !silent {
-		fmt.Printf("DEL: %s\n", object)
+		tlog.Logf("DEL: %s\n", object)
 	}
 	bp := BaseAPIParams(proxyURL)
 	err := api.DeleteObject(bp, bck, object)
@@ -87,7 +88,8 @@ func Del(proxyURL string, bck cmn.Bck, object string, wg *sync.WaitGroup, errCh 
 
 func CheckObjIsPresent(proxyURL string, bck cmn.Bck, objName string) bool {
 	bp := BaseAPIParams(proxyURL)
-	_, err := api.HeadObject(bp, bck, objName, apc.FltPresent, true /*silent*/)
+	hargs := api.HeadArgs{FltPresence: apc.FltPresent, Silent: true}
+	_, err := api.HeadObject(bp, bck, objName, hargs)
 	return err == nil
 }
 
@@ -106,7 +108,7 @@ func Put(proxyURL string, bck cmn.Bck, objName string, reader readers.Reader, er
 		return
 	}
 	if errCh == nil {
-		fmt.Printf("Failed to PUT %s: %v (nil error channel)\n", bck.Cname(objName), err)
+		tlog.Logf("Failed to PUT %s: %v (nil error channel)\n", bck.Cname(objName), err)
 	} else {
 		errCh <- err
 	}
@@ -129,7 +131,7 @@ func ListObjectNames(proxyURL string, bck cmn.Bck, prefix string, objectCountLim
 		msg = &apc.LsoMsg{Prefix: prefix}
 	)
 	if cached {
-		msg.Flags = apc.LsObjCached
+		msg.Flags = apc.LsCached
 	}
 	data, err := api.ListObjects(bp, bck, msg, api.ListArgs{Limit: objectCountLimit})
 	if err != nil {
@@ -148,7 +150,7 @@ func GetPrimaryURL() string {
 	if err == nil {
 		return primary.URL(cmn.NetPublic)
 	}
-	fmt.Printf("Warning: GetPrimaryProxy [%v] - retrying once...\n", err)
+	tlog.Logf("Warning: GetPrimaryProxy [%v] - retrying once...\n", err)
 	if currSmap == nil {
 		time.Sleep(time.Second)
 		primary, err = GetPrimaryProxy(proxyURLReadOnly)
@@ -161,7 +163,7 @@ func GetPrimaryURL() string {
 		}
 	}
 	if err != nil {
-		fmt.Printf("Warning: GetPrimaryProxy [%v] - returning global %q\n", err, proxyURLReadOnly)
+		tlog.Logf("Warning: GetPrimaryProxy [%v] - returning global %q\n", err, proxyURLReadOnly)
 		return proxyURLReadOnly
 	}
 	return primary.URL(cmn.NetPublic)
@@ -333,7 +335,8 @@ func PutRandObjs(args PutObjectsArgs) ([]string, int, error) {
 		if args.Ordered {
 			objNames = append(objNames, path.Join(args.ObjPath, strconv.Itoa(i)))
 		} else {
-			objNames = append(objNames, path.Join(args.ObjPath, trand.String(16)))
+			nameLen := cos.NonZero(args.ObjNameLn, 16)
+			objNames = append(objNames, path.Join(args.ObjPath, trand.String(nameLen)))
 		}
 	}
 	chunkSize := (len(objNames) + workerCnt - 1) / workerCnt
@@ -418,7 +421,7 @@ func GetObjectAtime(t *testing.T, bp api.BaseParams, bck cmn.Bck, object, timeFo
 		}
 	}
 
-	tassert.Fatalf(t, false, "Cannot find %s in bucket %s", object, bck)
+	tassert.Fatalf(t, false, "Cannot find %s in bucket %s", object, bck.String())
 	return time.Time{}, ""
 }
 
@@ -467,11 +470,11 @@ func BaseAPIParams(urls ...string) api.BaseParams {
 	return api.BaseParams{Client: gctx.Client, URL: u, Token: LoggedUserToken, UA: "tools/test"}
 }
 
-func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList []string) {
+func EvictObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst []string) {
 	bp := BaseAPIParams(proxyURL)
-	xid, err := api.EvictMultiObj(bp, bck, objList, "" /*template*/)
+	xid, err := api.EvictMultiObj(bp, bck, lst, "" /*template*/)
 	if err != nil {
-		t.Errorf("Evict bucket %s failed, err = %v", bck, err)
+		t.Errorf("Evict bucket %s failed: %v", bck.String(), err)
 	}
 
 	args := xact.ArgsMsg{ID: xid, Kind: apc.ActEvictObjects, Timeout: EvictPrefetchTimeout}
@@ -656,6 +659,20 @@ func SetClusterConfigUsingMsg(t *testing.T, toUpdate *cmn.ConfigToSet) {
 	bp := BaseAPIParams(proxyURL)
 	err := api.SetClusterConfigUsingMsg(bp, toUpdate, false /*transient*/)
 	tassert.CheckFatal(t, err)
+}
+
+func EnableRebalance(t *testing.T) {
+	proxyURL := GetPrimaryURL()
+	bp := BaseAPIParams(proxyURL)
+	err := api.EnableRebalance(bp)
+	tassert.CheckError(t, err)
+}
+
+func DisableRebalance(t *testing.T) {
+	proxyURL := GetPrimaryURL()
+	bp := BaseAPIParams(proxyURL)
+	err := api.DisableRebalance(bp)
+	tassert.CheckError(t, err)
 }
 
 func SetRemAisConfig(t *testing.T, nvs cos.StrKVs) {

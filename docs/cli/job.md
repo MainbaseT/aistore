@@ -37,11 +37,19 @@ Rest of this document covers starting, stopping, and otherwise managing job kind
 ### See also
 
 - [static descriptors (source code)](https://github.com/NVIDIA/aistore/blob/main/xact/api.go#L108)
-- [`xact` package README](/xact/README.md).
+- [`xact` package README](https://github.com/NVIDIA/aistore/blob/main/xact/README.md).
 - [`batch jobs`](/docs/batch.md)
 - [CLI: `dsort` (distributed shuffle)](/docs/cli/dsort.md)
 - [CLI: `download` from any remote source](/docs/cli/download.md)
 - [built-in `rebalance`](/docs/rebalance.md)
+
+* And more:
+  - [`ais etl`](/docs/cli/etl.md)
+  - [`ais prefetch`](/docs/cli/object.md)
+  - [`ais cp`](#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
+  - [multi-object operations](/docs/cli/object.md#operations-on-lists-and-ranges-and-entire-buckets)
+  - [reading, writing, and listing archives](/docs/cli/object.md)
+  - [copying buckets](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets)
 
 # `ais job` command
 
@@ -60,7 +68,7 @@ NAME:
    ais job - monitor, query, start/stop and manage jobs and eXtended actions (xactions)
 
 USAGE:
-   ais job command [command options] [arguments...]
+   ais job command [arguments...] [command options]
 
 COMMANDS:
    start  run batch job
@@ -82,7 +90,7 @@ Notice, though, that `start`, stop`, and `wait` (verbs) have shorter versions, e
 ## Table of Contents
 - [Start job](#start-job)
 - [Stop job](#stop-job)
-- [Show job statistics](#show-job-statistics)
+- [Show job](#show-job)
   - [Show extended statistics](#show-extended-statistics)
 - [Wait for job](#wait-for-job)
 - [Distributed Sort](#distributed-sort)
@@ -118,9 +126,33 @@ $ ais start lru --buckets ais://buck1,aws://buck2 -f
 
 ## Stop job
 
-`ais stop [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
-
 Stop a single job or multiple jobs.
+
+```console
+$ ais stop --help
+NAME:
+   ais stop - (alias for "job stop") terminate a single batch job or multiple jobs, e.g.:
+     - 'stop tco-cysbohAGL'       - terminate a given (multi-object copy/transform) job identified by its unique ID;
+     - 'stop copy-listrange'      - terminate all multi-object copies;
+     - 'stop copy-objects'        - same as above (using display name);
+     - 'stop list'                - stop all list-objects jobs;
+     - 'stop ls'                  - same as above;
+     - 'stop prefetch-listrange'  - stop all prefetch jobs;
+     - 'stop prefetch'            - same as above;
+     - 'stop g731 --force'        - forcefully abort global rebalance g731 (advanced usage only);
+     - 'stop --all'               - terminate all running jobs
+   press <TAB-TAB> to select, '--help' for more options.
+
+USAGE:
+   ais stop [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]
+
+OPTIONS:
+   --all          all running jobs
+   --regex value  regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   --force, -f    force execution of the command (caution: advanced usage only)
+   --yes, -y      assume 'yes' to all questions
+   --help, -h     show help
+```
 
 ### Examples stopping a single job:
 
@@ -151,9 +183,51 @@ $ ais stop lru
 Stopped LRU eviction.
 ```
 
-## Show job statistics
+## Show job
 
-`ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET]`
+`ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]`
+
+```console
+$ ais show job --help
+
+NAME:
+   ais show job - Show running and/or finished jobs
+     - 'show job tco-cysbohAGL'              - show a given (multi-object copy/transform) job identified by its unique ID;
+     - 'show job copy-listrange'             - show all running multi-object copies;
+     - 'show job copy-objects'               - same as above (using display name);
+     - 'show job copy-objects --all'         - show both running and already finished (or stopped) multi-object copies;
+     - 'show job list'                       - show all running list-objects jobs;
+     - 'show job ls'                         - same as above;
+     - 'show job ls --refresh 10'            - same as above with periodic _refreshing_ every 10 seconds;
+     - 'show job ls --refresh 10 --count 4'  - same as above but only for the first four 10-seconds intervals;
+     - 'show job prefetch-listrange'         - show all running prefetch jobs;
+     - 'show job prefetch'                   - same as above;
+     - 'show job prefetch --refresh 1m'      - show all running prefetch jobs at 1 minute intervals (until Ctrl-C);
+     - 'show job --all'                      - show absolutely all jobs, running and already finished
+   press <TAB-TAB> to select, '--help' for more options.
+
+USAGE:
+   ais show job [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]
+
+OPTIONS:
+   --all             Include all jobs: running, finished, and aborted
+   --count value     Used together with '--refresh' to limit the number of generated reports, e.g.:
+                      '--refresh 10 --count 5' - run 5 times with 10s interval (default: 0)
+   --date-time       Override the default hh:mm:ss (hours, minutes, seconds) time format - include calendar date as well
+   --json, -j        JSON input/output
+   --log value       Filename to log metrics (statistics)
+   --no-headers, -H  Display tables without headers
+   --progress        Show progress bar(s) and progress of execution in real time
+   --refresh value   Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                     valid time units: ns, us (or µs), ms, s (default), m, h
+   --regex value     Regular expression to select jobs by name, kind, or description, e.g.: --regex "ec|mirror|elect"
+   --units value     Show statistics and/or parse command-line specified sizes using one of the following units of measurement:
+                     iec - IEC format, e.g.: KiB, MiB, GiB (default)
+                     si  - SI (metric) format, e.g.: KB, MB, GB
+                     raw - do not convert to (or from) human-readable format
+   --verbose, -v     Show extended statistics
+   --help, -h        Show help
+```
 
 You can show jobs by any combination of the optional (filtering) arguments: NAME, JOB_ID, etc..
 
@@ -188,6 +262,7 @@ The extended statistics may give a hint what is the possible bottleneck:
 - low values in `QUEUE`, and `ENC TIME` close to `AVG TIME` may mean that the local hardware is overloaded: either local drives or CPUs are overloaded.
 
 #### Show EC Restoring Statistics
+
 Show information about EC restore requests.
 
 The output contains a few extra columns:
@@ -269,9 +344,23 @@ Wait for the specified job to finish.
 
 ### Options
 
-| Flag | Type | Description | Default |
-| --- | --- | --- | --- |
-| `--refresh` | `duration` | Refresh interval - time duration between reports. The usual unit suffixes are supported and include `m` (for minutes), `s` (seconds), `ms` (milliseconds) | ` ` |
+```console
+$ ais wait --help
+
+NAME:
+   ais wait - (alias for "job wait") wait for a specific batch job to complete (press <TAB-TAB> to select, '--help' for more options)
+
+USAGE:
+   ais wait [NAME] [JOB_ID] [NODE_ID] [BUCKET] [command options]
+
+OPTIONS:
+   --progress       Show progress bar(s) and progress of execution in real time
+   --refresh value  Time interval for continuous monitoring; can be also used to update progress bar (at a given interval);
+                    valid time units: ns, us (or µs), ms, s (default), m, h
+   --timeout value  Maximum time to wait for a job to finish; if omitted: wait forever or until Ctrl-C;
+                    valid time units: ns, us (or µs), ms, s (default), m, h
+   --help, -h       Show help
+```
 
 ## Distributed Sort
 
@@ -285,4 +374,4 @@ Run [dSort](/docs/dsort.md).
 `ais start download` or `ais start download`
 
 Run the AIS [Downloader](/docs/README.md).
-[Further reference for this command can be found here.](downloader.md)
+[Further reference for this command can be found here.](/docs/downloader.md)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -19,12 +20,49 @@ const (
 	_apndFlags = os.O_APPEND | os.O_WRONLY
 )
 
+type errBdir struct {
+	err   error
+	cname string
+}
+
+func (e *errBdir) Error() string {
+	if os.IsNotExist(e.err) {
+		return e.cname + ": missing bdir (bucket exists?)"
+	}
+	return fmt.Sprintf("%s: missing bdir [%v]", e.cname, e.err)
+}
+
 //
 // open
 //
 
-func (lom *LOM) Open() (cos.LomReader, error) {
-	return os.Open(lom.FQN)
+// open read-only, return os.File
+func (lom *LOM) OpenFile() (fh *os.File, _ error) {
+	reader, err := lom.Open()
+	if err != nil {
+		return nil, err
+	}
+	fh = reader.(*os.File)
+	return fh, nil
+}
+
+// same as above but return a reader
+func (lom *LOM) Open() (fh cos.LomReader, err error) {
+	fh, err = os.Open(lom.FQN)
+	switch {
+	case err == nil:
+		return fh, nil
+	case os.IsNotExist(err):
+		if e := lom._checkBdir(); e != nil {
+			err = e
+		}
+		return nil, err
+
+	// case cos.IsErrFntl(err)
+
+	default:
+		return nil, err
+	}
 }
 
 //
@@ -38,24 +76,61 @@ func (lom *LOM) Create() (cos.LomWriter, error) {
 
 func (lom *LOM) CreateWork(wfqn string) (cos.LomWriter, error) { return lom._cf(wfqn) } // -> lom
 func (lom *LOM) CreatePart(wfqn string) (*os.File, error)      { return lom._cf(wfqn) } // TODO: differentiate
-func (lom *LOM) CreateSlice(wfqn string) (*os.File, error)     { return lom._cf(wfqn) } // TODO: ditto
+func (lom *LOM) CreateSlice(wfqn string) (*os.File, error)     { return lom._cf(wfqn) } // --/--
 
 func (lom *LOM) _cf(fqn string) (fh *os.File, err error) {
 	fh, err = os.OpenFile(fqn, _openFlags, cos.PermRWR)
-	if err == nil || !os.IsNotExist(err) {
+	if err == nil {
+		return fh, nil
+	}
+
+	switch {
+	case cos.IsErrFntl(err):
+		// - when creating LOM: fixup fntl in place
+		// - otherwise, return fntl error (with an implied requirement that caller must handle it)
+		if fqn != lom.FQN {
+			return nil, err
+		}
+		var (
+			short = lom.ShortenFntl()
+			saved = lom.PushFntl(short)
+		)
+		fh, err = os.OpenFile(short[0], _openFlags, cos.PermRWR)
+		if err == nil {
+			lom.md.lid = lom.md.lid.setlmfl(lmflFntl)
+			lom.SetCustomKey(cmn.OrigFntl, saved[0])
+		} else {
+			debug.Assert(!cos.IsErrFntl(err))
+			lom.PopFntl(saved)
+		}
 		return fh, err
+	case !os.IsNotExist(err):
+		T.FSHC(err, lom.Mountpath(), "")
+		return nil, err
 	}
 
 	// slow path: create sub-directories
-	bdir := lom.mi.MakePathBck(lom.Bucket())
-	if err = cos.Stat(bdir); err != nil {
-		return nil, fmt.Errorf("%s (bdir %s): %w", lom, bdir, err)
+	if err = lom._checkBdir(); err != nil {
+		return nil, err
 	}
 	fdir := filepath.Dir(fqn)
 	if err = cos.CreateDir(fdir); err != nil {
 		return nil, err
 	}
 	return os.OpenFile(fqn, _openFlags, cos.PermRWR)
+}
+
+func (lom *LOM) _checkBdir() (err error) {
+	bdir := lom.mi.MakePathBck(lom.Bucket())
+	if err = cos.Stat(bdir); err == nil {
+		return nil
+	}
+	err = &errBdir{cname: lom.Cname(), err: err}
+	bmd := T.Bowner().Get()
+	if _, present := bmd.Get(&lom.bck); present {
+		err = fmt.Errorf("%w [%v]", syscall.ENOTDIR, err)
+	}
+	return err
 }
 
 // append
@@ -68,12 +143,9 @@ func (*LOM) AppendWork(wfqn string) (fh cos.LomWriter, err error) {
 // remove
 //
 
-func (lom *LOM) RemoveMain() (err error) {
-	err = cos.RemoveFile(lom.FQN)
-	if os.IsNotExist(err) {
-		err = nil
-	}
-	return err
+func (lom *LOM) RemoveMain() error {
+	return cos.RemoveFile(lom.FQN)
+	// if err != nil && cos.IsErrFntl(err)
 }
 
 func (lom *LOM) RemoveObj(force ...bool) (err error) {
@@ -87,7 +159,7 @@ func (lom *LOM) RemoveObj(force ...bool) (err error) {
 	lom.Uncache()
 	err = lom.RemoveMain()
 	for copyFQN := range lom.md.copies {
-		if erc := cos.RemoveFile(copyFQN); erc != nil && !os.IsNotExist(erc) {
+		if erc := cos.RemoveFile(copyFQN); erc != nil && !os.IsNotExist(erc) && err == nil {
 			err = erc
 		}
 	}
@@ -110,10 +182,31 @@ func (lom *LOM) RenameToMain(wfqn string) error {
 func (lom *LOM) RenameFinalize(wfqn string) error {
 	bdir := lom.mi.MakePathBck(lom.Bucket())
 	if err := cos.Stat(bdir); err != nil {
-		return fmt.Errorf("%s(bdir: %s): %w", lom, bdir, err)
+		return &errBdir{cname: lom.Cname(), err: err}
 	}
-	if err := lom.RenameToMain(wfqn); err != nil {
+	err := lom.RenameToMain(wfqn)
+	switch {
+	case err == nil:
+		return nil
+	case cos.IsErrMv(err):
+		return err
+	case cos.IsErrFntl(err):
+		// - when finalizing LOM: fixup fntl in place
+		var (
+			short = lom.ShortenFntl()
+			saved = lom.PushFntl(short)
+		)
+		err = lom.RenameToMain(wfqn)
+		if err == nil {
+			lom.md.lid = lom.md.lid.setlmfl(lmflFntl)
+			lom.SetCustomKey(cmn.OrigFntl, saved[0])
+		} else {
+			debug.Assert(!cos.IsErrFntl(err))
+			lom.PopFntl(saved)
+		}
+		return err
+	default:
+		T.FSHC(err, lom.Mountpath(), wfqn)
 		return cmn.NewErrFailedTo(T, "finalize", lom.Cname(), err)
 	}
-	return nil
 }

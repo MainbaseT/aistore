@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -24,11 +24,15 @@ import (
 type (
 	reverseProxy struct {
 		cloud   *httputil.ReverseProxy // unmodified GET requests => storage.googleapis.com
-		nodes   sync.Map               // map of reverse proxies keyed by node DaemonIDs
+		nodes   sync.Map               // map [SID => reverse proxy instance]
+		removed struct {
+			m  meta.NodeMap // map [SID => self-disabled node]
+			mu sync.Mutex
+		}
 		primary struct {
 			rp  *httputil.ReverseProxy
 			url string
-			sync.Mutex
+			mu  sync.Mutex
 		}
 	}
 	singleRProxy struct {
@@ -38,8 +42,10 @@ type (
 )
 
 // forward control plane request to the current primary proxy
-// return: forf (forwarded or failed) where forf = true means exactly that: forwarded or failed
-func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, s string, origBody ...[]byte) (forf bool) {
+// returns:
+// - true when forwarded or failed
+// - false otherwise (ie., when self is primary and can go ahead to execute)
+func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, s string, origBody ...[]byte) bool {
 	var (
 		body []byte
 		smap = p.owner.smap.get()
@@ -51,15 +57,15 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 		} else {
 			p.writeErrStatusf(w, r, http.StatusServiceUnavailable, "%s %q", errmsg, s)
 		}
-		return true
+		return true // fail
 	}
 	if p.settingNewPrimary.Load() {
 		p.writeErrStatusf(w, r, http.StatusServiceUnavailable,
 			"%s is in transition, cannot process the request", p.si)
-		return true
+		return true // fail
 	}
 	if smap.isPrimary(p.si) {
-		return
+		return false // ok, can execute
 	}
 	// We must **not** send any request body when doing HEAD request.
 	// Otherwise, the request can be rejected and terminated.
@@ -71,7 +77,7 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 		}
 	}
 	primary := &p.rproxy.primary
-	primary.Lock()
+	primary.mu.Lock()
 	if primary.url != smap.Primary.PubNet.URL {
 		primary.url = smap.Primary.PubNet.URL
 		uparsed, err := url.Parse(smap.Primary.PubNet.URL)
@@ -81,7 +87,7 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 		primary.rp.Transport = rpTransport(config)
 		primary.rp.ErrorHandler = p.rpErrHandler
 	}
-	primary.Unlock()
+	primary.mu.Unlock()
 	if len(body) > 0 {
 		debug.AssertFunc(func() bool {
 			l, _ := io.Copy(io.Discard, r.Body)
@@ -94,22 +100,27 @@ func (p *proxy) forwardCP(w http.ResponseWriter, r *http.Request, msg *apc.ActMs
 	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		pname := smap.Primary.StringEx()
 		if msg != nil {
-			nlog.Infof("%s: forwarding \"%s:%s\" to the primary %s", p, msg.Action, s, pname)
+			nlog.Infoln(p.String(), "forwarding [", msg.Action, s, "] to the primary", pname)
 		} else {
-			nlog.Infof("%s: forwarding %q to the primary %s", p, s, pname)
+			nlog.Infoln(p.String(), "forwarding [", s, "] to the primary", pname)
 		}
 	}
 	primary.rp.ServeHTTP(w, r)
-	return true
+	return true // forwarded
 }
 
 func rpTransport(config *cmn.Config) *http.Transport {
 	var (
 		err       error
-		transport = cmn.NewTransport(cmn.TransportArgs{Timeout: config.Client.Timeout.D()})
+		transport = cmn.NewTransport(cmn.TransportArgs{
+			Timeout:          config.Client.Timeout.D(),
+			IdleConnTimeout:  config.Net.HTTP.IdleConnTimeout.D(),
+			IdleConnsPerHost: config.Net.HTTP.MaxIdleConnsPerHost,
+			MaxIdleConns:     config.Net.HTTP.MaxIdleConns,
+		})
 	)
 	if config.Net.HTTP.UseHTTPS {
-		transport.TLSClientConfig, err = cmn.NewTLS(config.Net.HTTP.ToTLS())
+		transport.TLSClientConfig, err = cmn.NewTLS(config.Net.HTTP.ToTLS(), true /*intra-cluster*/)
 		if err != nil {
 			cos.ExitLog(err)
 		}
@@ -141,6 +152,9 @@ func (p *proxy) reverseNodeRequest(w http.ResponseWriter, r *http.Request, si *m
 	p.reverseRequest(w, r, si.ID(), parsedURL)
 }
 
+// usage:
+// 1. primary => node in the cluster
+// 2. primary => remais
 func (p *proxy) reverseRequest(w http.ResponseWriter, r *http.Request, nodeID string, parsedURL *url.URL) {
 	rproxy := p.rproxy.loadOrStore(nodeID, parsedURL, p.rpErrHandler)
 	rproxy.ServeHTTP(w, r)
@@ -220,7 +234,8 @@ func (rp *reverseProxy) init() {
 }
 
 func (rp *reverseProxy) loadOrStore(uuid string, u *url.URL,
-	errHdlr func(w http.ResponseWriter, r *http.Request, err error)) *httputil.ReverseProxy {
+	errHdlr func(w http.ResponseWriter, r *http.Request, err error),
+) *httputil.ReverseProxy {
 	revProxyIf, exists := rp.nodes.Load(uuid)
 	if exists {
 		shrp := revProxyIf.(*singleRProxy)

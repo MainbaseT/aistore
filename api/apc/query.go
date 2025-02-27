@@ -1,19 +1,21 @@
 // Package apc: API control messages and constants
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package apc
 
-// URL Query "?name1=val1&name2=..."
-// User query params.
+// see related "GET(what)" set of APIs: api/cluster and api/daemon
 const (
 	QparamWhat = "what" // "smap" | "bmd" | "config" | "stats" | "xaction" ... (enum below)
 
 	QparamProps = "props" // e.g. "checksum, size"|"atime, size"|"cached"|"bucket, size"| ...
 
-	QparamUUID    = "uuid"     // xaction
-	QparamJobID   = "jobid"    // job
-	QparamETLName = "etl_name" // etl
+	QparamUUID  = "uuid"  // xaction
+	QparamJobID = "jobid" // job
+
+	// etl
+	QparamETLName          = "etl_name"
+	QparamETLTransformArgs = "etl_args"
 
 	QparamRegex      = "regex"       // dsort: list regex
 	QparamOnlyActive = "only_active" // dsort: list only active
@@ -127,12 +129,18 @@ const (
 	// deleted objects
 	QparamSync = "synchronize"
 
+	// validate (ie., recompute and check) in-cluster object's checksums
+	QparamValidateCksum = "validate-checksum"
+
 	// when true, skip nlog.Error and friends
 	// (to opt-out logging too many messages and/or benign warnings)
 	QparamSilent = "sln"
 
 	// (see api.AttachMountpath vs. LocalConfig.FSP)
 	QparamMpathLabel = "mountpath_label"
+
+	// Request to restore an object
+	QparamECObject = "object"
 )
 
 // QparamFltPresence enum.
@@ -169,17 +177,18 @@ const (
 
 // health
 const (
-	QparamHealthReadiness = "readiness" // to be used by external watchdogs (e.g. K8s)
-	QparamAskPrimary      = "apr"       // true: the caller is directing health request to primary
-	QparamPrimaryReadyReb = "prr"       // true: check whether primary is ready to start rebalancing cluster
+	QparamHealthReadiness = "readiness" // used by external watchdogs (K8s)
+	QparamHealthReady     = QparamHealthReadiness + "=true"
+
+	QparamAskPrimary      = "apr" // true: the caller is directing health request to primary
+	QparamPrimaryReadyReb = "prr" // true: check whether primary is ready to start rebalancing cluster
 )
 
 // Internal query params.
 const (
 	QparamProxyID          = "pid" // ID of the redirecting proxy.
-	QparamPrimaryCandidate = "can" // ID of the candidate for the primary proxy.
-	QparamPrepare          = "prp" // true: request belongs to the "prepare" phase of the primary proxy election
-	QparamNonElectable     = "nel" // true: proxy is non-electable for the primary role
+	QparamPrimaryCandidate = "can" // candidate for the primary proxy (voting ID, force URL)
+	QparamPrepare          = "prp" // 2-phase commit where 'true' corresponds to 'begin'; usage: (primary election; set-primary)
 	QparamUnixTime         = "utm" // Unix time since 01/01/70 UTC (nanoseconds)
 	QparamIsGFNRequest     = "gfn" // true if the request is a Get-From-Neighbor
 	QparamRebStatus        = "rbs" // true: get detailed rebalancing status
@@ -209,38 +218,48 @@ const (
 
 // QparamWhat enum.
 const (
-	// cluster meta
+	// cluster metadata
 	WhatSmap = "smap"
 	WhatBMD  = "bmd"
+
 	// config
-	WhatNodeConfig    = "config" // query specific node for (cluster config + overrides, local config)
-	WhatClusterConfig = "cluster_config"
+	WhatNodeConfig    = "config"         // query specific node for (cluster config + overrides, local config)
+	WhatClusterConfig = "cluster_config" // as the name implies; identical (compressed, checksummed, versioned) copy on each node
+
+	// configured backends
+	WhatBackends = "backends"
 
 	// stats and status
-	WhatNodeStatsV322          = "stats"  // [ backward compatibility ]
-	WhatNodeStatsAndStatusV322 = "status" // [ ditto ]
-	WhatNodeStats              = "node_stats"
-	WhatNodeStatsAndStatus     = "node_status"
+	WhatNodeStats          = "node_stats"  // redundant
+	WhatNodeStatsAndStatus = "node_status" // current
+
+	WhatDiskRWUtilCap = "disk" // read/write stats, disk utilization, capacity
 
 	WhatMetricNames = "metrics"
-	WhatDiskStats   = "disk"
+
 	// assorted
 	WhatMountpaths = "mountpaths"
 	WhatRemoteAIS  = "remote"
 	WhatSmapVote   = "smapvote"
 	WhatSysInfo    = "sysinfo"
 	WhatTargetIPs  = "target_ips" // comma-separated list of all target IPs (compare w/ GetWhatSnode)
+
 	// log
 	WhatLog = "log"
+
 	// xactions
 	WhatOneXactStatus   = "status"      // IC status by uuid (returns a single matching xaction or none)
 	WhatAllXactStatus   = "status_all"  // ditto - all matching xactions
 	WhatXactStats       = "getxstats"   // stats: xaction by uuid
 	WhatQueryXactStats  = "qryxstats"   // stats: all matching xactions
 	WhatAllRunningXacts = "running_all" // e.g. e.g.: put-copies[D-ViE6HEL_j] list[H96Y7bhR2s] ...
+
 	// internal
 	WhatSnode    = "snode"
 	WhatICBundle = "ic_bundle"
+
+	// tls
+	WhatCertificate = "tls_certificate"
 )
 
 // QparamLogSev enum.

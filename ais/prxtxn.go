@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -18,6 +18,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
@@ -31,7 +32,7 @@ import (
 type txnCln struct {
 	p        *proxy
 	smap     *smapX
-	msg      *aisMsg
+	msg      *actMsgExt
 	uuid     string
 	path     string
 	req      cmn.HreqArgs
@@ -208,7 +209,7 @@ func (p *proxy) createBucket(msg *apc.ActMsg, bck *meta.Bck, remoteHdr http.Head
 		if bck.IsCloud() {
 			return cmn.NewErrNotImpl("create", bck.Provider+"(cloud) bucket")
 		}
-		if bck.IsHTTP() {
+		if bck.IsHT() {
 			return cmn.NewErrNotImpl("create", "bucket for HTTP provider")
 		}
 		// can do remote ais though
@@ -375,6 +376,12 @@ func (p *proxy) setBprops(msg *apc.ActMsg, bck *meta.Bck, nprops *cmn.Bprops) (s
 		return "", cmn.NewErrBckNotFound(bck.Bucket())
 	}
 	bck.Props = bprops
+
+	if nprops.EC.Enabled && cmn.Rom.EcStreams() > 0 {
+		if err := p._onEC(mono.NanoTime()); err != nil {
+			return "", err
+		}
+	}
 
 	// 2. begin
 	switch msg.Action {
@@ -639,7 +646,7 @@ func (p *proxy) tcb(bckFrom, bckTo *meta.Bck, msg *apc.ActMsg, dryRun bool) (xid
 }
 
 // transform or copy a list or a range of objects
-func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.ActMsg, tcomsg *cmn.TCObjsMsg) (string, error) {
+func (p *proxy) tcobjs(bckFrom, bckTo *meta.Bck, config *cmn.Config, msg *apc.ActMsg, tcomsg *cmn.TCOMsg) (string, error) {
 	// 1. prep
 	var (
 		_, existsTo = p.owner.bmd.get().Get(bckTo) // cleanup on fail: destroy if created
@@ -1133,7 +1140,7 @@ func (p *proxy) makeNewBckProps(bck *meta.Bck, propsToUpdate *cmn.BpropsToSet, c
 		return
 	}
 	err = nprops.Validate(targetCnt)
-	if cmn.IsErrSoft(err) && propsToUpdate.Force {
+	if cmn.IsErrWarning(err) && propsToUpdate.Force {
 		nlog.Warningln("Ignoring soft error:", err)
 		err = nil
 	}

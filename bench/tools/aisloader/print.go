@@ -1,6 +1,6 @@
 // Package aisloader
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 
 package aisloader
@@ -318,19 +318,19 @@ func printRunParams(p *params) {
 		d = "-"
 	}
 	b, err := jsoniter.MarshalIndent(struct {
-		Seed          int64  `json:"seed,string"`
+		StatsInterval string `json:"stats interval"`
 		URL           string `json:"proxy"`
 		Bucket        string `json:"bucket"`
 		Provider      string `json:"provider"`
 		Namespace     string `json:"namespace"`
 		Duration      string `json:"duration"`
+		Backing       string `json:"backed by"`
 		MaxPutBytes   int64  `json:"PUT upper bound,string"`
-		PutPct        int    `json:"% PUT"`
 		MinSize       int64  `json:"minimum object size (bytes)"`
 		MaxSize       int64  `json:"maximum object size (bytes)"`
 		NumWorkers    int    `json:"# workers"`
-		StatsInterval string `json:"stats interval"`
-		Backing       string `json:"backed by"`
+		PutPct        int    `json:"% PUT"`
+		Seed          int64  `json:"seed,string"`
 		Cleanup       bool   `json:"cleanup"`
 	}{
 		Seed:          p.seed,

@@ -1,4 +1,4 @@
-FROM docker.io/golang:1.22 AS builder
+FROM docker.io/golang:1.23 AS builder
 
 ARG mode
 ARG providers
@@ -29,6 +29,7 @@ RUN apt-get clean && apt-get update &&\
       make &&\
   apt-get -y clean all
 
+COPY deploy/dev/utils.sh /etc/ais/utils.sh
 COPY deploy/dev/local/aisnode_config.sh /etc/ais/aisnode_config.sh
 COPY deploy/conf/limits.conf /etc/security/limits.conf
 

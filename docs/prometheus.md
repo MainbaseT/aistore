@@ -7,11 +7,19 @@ redirect_from:
  - /docs/prometheus.md/
 ---
 
+**August 2024 UPDATES**:
+* added [complete reference](/docs/metrics-reference.md) that includes all supported metric names (both internal and visible externally), their respective types, and descriptions:
+* building `aisnode` with StatsD requires the corresponding build tag; build-wise, Prometheus is, effectively, the default.
+* for details, see related: [package `stats`](/docs/environment-vars.md#package-stats)
+
+* [Reference: all supported metrics](/docs/metrics-reference.md)
+
 ## Monitoring AIStore with Prometheus
 
-AIStore tracks a growing list of performance counters, utilization percentages, latency and throughput metrics, transmitted and received stats (total bytes and numbers of objects), error counters, and more.
+AIStore tracks a growing list of performance counters, utilization percentages, latency and throughput metrics, transmitted and received stats (total bytes and numbers of objects), error counters and more.
 
-Viewership is equally supported via:
+Full observability is supported using a variety of tools that include:
+
 * AIS node logs
 * [CLI](/docs/cli.md), and specifically
 * [`ais show cluster stats`](/docs/cli/cluster.md) command
@@ -28,57 +36,69 @@ This document mostly talks about the "Prometheus" option. Other related document
 
 AIStore is a fully compliant [Prometheus exporter](https://prometheus.io/docs/instrumenting/writing_exporters/) that natively supports [Prometheus](https://prometheus.io/) stats collection. There's no special configuration - the only thing required to enable the corresponding integration is letting AIStore know whether to publish its stats via StatsD **or** Prometheus.
 
-The corresponding binary choice between StatsD and Prometheus is a **deployment-time** switch that is a single environment variable: **AIS_PROMETHEUS**. When a starting-up AIS node (gateway or storage target) sees `AIS_PROMETHEUS` in the environment it registers all its metric descriptions (names, labels, and helps) with Prometheus and provides HTTP endpoint `/metrics` for subsequent collection (aka "scraping") by Prometheus.
+> The corresponding binary choice between StatsD and Prometheus is a **build-time** switch that is a single build tag: `statsd`.
 
-> With no `AIS_PROMETHEUS` in the environment, AIS nodes default to StatsD.
+> For the complete list of supported build tags, please see [conditional linkage](/docs/build_tags.md).
 
-Here's a simplified example:
+One immediate (low-level) way to view supported Prometheus metrics in action would be `curl`:
 
 ```console
-$ AIS_PROMETHEUS=true aisnode -config=/etc/ais/ais.json -local_config=/etc/ais/ais_local.json -role=target
+$ curl http://<aistore-node-ip-or-hostname>:<port>/metrics
+
+## or, possibly:
+
+$ curl https://<aistore-node-ip-or-hostname>:<port>/metrics
+```
+
+When a starting-up AIS node (gateway or storage target) is built with Prometheus support (ie., **without** build tag `statsd`) it will:
+
+* register all its metric descriptions (names, labels, and helps) with Prometheus, and
+* provide HTTP endpoint `/metrics` for subsequent collection (aka "scraping") by Prometheus.
+
+Here's a few examples:
+
+### Simplified Examples
+
+```console
+$ aisnode -config=/etc/ais/ais.json -local_config=/etc/ais/ais_local.json -role=target
 
 # Assuming the target with hostname "hostname" listens on port 8081:
 $ curl http://hostname:8081/metrics | grep ais
 
 # A sample output follows below (note the metric names that must be self-explanatory):
 
-  # TYPE ais_target_DFIltrTgz_disk_sda_avg_rsize gauge
-  ais_target_DFIltrTgz_disk_sda_avg_rsize 23560
-  # HELP ais_target_DFIltrTgz_disk_sda_avg_wsize average write size (bytes)
-  # TYPE ais_target_DFIltrTgz_disk_sda_avg_wsize gauge
-  ais_target_DFIltrTgz_disk_sda_avg_wsize 63120
-  # HELP ais_target_DFIltrTgz_disk_sda_util gauge
-  # TYPE ais_target_DFIltrTgz_disk_sda_util gauge
-  ais_target_DFIltrTgz_disk_sda_util 42
-  # HELP ais_target_DFIltrTgz_get_mbps throughput (MB/s)
-  # TYPE ais_target_DFIltrTgz_get_mbps gauge
-  ais_target_DFIltrTgz_get_mbps 72.65
-  # HELP ais_target_DFIltrTgz_get_ms latency (milliseconds)
-  # TYPE ais_target_DFIltrTgz_get_ms gauge
-  ais_target_DFIltrTgz_get_ms 2
-  # HELP ais_target_DFIltrTgz_get_n total number of operations
-  # TYPE ais_target_DFIltrTgz_get_n counter
-  ais_target_DFIltrTgz_get_n 155431
-  # HELP ais_target_DFIltrTgz_get_redir_ms latency (milliseconds)
-  # TYPE ais_target_DFIltrTgz_get_redir_ms gauge
-  ais_target_DFIltrTgz_get_redir_ms 0
-  # HELP ais_target_DFIltrTgz_kalive_ms latency (milliseconds)
-  # TYPE ais_target_DFIltrTgz_kalive_ms gauge
-  ais_target_DFIltrTgz_kalive_ms 1
-  # HELP ais_target_DFIltrTgz_lst_ms latency (milliseconds)
-  # TYPE ais_target_DFIltrTgz_lst_ms gauge
-  ais_target_DFIltrTgz_lst_ms 2
-  # HELP ais_target_DFIltrTgz_lst_n total number of operations
-  # TYPE ais_target_DFIltrTgz_lst_n counter
-  ais_target_DFIltrTgz_lst_n 120
-  # HELP ais_target_DFIltrTgz_put_ms latency (milliseconds)
-  # TYPE ais_target_DFIltrTgz_put_ms gauge
-  ais_target_DFIltrTgz_put_ms 5
-  # HELP ais_target_DFIltrTgz_put_n total number of operations
-  ...
+```console
+   # HELP ais_target_disk_avg_rsize average read size (bytes)
+   # TYPE ais_target_disk_avg_rsize gauge
+   ais_target_disk_avg_rsize{disk="nvme0n1",node_id="ClCt8081"} 4096
+   # HELP ais_target_disk_avg_wsize average write size (bytes)
+   # TYPE ais_target_disk_avg_wsize gauge
+   ais_target_disk_avg_wsize{disk="nvme0n1",node_id="ClCt8081"} 260130
+   # HELP ais_target_disk_read_mbps read bandwidth (MB/s)
+   # TYPE ais_target_put_bytes counter
+...
+   ais_target_put_bytes{node_id="ClCt8081"} 1.721761792e+10
+   # HELP ais_target_put_count total number of executed PUT(object) requests
+   # TYPE ais_target_put_count counter
+   ais_target_put_count{node_id="ClCt8081"} 1642
+   # HELP ais_target_put_ns_total PUT: total cumulative time (nanoseconds)
+   # TYPE ais_target_put_ns_total counter
+   ais_target_put_ns_total{node_id="ClCt8081"} 9.44367232e+09
+   # TYPE ais_target_state_flags gauge
+   ais_target_state_flags{node_id="ClCt8081"} 6
+   # HELP ais_target_uptime this node's uptime since its startup (seconds)
+   # TYPE ais_target_uptime gauge
+   ais_target_uptime{node_id="ClCt8081"} 210
+...
 ```
 
-References:
+And for continuous monitoring of any given subset of metrics (still _without_ using actual Prometheus installation) one could also run something like:
+
+```console
+for i in {1..99999}; do curl http://hostname:8081/metrics --silent | grep "ais_target_get_n.*node"; sleep 1; done
+```
+
+### References:
 
 * https://prometheus.io/docs/instrumenting/writing_exporters/
 * https://prometheus.io/docs/concepts/data_model/

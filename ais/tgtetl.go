@@ -1,15 +1,13 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -56,7 +54,7 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := io.ReadAll(r.Body)
+	b, err := cos.ReadAll(r.Body)
 	if err != nil {
 		t.writeErr(w, r, err)
 		return
@@ -83,7 +81,7 @@ func (t *target) handleETLPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cmn.Rom.FastV(4, cos.SmoduleETL) {
-		nlog.Infoln(t.String() + ": " + initMsg.String())
+		nlog.Infoln(t.String(), initMsg.String())
 	}
 }
 
@@ -99,7 +97,7 @@ func (t *target) handleETLGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/etl/_objects/<secret>/<uname>
+	// /v1/etl/_object/<secret>/<uname>
 	if apiItems[0] == apc.ETLObject {
 		t.getObjectETL(w, r)
 		return
@@ -152,12 +150,12 @@ func (t *target) stopETL(w http.ResponseWriter, r *http.Request, etlName string)
 	}
 }
 
-func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, lom *core.LOM) {
+func (t *target) getFromETL(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM) {
 	var (
-		comm etl.Communicator
-		err  error
+		name  = dpq.etl.name  // apc.QparamETLName
+		targs = dpq.etl.targs // apc.QparamETLTransformArgs
 	)
-	comm, err = etl.GetCommunicator(etlName)
+	comm, err := etl.GetCommunicator(name)
 	if err != nil {
 		if cos.IsErrNotFound(err) {
 			smap := t.owner.smap.Get()
@@ -169,13 +167,18 @@ func (t *target) getETL(w http.ResponseWriter, r *http.Request, etlName string, 
 		t.writeErr(w, r, err)
 		return
 	}
-	if err := comm.InlineTransform(w, r, lom); err != nil {
-		errV := cmn.NewErrETL(&cmn.ETLErrCtx{ETLName: etlName, PodName: comm.PodName(), SvcName: comm.SvcName()},
+
+	if err := comm.InlineTransform(w, r, lom, targs); err != nil {
+		errV := cmn.NewErrETL(&cmn.ETLErrCtx{ETLName: name, ETLTransformArgs: targs, PodName: comm.PodName(), SvcName: comm.SvcName()},
 			err.Error())
 		xetl := comm.Xact()
 		xetl.AddErr(errV)
 		t.writeErr(w, r, errV)
+		return
 	}
+
+	xetl := comm.Xact()
+	xetl.ObjsAdd(1, lom.Lsize())
 }
 
 func (t *target) logsETL(w http.ResponseWriter, r *http.Request, etlName string) {
@@ -197,8 +200,7 @@ func (t *target) healthETL(w http.ResponseWriter, r *http.Request, etlName strin
 		}
 		return
 	}
-	w.Header().Set(cos.HdrContentLength, strconv.Itoa(len(health)))
-	w.Write([]byte(health))
+	writeXid(w, health)
 }
 
 func (t *target) metricsETL(w http.ResponseWriter, r *http.Request, etlName string) {
@@ -234,19 +236,19 @@ func etlParseObjectReq(_ http.ResponseWriter, r *http.Request) (secret string, b
 		return
 	}
 	if objName == "" {
-		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b, uname)
+		err = fmt.Errorf("object name is missing (bucket=%s, uname=%q)", b.String(), uname)
 		return
 	}
 	bck = meta.CloneBck(&b)
 	return
 }
 
-// GET /v1/etl/_objects/<secret>/<uname>
+// GET /v1/etl/_object/<secret>/<uname>
 // Handles GET requests from ETL containers (K8s Pods).
 // Validates the secret that was injected into a Pod during its initialization
 // (see boot.go `_setPodEnv`).
 //
-// NOTE: this is an internal URL with "_objects" in its path intended to avoid
+// NOTE: this is an internal URL with "_object" in its path intended to avoid
 // conflicts with ETL name in `/v1/elts/<etl-name>/...`
 func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	secret, bck, objName, err := etlParseObjectReq(w, r)
@@ -269,7 +271,7 @@ func (t *target) getObjectETL(w http.ResponseWriter, r *http.Request) {
 	core.FreeLOM(lom)
 
 	if err != nil {
-		t._erris(w, r, dpq.silent, err, 0)
+		t._erris(w, r, err, 0, dpq.silent)
 	}
 	dpqFree(dpq)
 }
@@ -290,7 +292,7 @@ func (t *target) headObjectETL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lom := core.AllocLOM(objName)
-	ecode, err := t.objHead(w.Header(), r.URL.Query(), bck, lom)
+	ecode, err := t.objHead(r, w.Header(), r.URL.Query(), bck, lom)
 	core.FreeLOM(lom)
 	if err != nil {
 		// always silent (compare w/ httpobjhead)

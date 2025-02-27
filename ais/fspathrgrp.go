@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -14,9 +14,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
-	"github.com/NVIDIA/aistore/ext/dsort"
 	"github.com/NVIDIA/aistore/fs"
-	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/res"
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/volume"
@@ -51,7 +49,7 @@ func (g *fsprungroup) enableMpath(mpath string) (enabledMi *fs.Mountpath, err er
 
 // attachMpath adds mountpath and notifies necessary runners about the change
 // if the mountpath was actually added.
-func (g *fsprungroup) attachMpath(mpath string, label ios.Label) (addedMi *fs.Mountpath, err error) {
+func (g *fsprungroup) attachMpath(mpath string, label cos.MountpathLabel) (addedMi *fs.Mountpath, err error) {
 	addedMi, err = fs.AddMpath(g.t.SID(), mpath, label, g.redistributeMD)
 	if err != nil || addedMi == nil {
 		return
@@ -62,12 +60,6 @@ func (g *fsprungroup) attachMpath(mpath string, label ios.Label) (addedMi *fs.Mo
 }
 
 func (g *fsprungroup) _postAdd(action string, mi *fs.Mountpath) {
-	// NOTE:
-	// - currently, dsort doesn't handle (add/enable/disable/detach mountpath) at runtime
-	// - consider integrating via `xreg.LimitedCoexistence`
-	// - review all xact.IsMountpath(kind) == true
-	dsort.Managers.AbortAll(fmt.Errorf("%q %s", action, mi))
-
 	fspathsConfigAddDel(mi.Path, true /*add*/)
 	go func() {
 		if cmn.GCO.Get().Resilver.Enabled {
@@ -100,27 +92,54 @@ func (g *fsprungroup) detachMpath(mpath string, dontResilver bool) (*fs.Mountpat
 	return g.doDD(apc.ActMountpathDetach, fs.FlagBeingDetached, mpath, dontResilver)
 }
 
+//
+// rescan and fshc (advanced use)
+//
+
+func (g *fsprungroup) rescanMpath(mpath string, dontResilver bool) error {
+	avail, disabled := fs.Get()
+	mi, ok := avail[mpath]
+	if !ok {
+		what := mpath
+		if mi, ok = disabled[mpath]; ok {
+			what = mi.String()
+		}
+		return fmt.Errorf("%s: not starting rescan-disks: %s is not available", g.t, what)
+	}
+
+	if len(mi.Disks) == 0 {
+		return fmt.Errorf("%s: not starting rescan-disks: %s has no disks", g.t, mi)
+	}
+
+	warn, err := mi.RescanDisks()
+	if err != nil || warn == nil {
+		return err
+	}
+	if !dontResilver && cmn.GCO.Get().Resilver.Enabled {
+		go g.t.runResilver(res.Args{}, nil /*wg*/)
+	}
+	return warn
+}
+
 func (g *fsprungroup) doDD(action string, flags uint64, mpath string, dontResilver bool) (*fs.Mountpath, error) {
 	rmi, numAvail, noResil, err := fs.BeginDD(action, flags, mpath)
 	if err != nil || rmi == nil {
 		return nil, err
 	}
-
-	// NOTE: above
-	dsort.Managers.AbortAll(fmt.Errorf("%q %s", action, rmi))
-
 	if numAvail == 0 {
-		s := fmt.Sprintf("%s: lost (via %q) the last available mountpath %q", g.t.si, action, rmi)
+		nlog.Errorf("%s: lost (via %q) the last available mountpath %q", g.t.si, action, rmi)
 		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // go ahead to disable/detach
-		g.t.disable(s)
+		g.t.disable()
 		return rmi, nil
 	}
 
 	core.UncacheMountpath(rmi)
 
-	if noResil || dontResilver || !cmn.GCO.Get().Resilver.Enabled {
-		nlog.Infof("%s: %q %s: no resilvering (%t, %t, %t)", g.t, action, rmi,
-			noResil, !dontResilver, cmn.GCO.Get().Resilver.Enabled)
+	config := cmn.GCO.Get()
+	if noResil || dontResilver || !config.Resilver.Enabled {
+		nlog.Infoln(g.t.String(), "action", action, rmi.String(), "- not resilvering:")
+		nlog.Infoln("noResil (action done?):", noResil, "dontResilver:", dontResilver,
+			"config enabled:", config.Resilver.Enabled)
 		g.postDD(rmi, action, nil /*xaction*/, nil /*error*/) // ditto (compare with the one below)
 		return rmi, nil
 	}
@@ -265,7 +284,7 @@ func (g *fsprungroup) checkEnable(action string, mi *fs.Mountpath) {
 	} else {
 		nlog.Infoln(action, "the first mountpath", mi.String())
 		if err := g.t.enable(); err != nil {
-			nlog.Errorf("Failed to re-join %s (self): %v", g.t, err) // (FATAL, unlikely)
+			nlog.Errorln(g.t.String(), "(self) failed to rejoin cluster:", err) // (FATAL, unlikely)
 		}
 	}
 }

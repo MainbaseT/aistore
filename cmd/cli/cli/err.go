@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file contains error handlers and utilities.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/api/env"
 	"github.com/NVIDIA/aistore/cmd/cli/config"
 	"github.com/NVIDIA/aistore/cmd/cli/teb"
@@ -50,7 +51,7 @@ type (
 //////////////
 
 func (e *errUsage) Error() string {
-	msg := helpMessage(e.helpTemplate, e.helpData)
+	msg := helpErrMessage(e.helpTemplate, e.helpData)
 
 	// remove "alias for" (simplify)
 	reg := regexp.MustCompile(aliasForRegex)
@@ -88,7 +89,11 @@ func (e *errAdditionalInfo) Error() string {
 /////////////////////
 
 func (e *errDoesNotExist) Error() string {
-	return fmt.Sprintf("%s %q does not exist%s", e.what, e.name, e.suffix)
+	s := fmt.Sprintf("%q does not exist%s", e.name, e.suffix)
+	if e.what != "" {
+		return e.what + " " + s
+	}
+	return s
 }
 
 func isErrDoesNotExist(err error) bool {
@@ -132,7 +137,16 @@ func redErr(err error) error {
 	if i := strings.Index(msg, "Error:"); i >= 0 && len(msg) > i+10 {
 		// e.g. "CertificateVerificationError: ..."
 		if cos.IsAlphaNice(msg[:i]) {
-			return errors.New(fred(msg[:i+6]) + msg[i+6:])
+			typeCode := msg[:i+6]
+
+			// NOTE (usability vs hardcoded check)
+			// quoting Go source, "OpError is the error type usually returned by functions in the net package."
+			// the "Op" part in it is likely from "operation" - tells nothing...
+			if typeCode == "OpError:" {
+				typeCode = "NetworkError:"
+			}
+
+			return errors.New(fred(typeCode) + msg[i+6:])
 		}
 	}
 	return errors.New(fred("Error: ") + msg)
@@ -170,11 +184,31 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 	case trailingShow:
 		sb.WriteString(prefix)
 		sb.WriteString(c.App.Name) // NOTE: the entire command-line (vs cliName)
-		sb.WriteString(" " + commandShow)
-		sb.WriteString(" " + c.Args()[0])
+		sb.WriteByte(' ')
+		sb.WriteString(commandShow)
+		sb.WriteByte(' ')
+		sb.WriteString(c.Args()[0])
 		sbWriteFlags(c, sb)
 		sb.WriteString("'?")
 		sbWriteSearch(sb, cmd, true)
+	case strings.Contains(cmd, apc.BckProviderSeparator):
+		_, objName, err := cmn.ParseBckObjectURI(cmd, cmn.ParseURIOpts{})
+		if err != nil {
+			return ""
+		}
+		sb.WriteString(prefix)
+		sb.WriteString(c.App.Name) // ditto
+		sbWriteTail(c, sb)
+		sb.WriteByte(' ')
+		if objName == "" {
+			sb.WriteString(commandBucket)
+		} else {
+			sb.WriteString(commandObject)
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(cmd)
+		sbWriteFlags(c, sb)
+		sb.WriteString("'?")
 	case len(similar) == 1:
 		sb.WriteString(prefix)
 		msg := fmt.Sprintf("%v", similar)
@@ -186,7 +220,8 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 	case distance < max(incorrectCmdDistance, len(cmd)/2):
 		sb.WriteString(prefix)
 		sb.WriteString(c.App.Name) // ditto
-		sb.WriteString(" " + closestCommand)
+		sb.WriteByte(' ')
+		sb.WriteString(closestCommand)
 		sbWriteTail(c, sb)
 		sbWriteFlags(c, sb)
 		sb.WriteString("'?")
@@ -201,7 +236,8 @@ func didYouMeanMessage(c *cli.Context, cmd string, similar []string, closestComm
 func sbWriteTail(c *cli.Context, sb *strings.Builder) {
 	if c.NArg() > 1 {
 		for _, a := range c.Args()[1:] { // skip the wrong one
-			sb.WriteString(" " + a)
+			sb.WriteByte(' ')
+			sb.WriteString(a)
 		}
 	}
 }
@@ -317,6 +353,7 @@ func V(err error) error {
 	return err
 }
 
+// with hints and tips (compare with `stripErr` below)
 func formatErr(err error) error {
 	if err == nil {
 		return nil
@@ -325,7 +362,7 @@ func formatErr(err error) error {
 		errmsg := fmt.Sprintf("AIStore cannot be reached at %s\n", clusterURL)
 		errmsg += fmt.Sprintf("Make sure that environment '%s' has the address of any AIS gateway (proxy).\n"+
 			"For defaults, see CLI config at %s or run `ais show config cli`.",
-			env.AIS.Endpoint, config.Path())
+			env.AisEndpoint, config.Path())
 		return redErr(errors.New(errmsg))
 	}
 	switch err := err.(type) {
@@ -350,6 +387,33 @@ func formatErr(err error) error {
 	}
 }
 
+// remove "verb URL" from the error (compare with `formatErr`)
+// TODO: add more apc.URLPath* paths
+func stripErr(err error) error {
+	var (
+		s = err.Error()
+		l int
+	)
+	i := strings.Index(s, apc.URLPathObjects.S)
+	if i < 0 {
+		i = strings.Index(s, apc.URLPathBuckets.S)
+	}
+	if i < 0 {
+		return err
+	}
+
+	k := strings.Index(s[i+l:], " ")
+	if k < 0 || len(s) < i+l+k+5 {
+		return err
+	}
+	return errors.New(s[i+l+k+1:])
+}
+
+func isTimeout(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline")
+}
+
 func isStartingUp(err error) bool {
 	if herr, ok := err.(*cmn.ErrHTTP); ok {
 		return herr.Status == http.StatusServiceUnavailable
@@ -361,4 +425,50 @@ func isStartingUp(err error) bool {
 		}
 	}
 	return false
+}
+
+//
+// misplaced or mistyped flag(s)
+//
+
+func errArgIsFlag(c *cli.Context, arg string) (err error) {
+	if len(arg) > 1 && arg[0] == '-' {
+		err = incorrectUsageMsg(c, "missing command line argument (hint: flag '%s' misplaced?)", arg)
+	}
+	return err
+}
+
+func errTailArgsContainFlag(tail []string) error {
+	for _, arg := range tail {
+		if len(arg) > 1 && arg[0] == '-' {
+			return fmt.Errorf("unrecognized or misplaced option %q", arg)
+		}
+	}
+	return nil
+}
+
+//
+// range read
+//
+
+func errRangeReadArch(what string) error {
+	return fmt.Errorf("cannot range-read (%s, %s) archived content (%s) - "+NIY, qflprn(lengthFlag), qflprn(offsetFlag), what)
+}
+
+//
+// parse uri
+//
+
+func errBucketNameInvalid(c *cli.Context, arg string, err error) error {
+	if errV := errArgIsFlag(c, arg); errV != nil {
+		return errV
+	}
+	if strings.Contains(err.Error(), cos.OnlyPlus) && strings.Contains(err.Error(), "bucket name") {
+		if strings.Contains(arg, ":/") && !strings.Contains(arg, apc.BckProviderSeparator) {
+			a := strings.Replace(arg, ":/", apc.BckProviderSeparator, 1)
+			return fmt.Errorf("bucket name in %q is invalid: (did you mean %q?)", arg, a)
+		}
+		return fmt.Errorf("bucket name in %q is invalid: "+cos.OnlyPlus, arg)
+	}
+	return nil
 }

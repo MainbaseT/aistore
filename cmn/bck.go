@@ -1,7 +1,7 @@
 // Package cmn provides common constants, types, and utilities for AIS clients
 // and AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cmn
 
@@ -126,19 +126,31 @@ func ParseNsUname(s string) (n Ns) {
 }
 
 func (n Ns) String() (res string) {
+	var sb strings.Builder
+	if n.IsGlobal() {
+		return
+	}
+	sb.Grow(n.Len() + 1)
+	n._str(&sb)
+	return sb.String()
+}
+
+func (n Ns) _str(sb *strings.Builder) {
 	if n.IsGlobal() {
 		return
 	}
 	if n.IsAnyRemote() {
-		return string(apc.NsUUIDPrefix)
+		sb.WriteByte(apc.NsUUIDPrefix)
+		return
 	}
 	if n.UUID != "" {
-		res += string(apc.NsUUIDPrefix) + n.UUID
+		sb.WriteByte(apc.NsUUIDPrefix)
+		sb.WriteString(n.UUID)
 	}
 	if n.Name != "" {
-		res += string(apc.NsNamePrefix) + n.Name
+		sb.WriteByte(apc.NsNamePrefix)
+		sb.WriteString(n.Name)
 	}
-	return
 }
 
 func (n Ns) Len() int {
@@ -169,14 +181,17 @@ func (n Ns) _copy(b []byte, l int) int {
 	return off
 }
 
-func (n Ns) validate() error {
+func (n Ns) validate() (err error) {
 	if n.IsGlobal() {
 		return nil
 	}
-	if cos.IsAlphaNice(n.UUID) && cos.IsAlphaPlus(n.Name) {
-		return nil
+	if err = cos.CheckAlphaPlus(n.Name, "namepace"); err == nil {
+		if cos.IsAlphaNice(n.UUID) {
+			return nil
+		}
+		return fmt.Errorf(fmtErrNamespace, n.UUID, n.Name)
 	}
-	return fmt.Errorf(fmtErrNamespace, n.UUID, n.Name)
+	return err
 }
 
 func (n Ns) contains(other Ns) bool {
@@ -197,23 +212,37 @@ func (n Ns) contains(other Ns) bool {
 // Bck (value)
 /////////
 
-func (b Bck) Equal(other *Bck) bool {
+func (b *Bck) Equal(other *Bck) bool {
 	return b.Name == other.Name && b.Provider == other.Provider && b.Ns == other.Ns
 }
 
-func (b Bck) String() (s string) {
+func (b *Bck) String() string {
+	var sb strings.Builder
+	sb.Grow(64)
+	b.Str(&sb)
+	return sb.String()
+}
+
+func (b *Bck) Str(sb *strings.Builder) {
 	if b.Ns.IsGlobal() {
 		if b.Provider == "" {
-			return b.Name
+			sb.WriteString(b.Name)
+			return
 		}
-		s = apc.ToScheme(b.Provider) + apc.BckProviderSeparator + b.Name
+		sb.WriteString(apc.ToScheme(b.Provider))
+		sb.WriteString(apc.BckProviderSeparator)
+		sb.WriteString(b.Name)
 	} else {
-		s = apc.ToScheme(b.Provider) + apc.BckProviderSeparator + b.Ns.String() + "/" + b.Name
+		sb.WriteString(apc.ToScheme(b.Provider))
+		sb.WriteString(apc.BckProviderSeparator)
+		b.Ns._str(sb)
+		sb.WriteByte('/')
+		sb.WriteString(b.Name)
 	}
 	if back := b.Backend(); back != nil {
-		s += "->" + back.String()
+		sb.WriteString("->")
+		back.Str(sb)
 	}
-	return s
 }
 
 // unique name => Bck (use MakeUname above to perform the reverse translation)
@@ -270,39 +299,37 @@ func (b *Bck) Validate() (err error) {
 	return
 }
 
-func (b *Bck) ValidateName() (err error) {
+func (b *Bck) ValidateName() error {
 	if b.Name == "" {
 		return errors.New("bucket name is missing")
 	}
 	if b.Name == "." {
 		return fmt.Errorf(fmtErrBckName, b.Name)
 	}
-	if !cos.IsAlphaPlus(b.Name) {
-		err = fmt.Errorf(fmtErrBckName, b.Name)
-	}
-	return
-}
-
-// ditto
-func ValidatePrefix(s string) error {
-	if !strings.Contains(s, "../") {
-		return nil
-	}
-	return fmt.Errorf("invalid prefix %q", s)
+	return cos.CheckAlphaPlus(b.Name, "bucket name")
 }
 
 // canonical name, with or without object
 func (b *Bck) Cname(objname string) (s string) {
-	sch := apc.ToScheme(b.Provider)
+	var sb strings.Builder
+	sb.Grow(len(b.Name) + len(objname) + b.Ns.Len() + 16)
+
+	sb.WriteString(apc.ToScheme(b.Provider))
+	sb.WriteString(apc.BckProviderSeparator)
+
 	if b.Ns.IsGlobal() {
-		s = sch + apc.BckProviderSeparator + b.Name
+		sb.WriteString(b.Name)
 	} else {
-		s = fmt.Sprintf("%s%s%s/%s", sch, apc.BckProviderSeparator, b.Ns, b.Name)
+		b.Ns._str(&sb)
+		sb.WriteByte('/')
+		sb.WriteString(b.Name)
 	}
 	if objname == "" {
-		return
+		return sb.String()
 	}
-	return s + cos.PathSeparator + objname
+	sb.WriteByte(filepath.Separator)
+	sb.WriteString(objname)
+	return sb.String()
 }
 
 func (b *Bck) IsEmpty() bool {
@@ -372,7 +399,7 @@ func (b *Bck) IsAIS() bool {
 }
 
 func (b *Bck) IsRemoteAIS() bool { return b.Provider == apc.AIS && b.Ns.IsRemote() }
-func (b *Bck) IsHTTP() bool      { return b.Provider == apc.HTTP }
+func (b *Bck) IsHT() bool        { return b.Provider == apc.HT }
 
 func (b *Bck) IsRemote() bool {
 	return apc.IsRemoteProvider(b.Provider) || b.IsRemoteAIS() || b.Backend() != nil
@@ -381,6 +408,10 @@ func (b *Bck) IsRemote() bool {
 //
 // NOTE: for more Is* accessors (e.g. IsRemoteS3), see also: core/meta/bck.go
 //
+
+func (b *Bck) IsBuiltTagged() bool {
+	return b.IsCloud() || b.Provider == apc.HT
+}
 
 func (b *Bck) IsCloud() bool {
 	if apc.IsCloudProvider(b.Provider) {
@@ -404,15 +435,14 @@ func (b *Bck) HasProvider() bool { return b.Provider != "" }
 // useful helpers
 //
 
-func (b *Bck) NewQuery() (q url.Values) {
-	q = make(url.Values, 1)
+// q = make(url.Values, 1) TODO -- FIXME
+func (b *Bck) SetQuery(q url.Values) {
 	if b.Provider != "" {
 		q.Set(apc.QparamProvider, b.Provider)
 	}
 	if !b.Ns.IsGlobal() {
 		q.Set(apc.QparamNamespace, b.Ns.Uname())
 	}
-	return
 }
 
 func (b *Bck) AddToQuery(query url.Values) url.Values {
@@ -465,22 +495,29 @@ func (qbck QueryBcks) String() string {
 		if qbck.Ns.IsGlobal() {
 			return apc.ToScheme(p) + apc.BckProviderSeparator
 		}
-		return fmt.Sprintf("%s%s%s", apc.ToScheme(p), apc.BckProviderSeparator, qbck.Ns)
+		var (
+			sb strings.Builder
+		)
+		sb.Grow(qbck.Ns.Len() + 8)
+		sb.WriteString(apc.ToScheme(p))
+		sb.WriteString(apc.BckProviderSeparator)
+		qbck.Ns._str(&sb)
+		return sb.String()
 	}
 	b := Bck(qbck)
 	return b.String()
 }
 
 func (qbck *QueryBcks) IsAIS() bool       { b := (*Bck)(qbck); return b.IsAIS() }
-func (qbck *QueryBcks) IsHTTP() bool      { b := (*Bck)(qbck); return b.IsHTTP() }
+func (qbck *QueryBcks) IsHT() bool        { b := (*Bck)(qbck); return b.IsHT() }
 func (qbck *QueryBcks) IsRemoteAIS() bool { b := (*Bck)(qbck); return b.IsRemoteAIS() }
 func (qbck *QueryBcks) IsCloud() bool     { return apc.IsCloudProvider(qbck.Provider) }
 
 func (qbck *QueryBcks) IsEmpty() bool { b := (*Bck)(qbck); return b.IsEmpty() }
 
-func (qbck *QueryBcks) NewQuery() url.Values {
+func (qbck *QueryBcks) SetQuery(q url.Values) {
 	bck := (*Bck)(qbck)
-	return bck.NewQuery()
+	bck.SetQuery(q)
 }
 
 func (qbck *QueryBcks) AddToQuery(query url.Values) {
@@ -507,17 +544,16 @@ func (qbck *QueryBcks) Validate() (err error) {
 	return nil
 }
 
-func (qbck QueryBcks) Equal(bck *Bck) bool { return Bck(qbck).Equal(bck) }
+func (qbck *QueryBcks) Equal(bck *Bck) bool {
+	b := (*Bck)(qbck)
+	return b.Equal(bck)
+}
 
+// NOTE: a named bucket with no provider is assumed to be ais://
 func (qbck QueryBcks) Contains(other *Bck) bool {
 	if qbck.Name != "" {
-		// NOTE: named bucket with no provider is assumed to be ais://
-		if other.Provider == "" {
-			other.Provider = apc.AIS
-		}
-		if qbck.Provider == "" {
-			qbck.Provider = other.Provider //nolint:revive // if not set we match the expected
-		}
+		other.Provider = cos.Right(apc.AIS, other.Provider)
+		qbck.Provider = cos.Right(other.Provider, qbck.Provider) //nolint:revive // if not set we match the expected
 		return qbck.Equal(other)
 	}
 	ok := qbck.Provider == other.Provider || qbck.Provider == ""
@@ -578,7 +614,7 @@ func (bcks Bcks) Equal(other Bcks) bool {
 func NewHTTPObj(u *url.URL) *HTTPBckObj {
 	hbo := &HTTPBckObj{
 		Bck: Bck{
-			Provider: apc.HTTP,
+			Provider: apc.HT,
 			Ns:       NsGlobal,
 		},
 	}

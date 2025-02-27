@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles object operations.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -40,13 +40,15 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		showProgress = flagIsSet(c, progressFlag)
 	)
 	// 1. list or template
-	if listObjs != "" {
+	switch {
+	case listObjs != "":
 		lrMsg.ObjNames = splitCsv(listObjs)
 		numObjs = int64(len(lrMsg.ObjNames))
-	} else if tmplObjs == "" {
-		// motivation: copy the entire bucket via x-tco rather than x-tcb
-		// (compare with copying or transforming not "cached" data from remote buckets, etc.)
-	} else {
+	case tmplObjs == "":
+		// motivation:
+		// - copy the entire bucket via x-tco rather than x-tcb
+		// - compare with copying or transforming not "cached" data from remote buckets
+	default:
 		pt, err := cos.NewParsedTemplate(tmplObjs)
 		if err != nil && err != cos.ErrEmptyTemplate { // NOTE same as above: empty => entire bucket
 			return err
@@ -62,7 +64,7 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 	}
 
 	// 2. TCO message
-	msg := cmn.TCObjsMsg{ToBck: bckTo}
+	msg := cmn.TCOMsg{ToBck: bckTo}
 	{
 		msg.ListRange = lrMsg
 		msg.DryRun = flagIsSet(c, copyDryRunFlag)
@@ -72,6 +74,10 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 		msg.LatestVer = flagIsSet(c, latestVerFlag)
 		msg.Sync = flagIsSet(c, syncFlag)
 		msg.ContinueOnError = flagIsSet(c, continueOnErrorFlag)
+		msg.Prepend = parseStrFlag(c, copyPrependFlag)
+		if flagIsSet(c, numListRangeWorkersFlag) {
+			msg.NumWorkers = parseIntFlag(c, numListRangeWorkersFlag)
+		}
 	}
 	// 3. start copying/transforming
 	var (
@@ -119,14 +125,14 @@ func runTCO(c *cli.Context, bckFrom, bckTo cmn.Bck, listObjs, tmplObjs, etlName 
 	// or wait
 	var timeout time.Duration
 
-	fmt.Fprintf(c.App.Writer, tcbtcoCptn(text, bckFrom, bckTo)+" ...")
+	fmt.Fprint(c.App.Writer, tcbtcoCptn(text, bckFrom, bckTo)+" ...")
 
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
 	xargs := xact.ArgsMsg{ID: xid, Kind: xkind, Timeout: timeout}
 	if err = waitXact(&xargs); err != nil {
-		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, text, bckFrom, bckTo)
+		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, text, bckFrom.String(), bckTo.String())
 	} else {
 		fmt.Fprint(c.App.Writer, fmtXactSucceeded)
 	}
@@ -166,25 +172,27 @@ func _evictOne(c *cli.Context, shift int) error {
 		const msg = "evicting objects from AIS buckets (ie., buckets with no remote backends) is not allowed."
 		return errors.New(msg + "\n(Tip:  consider 'ais object rm' or 'ais rmb', see --help for details)")
 	}
-	if _, err := headBucket(bck, false /* don't add */); err != nil {
-		return err
+	if shouldHeadRemote(c, bck) {
+		if _, err := headBucket(bck, false /* don't add */); err != nil {
+			return err
+		}
 	}
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	oltp, err := dopOLTP(c, bck, objNameOrTmpl)
 	if err != nil {
 		return err
 	}
 
 	switch {
-	case listObjs != "" || tmplObjs != "": // 1. multi-obj
-		lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+	case oltp.list != "" || oltp.tmpl != "": // 1. multi-obj
+		lrCtx := &lrCtx{oltp.list, oltp.tmpl, bck}
 		return lrCtx.do(c)
-	case objName == "": // 2. entire bucket
+	case oltp.objName == "": // 2. entire bucket
 		return evictBucket(c, bck)
 	default: // 3. one(?) obj to evict
-		err := api.EvictObject(apiBP, bck, objName)
+		err := api.EvictObject(apiBP, bck, oltp.objName)
 		if err == nil {
 			if !flagIsSet(c, nonverboseFlag) {
-				fmt.Fprintf(c.App.Writer, "evicted %q from %s\n", objName, bck.Cname(""))
+				fmt.Fprintf(c.App.Writer, "evicted %q from %s\n", oltp.objName, bck.Cname(""))
 			}
 			return nil
 		}
@@ -193,11 +201,11 @@ func _evictOne(c *cli.Context, shift int) error {
 			return V(err)
 		}
 		// not found
-		suffix := " (not \"cached\")"
-		if c.NArg() > 1 {
+		suffix := " (not \"cached\" in cluster)"
+		if !argIsFlag(c, 1) {
 			suffix = " (hint: missing double or single quotes?)"
 		}
-		return &errDoesNotExist{what: "object", name: bck.Cname(objName), suffix: suffix}
+		return &errDoesNotExist{name: bck.Cname(oltp.objName), suffix: suffix}
 	}
 }
 
@@ -223,35 +231,48 @@ func _rmOne(c *cli.Context, shift int) error {
 	if err != nil {
 		return err
 	}
-	if _, err := headBucket(bck, false /* don't add */); err != nil {
-		return err
+	if shouldHeadRemote(c, bck) {
+		bprops, err := headBucket(bck, false /* don't add */)
+		if err != nil {
+			return err
+		}
+		bck.Props = bprops
 	}
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	// [NOTE]
+	// - passing empty bck _not_ to interpret embedded objName as prefix
+	// - instead of HEAD(obj) do list-objects(prefix=objNameOrTmpl)  - here and everywhere
+	oltp, err := dopOLTP(c, bck, objNameOrTmpl)
 	if err != nil {
 		return err
 	}
 
 	switch {
-	case listObjs != "" || tmplObjs != "": // 1. multi-obj
-		lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+	case oltp.list != "" || oltp.tmpl != "": // 1. multi-obj
+		lrCtx := &lrCtx{oltp.list, oltp.tmpl, bck}
 		return lrCtx.do(c)
-	case objName == "": // 2. all objects
+	case oltp.objName == "": // 2. all objects
 		if flagIsSet(c, rmrfFlag) {
 			if !flagIsSet(c, yesFlag) {
-				warn := fmt.Sprintf("will remove all objects from %s. The operation cannot be undone!", bck)
+				warn := fmt.Sprintf("will remove all objects from %s. The operation cannot be undone!", bck.String())
 				if ok := confirm(c, "Proceed?", warn); !ok {
 					return nil
 				}
 			}
 			return rmRfAllObjects(c, bck)
 		}
-		return incorrectUsageMsg(c, "use one of: (%s or %s or %s) to indicate _which_ objects to remove",
+		return incorrectUsageMsg(c, "to select objects to be removed use one of: (%s or %s or %s)",
 			qflprn(listFlag), qflprn(templateFlag), qflprn(rmrfFlag))
 	default: // 3. one obj
-		err := api.DeleteObject(apiBP, bck, objName)
+		err := api.DeleteObject(apiBP, bck, oltp.objName)
+		if err == nil && bck.IsCloud() && oltp.notFound {
+			// [NOTE]
+			// - certain backends return OK when specified object does not exist (see aws.go)
+			// - compensate here
+			return cos.NewErrNotFound(nil, bck.Cname(oltp.objName))
+		}
 		if err == nil {
 			if !flagIsSet(c, nonverboseFlag) {
-				fmt.Fprintf(c.App.Writer, "deleted %q from %s\n", objName, bck.Cname(""))
+				fmt.Fprintf(c.App.Writer, "deleted %q from %s\n", oltp.objName, bck.Cname(""))
 			}
 			return nil
 		}
@@ -264,7 +285,7 @@ func _rmOne(c *cli.Context, shift int) error {
 		if c.NArg() > 1 {
 			suffix = " (hint: missing double or single quotes?)"
 		}
-		return &errDoesNotExist{what: "object", name: bck.Cname(objName), suffix: suffix}
+		return &errDoesNotExist{name: bck.Cname(oltp.objName), suffix: suffix}
 	}
 }
 
@@ -287,24 +308,37 @@ func startPrefetchHandler(c *cli.Context) error {
 func _prefetchOne(c *cli.Context, shift int) error {
 	uri := preparseBckObjURI(c.Args().Get(shift))
 	bck, objNameOrTmpl, err := parseBckObjURI(c, uri, true /*emptyObjnameOK*/)
+
 	if err != nil {
 		return err
 	}
-	if bck.Props, err = headBucket(bck, true /* add */); err != nil {
-		return err
+	if shouldHeadRemote(c, bck) {
+		if bck.Props, err = headBucket(bck, true /* add */); err != nil {
+			return err
+		}
 	}
 	if !bck.IsRemote() {
 		return fmt.Errorf("expecting remote bucket (have %s)", bck.Cname(""))
 	}
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+	oltp, err := dopOLTP(c, bck, objNameOrTmpl)
 	if err != nil {
 		return err
 	}
-
-	if listObjs == "" && tmplObjs == "" {
-		listObjs = objName
+	if oltp.notFound { // (true only when list-objects says so)
+		err := cos.NewErrNotFound(nil, "\""+uri+"\"")
+		if !flagIsSet(c, yesFlag) {
+			if ok := confirm(c, err.Error()+" - proceed anyway?"); !ok {
+				return err
+			}
+		} else {
+			actionWarn(c, err.Error()+" - proceeding anyway")
+		}
 	}
-	lrCtx := &lrCtx{listObjs, tmplObjs, bck}
+
+	if oltp.list == "" && oltp.tmpl == "" {
+		oltp.list = oltp.objName // ("prefetch" is not one of those primitive verbs)
+	}
+	lrCtx := &lrCtx{oltp.list, oltp.tmpl, bck}
 	return lrCtx.do(c)
 }
 
@@ -444,11 +478,14 @@ func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action strin
 			msg.ObjNames = fileList
 			msg.Template = lr.tmplObjs
 			msg.LatestVer = flagIsSet(c, latestVerFlag)
-		}
-		if flagIsSet(c, blobThresholdFlag) {
-			msg.BlobThreshold, err = parseSizeFlag(c, blobThresholdFlag)
-			if err != nil {
-				return
+			if flagIsSet(c, blobThresholdFlag) {
+				msg.BlobThreshold, err = parseSizeFlag(c, blobThresholdFlag)
+				if err != nil {
+					return
+				}
+			}
+			if flagIsSet(c, numListRangeWorkersFlag) {
+				msg.NumWorkers = parseIntFlag(c, numListRangeWorkersFlag)
 			}
 		}
 		xid, err = api.Prefetch(apiBP, lr.bck, msg)
@@ -462,7 +499,7 @@ func (lr *lrCtx) _do(c *cli.Context, fileList []string) (xid, kind, action strin
 		kind = apc.ActEvictObjects
 		action = "evict"
 	default:
-		debug.Assert(false, verb)
+		debug.Assert(false, "invalid subcommand: ", verb)
 	}
 	return xid, kind, action, err
 }

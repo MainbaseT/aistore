@@ -8,9 +8,11 @@ package backend
 
 import (
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/core"
+	"github.com/NVIDIA/aistore/stats"
 )
 
-func NewAzure(_ core.TargetPut) (core.Backend, error) {
-	return nil, newErrInitBackend(apc.Azure)
+func NewAzure(core.TargetPut, stats.Tracker, bool) (core.Backend, error) {
+	return nil, &cmn.ErrInitBackend{Provider: apc.Azure}
 }

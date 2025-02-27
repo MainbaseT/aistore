@@ -1,7 +1,7 @@
 // Package shard provides Extract(shard), Create(shard), and associated methods
 // across all suppported archival formats (see cmn/archive/mime.go)
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package shard
 
@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/nlog"
+	"github.com/NVIDIA/aistore/cmn/oom"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/ext/dsort/ct"
 	"github.com/NVIDIA/aistore/fs"
@@ -26,7 +27,7 @@ import (
 
 const (
 	// Extract methods
-	ExtractToMem cos.Bits = 1 << iota
+	ExtractToMem bits = 1 << iota
 	ExtractToDisk
 	ExtractToWriter
 )
@@ -44,7 +45,7 @@ type (
 		r             cos.ReadSizer // body of the record
 		w             io.Writer     // required when method is set to ExtractToWriter
 		metadata      []byte        // metadata of the record
-		extractMethod cos.Bits      // method which needs to be used to extract a record
+		extractMethod bits          // method which needs to be used to extract a record
 		offset        int64         // offset of the body in the shard
 		buf           []byte        // helper buffer for `CopyBuffer` methods
 	}
@@ -219,7 +220,7 @@ func (recm *RecordManager) MergeEnqueuedRecords() {
 
 		recm.Records.merge(records)
 	}
-	cos.FreeMemToOS(false /*force*/)
+	oom.FreeToOS(false /*force*/)
 }
 
 func (recm *RecordManager) encodeRecordName(storeType, shardName, recordName string) (contentPath, fullContentPath string) {
@@ -359,9 +360,8 @@ func (recm *RecordManager) Cleanup() {
 	})
 	recm.contents = nil
 
-	// NOTE: may call cos.FreeMemToOS
+	// NOTE: may call oom.FreeToOS
 	core.T.PageMM().FreeSpec(memsys.FreeSpec{
-		Totally: true,
 		ToOS:    true,
 		MinSize: 1, // force toGC to free all (even small) memory to system
 	})
@@ -396,3 +396,13 @@ func parseRecordUname(recordUniqueName string) (shardName, recordName string) {
 	splits := strings.SplitN(recordUniqueName, recSepa, 2)
 	return splits[0], splits[1]
 }
+
+//////////
+// bits //
+//////////
+
+type bits uint8
+
+func (b *bits) Set(flag bits)      { x := *b; x |= flag; *b = x }
+func (b *bits) Clear(flag bits)    { x := *b; x &^= flag; *b = x }
+func (b *bits) Has(flag bits) bool { return *b&flag != 0 }

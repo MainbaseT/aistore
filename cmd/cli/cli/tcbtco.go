@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -78,13 +78,8 @@ func copyTransform(c *cli.Context, etlName, objNameOrTmpl string, bckFrom, bckTo
 		text1, text2 = "transform", "Transforming"
 	}
 
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
-	if err != nil {
-		return err
-	}
-
 	// HEAD(from)
-	if _, err = headBucket(bckFrom, true /* don't add */); err != nil {
+	if bckFrom.Props, err = headBucket(bckFrom, true /* don't add */); err != nil {
 		return err
 	}
 
@@ -94,32 +89,39 @@ func copyTransform(c *cli.Context, etlName, objNameOrTmpl string, bckFrom, bckTo
 	if empty {
 		if bckFrom.IsRemote() && !allIncludingRemote {
 			hint := "(tip: use option %s to " + text1 + " remote objects from the backend store)\n"
-			note := fmt.Sprintf("source %s appears to be empty "+hint, bckFrom, qflprn(copyAllObjsFlag))
+			note := fmt.Sprintf("source %s appears to be empty "+hint, bckFrom.String(), qflprn(copyAllObjsFlag))
 			actionNote(c, note)
 			return nil
 		}
-		note := fmt.Sprintf("source %s is empty, nothing to do\n", bckFrom)
+		note := fmt.Sprintf("source %s is empty, nothing to do\n", bckFrom.String())
 		actionNote(c, note)
 		return nil
 	}
 
-	// HEAD(to)
+	oltp, err := dopOLTP(c, bckFrom, objNameOrTmpl)
+	if err != nil {
+		return err
+	}
+
+	// bck-to exists?
 	if _, err = api.HeadBucket(apiBP, bckTo, true /* don't add */); err != nil {
 		if herr, ok := err.(*cmn.ErrHTTP); !ok || herr.Status != http.StatusNotFound {
 			return err
 		}
 		warn := fmt.Sprintf("destination %s doesn't exist and will be created with configuration copied from the source (%s))",
-			bckTo, bckFrom)
+			bckTo.String(), bckFrom.String())
 		actionWarn(c, warn)
 	}
 
 	dryRun := flagIsSet(c, copyDryRunFlag)
 
-	// either 1. copy/transform bucket (x-tcb)
-	if objName == "" && listObjs == "" && tmplObjs == "" {
+	//
+	// either (1) copy/transform bucket (x-tcb)
+	//
+	if oltp.objName == "" && oltp.list == "" && oltp.tmpl == "" {
 		// NOTE: e.g. 'ais cp gs://abc gs:/abc' to sync remote bucket => aistore
 		if bckFrom.Equal(&bckTo) && !bckFrom.IsRemote() {
-			return incorrectUsageMsg(c, errFmtSameBucket, commandCopy, bckTo)
+			return incorrectUsageMsg(c, errFmtSameBucket, commandCopy, bckTo.Cname(""))
 		}
 		if dryRun {
 			// TODO: show object names with destinations, make the output consistent with etl dry-run
@@ -132,21 +134,23 @@ func copyTransform(c *cli.Context, etlName, objNameOrTmpl string, bckFrom, bckTo
 		return copyBucket(c, bckFrom, bckTo)
 	}
 
-	// or 2. multi-object x-tco
-	if listObjs == "" && tmplObjs == "" {
-		listObjs = objName // NOTE: "pure" prefix comment in parseObjListTemplate (above)
+	//
+	// or (2) multi-object x-tco
+	//
+	if oltp.list == "" && oltp.tmpl == "" {
+		oltp.list = oltp.objName // (compare with `_prefetchOne`)
 	}
 	if dryRun {
 		var prompt string
-		if listObjs != "" {
-			prompt = fmt.Sprintf("%s %q ...\n", text2, listObjs)
+		if oltp.list != "" {
+			prompt = fmt.Sprintf("%s %q ...\n", text2, oltp.list)
 		} else {
-			prompt = fmt.Sprintf("%s objects that match the pattern %q ...\n", text2, tmplObjs)
+			prompt = fmt.Sprintf("%s objects that match the pattern %q ...\n", text2, oltp.tmpl)
 		}
 		dryRunCptn(c) // TODO: ditto
 		actionDone(c, prompt)
 	}
-	return runTCO(c, bckFrom, bckTo, listObjs, tmplObjs, etlName)
+	return runTCO(c, bckFrom, bckTo, oltp.list, oltp.tmpl, etlName)
 }
 
 func _iniCopyBckMsg(c *cli.Context, msg *apc.CopyBckMsg) (err error) {
@@ -228,7 +232,7 @@ func copyBucket(c *cli.Context, bckFrom, bckTo cmn.Bck) error {
 	if flagIsSet(c, waitJobXactFinishedFlag) {
 		timeout = parseDurationFlag(c, waitJobXactFinishedFlag)
 	}
-	fmt.Fprintf(c.App.Writer, tcbtcoCptn("Copying", bckFrom, bckTo)+" ...")
+	fmt.Fprint(c.App.Writer, tcbtcoCptn("Copying", bckFrom, bckTo)+" ...")
 	xargs := xact.ArgsMsg{ID: xid, Kind: kind, Timeout: timeout}
 	if err := waitXact(&xargs); err != nil {
 		fmt.Fprintf(c.App.ErrWriter, fmtXactFailed, "copy", from, to)
@@ -304,7 +308,7 @@ func etlBucket(c *cli.Context, etlName string, bckFrom, bckTo cmn.Bck) error {
 	}
 
 	_, xname := xact.GetKindName(apc.ActETLBck)
-	text := fmt.Sprintf("%s %s => %s", xact.Cname(xname, xid), bckFrom, bckTo)
+	text := fmt.Sprintf("%s %s => %s", xact.Cname(xname, xid), bckFrom.String(), bckTo.String())
 	if !flagIsSet(c, waitFlag) && !flagIsSet(c, waitJobXactFinishedFlag) {
 		fmt.Fprintln(c.App.Writer, text)
 		return nil

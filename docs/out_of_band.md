@@ -7,6 +7,46 @@ redirect_from:
  - /docs/out_of_band.md/
 ---
 
+
+**Table of Contents**
+- [Example](#example)
+- [Out-of-band updates](#out-of-band-updates)
+- [Lesser scope](#lesser-scope)
+- [Out-of-band writes, deletes and more](#out-of-band-writes-deletes-and-more)
+- [When reading in-cluster data causes deletion](#when-reading-in-cluster-data-causes-deletion)
+- [GET latest version](#get-latest-version)
+- [References](#references)
+
+There are multiple ways to fully synchronize in-cluster content with remote backend. Let's first take a look at the following `ais cp` and `ais prefetch` examples:
+
+## Example
+
+```console
+$ ais cp s3://BUCKET s3://BUCKET --prefix PREFIX --num-workers 64 --sync
+```
+
+Notice the `--sync` option.
+
+Alternatively, to fully synchronize in-cluster content (and since "prefetch" typically does not imply any deletions) we can also use `ais evict` followed by `ais prefetch`:
+
+```console
+## run "evict" and wait for the job to finish; optionally use `--wait` option
+##
+$ ais evict BUCKET[/PREFIX] --keep-md
+
+## optionally, `ais ls` to show that nothing is "cached"
+##
+$ ais ls BUCKET[/PREFIX] --cached
+
+## no need to use `--latest` option (redundant and slowing-down).
+##
+$ ais prefetch BUCKET[/PREFIX] --num-workers 64 --blob-threshold 1GiB
+```
+
+> Notice the `--keep-md` option above.
+
+> TIP: always a good idea to check `--help` for the most recent updates.
+
 ## Out-of-band updates
 
 One (but not the only one) way to deal with out-of-band updates is to configure bucket as follows:
@@ -38,7 +78,7 @@ prefetch-objects[f70MKzP63]: prefetch entire bucket s3://abc. To monitor the pro
 
 Notice the `--latest` switch above. As far as this particular `prefetch` is concerned `--latest` will have the same effect as setting `versioning.validate_warm_get=true`. But only "as far" - the scope of validating in-cluster versions will be limited to this specific batch job.
 
-The same applies to copying buckets, [copying ranges and lists of objects](/docs/cli/bucket.md#copy-multiple-objects), and certainly getting (as in `GET`) individual objects.
+The same applies to [copying buckets and copying ranges and lists of objects](/docs/cli/bucket.md#copy-list-range-andor-prefix-selected-objects-or-entire-in-cluster-or-remote-buckets), and certainly getting (as in `GET`) individual objects.
 
 Here's the an excerpt from `GET` help (and note `--latest` below):
 
@@ -46,7 +86,7 @@ Here's the an excerpt from `GET` help (and note `--latest` below):
 $ ais get --help
 
 USAGE:
-   ais get [command options] BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-]
+   ais get BUCKET[/OBJECT_NAME] [OUT_FILE|OUT_DIR|-] [command options]
 
 OPTIONS:
    --offset value    object read offset; must be used together with '--length'; default formatting: IEC (use '--units' to override)
@@ -66,7 +106,7 @@ OPTIONS:
 * [`ais cp` command](/docs/cli/bucket.md) and, in particular, its `--sync` option.
 - [Example copying buckets and multi-objects with simultaneous synchronization](/docs/cli/bucket.md#example-copying-buckets-and-multi-objects-with-simultaneous-synchronization)
 
-## Out-of-band writes, deletes, and more
+## Out-of-band writes, deletes and more
 
 1. with version validation enabled, aistore will detect both out-of-band writes and deletes;
 2. buckets with versioning disabled are also supported;

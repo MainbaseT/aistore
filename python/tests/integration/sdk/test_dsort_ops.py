@@ -15,11 +15,11 @@ from aistore.sdk.dsort import (
     DsortAlgorithm,
     ExternalKeyMap,
 )
-from aistore.sdk.types import BucketModel
+from aistore.sdk.provider import Provider
 from aistore.sdk.multiobj import ObjectRange, ObjectNames
 from tests.integration import CLUSTER_ENDPOINT
 from tests.const import TEST_TIMEOUT
-from tests.utils import test_cases, random_string, create_random_tarballs
+from tests.utils import cases, random_string, create_random_tarballs
 
 
 class TestDsortOps(unittest.TestCase):
@@ -102,7 +102,9 @@ class TestDsortOps(unittest.TestCase):
     def _get_object_content_map(self, bucket_name, object_names):
         expected_contents = {}
         for obj in object_names:
-            output_bytes = self.client.bucket(bucket_name).object(obj).get().read_all()
+            output_bytes = (
+                self.client.bucket(bucket_name).object(obj).get_reader().read_all()
+            )
             output = io.BytesIO(output_bytes)
             with tarfile.open(fileobj=output) as result_tar:
                 for tar in result_tar:
@@ -112,20 +114,19 @@ class TestDsortOps(unittest.TestCase):
         return expected_contents
 
     # pylint: disable=too-many-locals
-    @test_cases(("gnu", tarfile.GNU_FORMAT, 2, 3), ("pax", tarfile.PAX_FORMAT, 2, 3))
+    @cases(("gnu", tarfile.GNU_FORMAT, 2, 3), ("pax", tarfile.PAX_FORMAT, 2, 3))
     def test_dsort_json(self, test_case):
         self._test_dsort_from_spec(test_case, spec_type="json")
 
-    @test_cases(("gnu", tarfile.GNU_FORMAT, 2, 3), ("pax", tarfile.PAX_FORMAT, 2, 3))
+    @cases(("gnu", tarfile.GNU_FORMAT, 2, 3), ("pax", tarfile.PAX_FORMAT, 2, 3))
     def test_dsort_yaml(self, test_case):
         self._test_dsort_from_spec(test_case, spec_type="yaml")
 
     def _test_dsort_from_spec(self, test_case, spec_type):
         tar_type, tar_format, num_shards, num_files = test_case
         # create bucket for output
-        out_bck_name = tar_type + "-out"
-        self.client.bucket(out_bck_name).create(exist_ok=True)
-        self.buckets.append(out_bck_name)
+        out_bck = self.client.bucket(tar_type + "-out").create(exist_ok=True)
+        self.buckets.append(out_bck.name)
         # create tars as objects in buckets
         shards = self._generate_shards(tar_type, tar_format, num_shards, num_files)
         # Read created objects to get expected output after dsort
@@ -135,8 +136,8 @@ class TestDsortOps(unittest.TestCase):
 
         spec = {
             "input_extension": ".tar",
-            "input_bck": {"name": tar_type},
-            "output_bck": {"name": out_bck_name},
+            "input_bck": {"name": tar_type, "provider": Provider.AIS.value},
+            "output_bck": {"name": out_bck.name, "provider": out_bck.provider.value},
             "input_format": {"template": tar_type + "-{0..9}"},
             "output_format": "out-shard-{0..9}",
             "output_extension": ".tar",
@@ -157,9 +158,7 @@ class TestDsortOps(unittest.TestCase):
         dsort.start(spec_file)
 
         dsort.wait(timeout=TEST_TIMEOUT)
-        output_bytes = (
-            self.client.bucket(out_bck_name).object("out-shard-0.tar").get().read_all()
-        )
+        output_bytes = out_bck.object("out-shard-0.tar").get_reader().read_all()
         output = io.BytesIO(output_bytes)
         result_contents = {}
         with tarfile.open(fileobj=output) as result_tar:
@@ -206,7 +205,7 @@ class TestDsortOps(unittest.TestCase):
         dsort.wait(timeout=TEST_TIMEOUT)
 
         for output_shard in self.client.bucket(out_bck_name).list_all_objects_iter():
-            output_bytes = output_shard.get().read_all()
+            output_bytes = output_shard.get_reader().read_all()
             output = io.BytesIO(output_bytes)
             with tarfile.open(fileobj=output) as result_tar:
                 for tar in result_tar:
@@ -217,24 +216,23 @@ class TestDsortOps(unittest.TestCase):
                     self.assertIn(tar_filepath.suffix[1:], extension_list)
 
     def test_algorithm_alphanumeric(self):
-        input_bck_name, out_bck_name = "alphanumeric-input", "alphanumeric-out"
-        self.client.bucket(input_bck_name).create(exist_ok=True)
-        self.buckets.append(input_bck_name)
-        self.client.bucket(out_bck_name).create(exist_ok=True)
-        self.buckets.append(out_bck_name)
+        input_bck = self.client.bucket("alphanumeric-input").create(exist_ok=True)
+        self.buckets.append(input_bck.name)
+        out_bck = self.client.bucket("alphanumeric-out").create(exist_ok=True)
+        self.buckets.append(out_bck.name)
 
         num_shards, num_files = 10, 1000
-        self._generate_shards(input_bck_name, tarfile.GNU_FORMAT, num_shards, num_files)
+        self._generate_shards(input_bck.name, tarfile.GNU_FORMAT, num_shards, num_files)
 
         dsort_framework = DsortFramework(
             input_shards=DsortShardsGroup(
-                bck=BucketModel(name=input_bck_name),
+                bck=input_bck.as_model(),
                 role="input",
-                format=ObjectRange.from_string(input_bck_name + "-{0..9}"),
+                format=ObjectRange.from_string(input_bck.name + "-{0..9}"),
                 extension=".tar",
             ),
             output_shards=DsortShardsGroup(
-                bck=BucketModel(name=out_bck_name),
+                bck=out_bck.as_model(),
                 role="output",
                 format=ObjectRange.from_string("output-shards-{000..100}"),
                 extension=".tar",
@@ -248,10 +246,10 @@ class TestDsortOps(unittest.TestCase):
         dsort.start(dsort_framework)
         dsort.wait(timeout=TEST_TIMEOUT)
         tar_names = []
-        for output_shard in self.client.bucket(out_bck_name).list_all_objects_iter(
+        for output_shard in self.client.bucket(out_bck.name).list_all_objects_iter(
             prefix="output-shards-"
         ):
-            output_bytes = output_shard.get().read_all()
+            output_bytes = output_shard.get_reader().read_all()
             output = io.BytesIO(output_bytes)
             with tarfile.open(fileobj=output) as result_tar:
                 tar_names.extend([tar.name for tar in result_tar])
@@ -260,24 +258,23 @@ class TestDsortOps(unittest.TestCase):
         self.assertEqual(len(tar_names), num_shards * num_files)
 
     def test_algorithm_shuffle(self):
-        input_bck_name, out_bck_name = "shuffle-input", "shuffle-out"
-        self.client.bucket(input_bck_name).create(exist_ok=True)
-        self.buckets.append(input_bck_name)
-        self.client.bucket(out_bck_name).create(exist_ok=True)
-        self.buckets.append(out_bck_name)
+        input_bck = self.client.bucket("shuffle-input").create(exist_ok=True)
+        self.buckets.append(input_bck.name)
+        out_bck = self.client.bucket("shuffle-out").create(exist_ok=True)
+        self.buckets.append(out_bck.name)
 
         num_shards, num_files = 10, 1000
-        self._generate_shards(input_bck_name, tarfile.GNU_FORMAT, num_shards, num_files)
+        self._generate_shards(input_bck.name, tarfile.GNU_FORMAT, num_shards, num_files)
 
         dsort_framework = DsortFramework(
             input_shards=DsortShardsGroup(
-                bck=BucketModel(name=input_bck_name),
+                bck=input_bck.as_model(),
                 role="input",
-                format=ObjectRange.from_string(input_bck_name + "-{0..9}"),
+                format=ObjectRange.from_string(input_bck.name + "-{0..9}"),
                 extension=".tar",
             ),
             output_shards=DsortShardsGroup(
-                bck=BucketModel(name=out_bck_name),
+                bck=out_bck.as_model(),
                 role="output",
                 format=ObjectRange.from_string("output-shards-{000..100}"),
                 extension=".tar",
@@ -291,10 +288,10 @@ class TestDsortOps(unittest.TestCase):
         dsort.start(dsort_framework)
         dsort.wait(timeout=TEST_TIMEOUT)
         tar_names = []
-        for output_shard in self.client.bucket(out_bck_name).list_all_objects_iter(
+        for output_shard in self.client.bucket(out_bck.name).list_all_objects_iter(
             prefix="output-shards-"
         ):
-            output_bytes = output_shard.get().read_all()
+            output_bytes = output_shard.get_reader().read_all()
             output = io.BytesIO(output_bytes)
             with tarfile.open(fileobj=output) as result_tar:
                 tar_names.extend([tar.name for tar in result_tar])
@@ -308,7 +305,7 @@ class TestDsortOps(unittest.TestCase):
         self.assertNotEqual(tar_names, sorted_tar_names)
         self.assertEqual(len(tar_names), num_shards * num_files)
 
-    @test_cases(
+    @cases(
         (".loss", "int", False),
         (".cls", "float", False),
         (".smth", "string", False),
@@ -318,16 +315,16 @@ class TestDsortOps(unittest.TestCase):
     )
     def test_algorithm_content(self, test_case):
         extension, content_key_type, missing_keys = test_case
-        input_bck_name = f"{content_key_type}-input"
-        out_bck_name = f"{content_key_type}-out"
-        self.client.bucket(input_bck_name).create(exist_ok=True)
-        self.buckets.append(input_bck_name)
-        self.client.bucket(out_bck_name).create(exist_ok=True)
-        self.buckets.append(out_bck_name)
+        input_bck = self.client.bucket(f"{content_key_type}-input").create(
+            exist_ok=True
+        )
+        self.buckets.append(input_bck.name)
+        out_bck = self.client.bucket(f"{content_key_type}-out").create(exist_ok=True)
+        self.buckets.append(out_bck.name)
 
         num_shards, num_files = 10, 20
         self._generate_shards(
-            input_bck_name,
+            input_bck.name,
             tarfile.GNU_FORMAT,
             num_shards,
             num_files,
@@ -337,13 +334,13 @@ class TestDsortOps(unittest.TestCase):
 
         dsort_framework = DsortFramework(
             input_shards=DsortShardsGroup(
-                bck=BucketModel(name=input_bck_name),
+                bck=input_bck.as_model(),
                 role="input",
-                format=ObjectRange.from_string(input_bck_name + "-{0..9}"),
+                format=ObjectRange.from_string(input_bck.name + "-{0..9}"),
                 extension=".tar",
             ),
             output_shards=DsortShardsGroup(
-                bck=BucketModel(name=out_bck_name),
+                bck=out_bck.as_model(),
                 role="output",
                 format=ObjectRange.from_string("output-shards-{000..100}"),
                 extension=".tar",
@@ -364,10 +361,10 @@ class TestDsortOps(unittest.TestCase):
 
         num_archived_files = 0
         last_file_name, last_value = "", None
-        for output_shard in self.client.bucket(out_bck_name).list_all_objects_iter(
+        for output_shard in self.client.bucket(out_bck.name).list_all_objects_iter(
             prefix="output-shards-"
         ):
-            output_bytes = output_shard.get().read_all()
+            output_bytes = output_shard.get_reader().read_all()
             output = io.BytesIO(output_bytes)
             with tarfile.open(fileobj=output) as tar:
                 for file_info in tar:
@@ -401,24 +398,22 @@ class TestDsortOps(unittest.TestCase):
         )  # both key and content files
 
     def test_abort(self):
-        input_bck_name = "abort"
-        out_bck_name = "out"
-        self.client.bucket(input_bck_name).create(exist_ok=True)
-        self.buckets.append(input_bck_name)
-        self.client.bucket(out_bck_name).create(exist_ok=True)
-        self.buckets.append(out_bck_name)
+        input_bck = self.client.bucket("abort").create(exist_ok=True)
+        self.buckets.append(input_bck.name)
+        out_bck = self.client.bucket("out").create(exist_ok=True)
+        self.buckets.append(out_bck.name)
         # Create enough files to make the dSort job slow enough to abort
-        self._generate_shards(input_bck_name, tarfile.GNU_FORMAT, 10, 1000)
+        self._generate_shards(input_bck.name, tarfile.GNU_FORMAT, 10, 1000)
 
         dsort_framework = DsortFramework(
             input_shards=DsortShardsGroup(
-                bck=BucketModel(name=input_bck_name),
+                bck=input_bck.as_model(),
                 role="input",
-                format=ObjectRange.from_string(input_bck_name + "-{0..9}"),
+                format=ObjectRange.from_string(input_bck.name + "-{0..9}"),
                 extension=".tar",
             ),
             output_shards=DsortShardsGroup(
-                bck=BucketModel(name=out_bck_name),
+                bck=out_bck.as_model(),
                 role="output",
                 format=ObjectRange.from_string("output-shards-{000..100}"),
                 extension=".tar",

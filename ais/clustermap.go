@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -20,6 +20,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/fname"
 	"github.com/NVIDIA/aistore/cmn/jsp"
+	"github.com/NVIDIA/aistore/cmn/k8s"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/memsys"
@@ -31,7 +32,7 @@ const clusterMap = "Smap"
 // NOTE: to access Snode, Smap and related structures, external
 //       packages and HTTP clients must import aistore/cluster (and not ais)
 
-//=====================================================================
+// =====================================================================
 //
 // - smapX is a server-side extension of the meta.Smap
 // - smapX represents AIStore cluster in terms of its member nodes and their properties
@@ -46,7 +47,7 @@ const clusterMap = "Smap"
 // (*) for merges and conflict resolution, check smapX version prior to put()
 //     (version check must be protected by the same critical section)
 //
-//=====================================================================
+// =====================================================================
 
 type (
 	smapX struct {
@@ -102,6 +103,7 @@ var (
 // as revs
 func (*smapX) tag() string       { return revsSmapTag }
 func (m *smapX) version() int64  { return m.Version }
+func (m *smapX) uuid() string    { return m.UUID }
 func (*smapX) jit(p *proxy) revs { return p.owner.smap.get() }
 
 func (m *smapX) sgl() *memsys.SGL {
@@ -195,6 +197,11 @@ func (m *smapX) _setIC(psi *meta.Snode) (ok bool) {
 // check configured "original" and "discovery" URLs vs IC members' control,
 // or pick IC members to provide alternative ones
 func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
+	// Do not modify discovery once set for K8s as we expect it to be the dynamic headless service URL
+	if k8s.IsK8s() && discovery != "" {
+		disc = discovery
+	}
+
 	// extra effort to avoid changing existing URLs if they work
 	for _, psi := range m.Pmap {
 		if !m.IsIC(psi) {
@@ -210,16 +217,18 @@ func (m *smapX) configURLsIC(original, discovery string) (orig, disc string) {
 		}
 	}
 	// pick alternatives
+outer:
 	for _, psi := range m.Pmap {
 		if !m.IsIC(psi) {
 			continue
 		}
-		if orig == "" {
+		switch {
+		case orig == "":
 			orig = psi.URL(cmn.NetIntraControl)
-		} else if disc == "" {
+		case disc == "":
 			disc = psi.URL(cmn.NetIntraControl)
-		} else {
-			break
+		default:
+			break outer
 		}
 	}
 	return orig, disc
@@ -286,6 +295,7 @@ func (m *smapX) addTarget(tsi *meta.Snode) {
 		cos.Assertf(false, "FATAL: duplicate SID: new %s vs %s", tsi.StringEx(), si.StringEx())
 	}
 	tsi.SetName()
+	tsi.InitNetNamer()
 	m.Tmap[tsi.ID()] = tsi
 	m.Version++
 }
@@ -522,14 +532,26 @@ func (r *smapOwner) Listeners() meta.SmapListeners { return r.sls }
 // private
 //
 
+// put new smap version
 func (r *smapOwner) put(smap *smapX) {
+	// residual (in-memory) initialization
 	smap.InitDigests()
 	smap.vstr = strconv.FormatInt(smap.Version, 10)
+
+	for _, psi := range smap.Pmap {
+		psi.SetName()
+	}
+	for _, tsi := range smap.Tmap {
+		tsi.SetName()
+		tsi.InitNetNamer()
+	}
+
+	// put and notify
 	r.smap.Store(smap)
 	r.sls.notify(smap.version())
 }
 
-func (r *smapOwner) get() (smap *smapX) { return r.smap.Load() }
+func (r *smapOwner) get() *smapX { return r.smap.Load() }
 
 func (r *smapOwner) synchronize(si *meta.Snode, newSmap *smapX, payload msPayload, cb smapUpdatedCB) (err error) {
 	if err = newSmap.validate(); err != nil {
@@ -711,7 +733,7 @@ func (sls *sls) notify(ver int64) {
 		return
 	}
 	sls.postCh <- ver
-	if len(sls.postCh) == cap(sls.postCh) {
-		nlog.ErrorDepth(1, "sls channel full: Smap v", ver) // unlikely
+	if l, c := len(sls.postCh), cap(sls.postCh); l > c/2 {
+		nlog.ErrorDepth(1, cos.ErrWorkChanFull, l, c, "Smap version:", ver) // unlikely
 	}
 }

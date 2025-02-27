@@ -1,6 +1,6 @@
 // Package integration_test.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package integration_test
 
@@ -89,10 +89,10 @@ func propsUpdateObjects(t *testing.T, proxyURL string, bck cmn.Bck, oldVersions 
 	return
 }
 
-func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, objList map[string]string) {
+func propsReadObjects(t *testing.T, proxyURL string, bck cmn.Bck, lst map[string]string) {
 	versChanged, bytesChanged := propsStats(t, proxyURL)
 	baseParams := tools.BaseAPIParams(proxyURL)
-	for objName := range objList {
+	for objName := range lst {
 		_, err := api.GetObject(baseParams, bck, objName, nil)
 		if err != nil {
 			t.Errorf("Failed to GET %s: %v", bck.Cname(objName), err)
@@ -185,7 +185,7 @@ func propsRecacheObjects(t *testing.T, proxyURL string, bck cmn.Bck, objs map[st
 
 	tlog.Logf("Listing objects...\n")
 	reslist := testListObjects(t, proxyURL, bck, msg)
-	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck)
+	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
 	var (
 		version string
@@ -256,7 +256,7 @@ func propsRebalance(t *testing.T, proxyURL string, bck cmn.Bck, objects map[stri
 
 	tlog.Logf("Listing objects...\n")
 	reslist := testListObjects(t, proxyURL, bck, msg)
-	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck)
+	tassert.Fatalf(t, reslist != nil && len(reslist.Entries) > 0, "Unexpected: no objects in the bucket %s", bck.String())
 
 	var (
 		version  string
@@ -374,7 +374,7 @@ func propsVersion(t *testing.T, bck cmn.Bck, versionEnabled bool, cksumType stri
 	msg.AddProps(apc.GetPropsVersion, apc.GetPropsAtime, apc.GetPropsStatus)
 	reslist := testListObjects(t, proxyURL, bck, msg)
 	if reslist == nil {
-		t.Fatalf("Unexpected error: no objects in the bucket %s", bck)
+		t.Fatalf("Unexpected error: no objects in the bucket %s", bck.String())
 		return
 	}
 
@@ -502,7 +502,7 @@ func TestObjProps(t *testing.T) {
 				}
 				tassert.Errorf(
 					t, err != nil,
-					"Cloud bucket %s is %s - expecting set-props to fail", m.bck, s)
+					"Cloud bucket %s is %s - expecting set-props to fail", m.bck.String(), s)
 			} else {
 				tassert.CheckFatal(t, err)
 			}
@@ -532,7 +532,7 @@ func TestObjProps(t *testing.T) {
 					flt = apc.FltExistsOutside
 				}
 
-				props, err := api.HeadObject(baseParams, m.bck, objName, flt, false /*silent*/)
+				props, err := api.HeadObject(baseParams, m.bck, objName, api.HeadArgs{FltPresence: flt})
 				if test.checkPresent {
 					if test.bucketType != typeLocal && test.evict {
 						tassert.Fatalf(t, err != nil,
@@ -606,16 +606,17 @@ func TestObjProps(t *testing.T) {
 }
 
 func testListObjects(t *testing.T, proxyURL string, bck cmn.Bck, msg *apc.LsoMsg) *cmn.LsoRes {
-	if msg == nil {
-		tlog.Logf("LIST %s []\n", bck)
-	} else if msg.Prefix == "" && msg.PageSize == 0 && msg.ContinuationToken == "" {
-		tlog.Logf("LIST %s [cached: %t]\n", bck, msg.IsFlagSet(apc.LsObjCached))
-	} else {
+	switch {
+	case msg == nil:
+		tlog.Logf("LIST %s []\n", bck.String())
+	case msg.Prefix == "" && msg.PageSize == 0 && msg.ContinuationToken == "":
+		tlog.Logf("LIST %s [cached: %t]\n", bck.String(), msg.IsFlagSet(apc.LsCached))
+	default:
 		tlog.Logf("LIST %s [prefix: %q, page_size: %d, cached: %t, token: %q]\n",
-			bck, msg.Prefix, msg.PageSize, msg.IsFlagSet(apc.LsObjCached), msg.ContinuationToken)
+			bck.String(), msg.Prefix, msg.PageSize, msg.IsFlagSet(apc.LsCached), msg.ContinuationToken)
 	}
 	baseParams := tools.BaseAPIParams(proxyURL)
 	resList, err := api.ListObjects(baseParams, bck, msg, api.ListArgs{})
-	tassert.Fatalf(t, err == nil, "%s: list-objects failed: %v", bck, err)
+	tassert.Fatalf(t, err == nil, "%s: list-objects failed: %v", bck.String(), err)
 	return resList
 }

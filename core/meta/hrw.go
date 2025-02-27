@@ -6,11 +6,11 @@ package meta
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/cmn/xoshiro256"
 	"github.com/OneOfOne/xxhash"
 )
@@ -19,12 +19,12 @@ import (
 // aka highest random weight (HRW)
 // See also: fs/hrw.go
 
-var robin atomic.Uint64 // round
-
 func (smap *Smap) HrwName2T(uname []byte) (*Snode, error) {
 	digest := xxhash.Checksum64S(uname, cos.MLCG32)
 	return smap.HrwHash2T(digest)
 }
+
+// TODO: control plane multihoming: return LRU data plane interface
 
 func (smap *Smap) HrwMultiHome(uname []byte) (si *Snode, netName string, err error) {
 	digest := xxhash.Checksum64S(uname, cos.MLCG32)
@@ -32,15 +32,9 @@ func (smap *Smap) HrwMultiHome(uname []byte) (si *Snode, netName string, err err
 	if err != nil {
 		return nil, cmn.NetPublic, err
 	}
-	l := len(si.PubExtra)
-	if l == 0 {
-		return si, cmn.NetPublic, nil
-	}
-	i := robin.Add(1) % uint64(l+1)
-	if i == 0 {
-		return si, cmn.NetPublic, nil
-	}
-	return si, si.PubExtra[i-1].URL, nil
+
+	debug.Assert(si.nmr != nil, si.StringEx(), " in ", smap.StringEx()) // see related: smapOwner.put
+	return si, si.nmr.name(), nil
 }
 
 func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
@@ -49,7 +43,7 @@ func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
 		if tsi.InMaintOrDecomm() { // always skipping targets 'in maintenance mode'
 			continue
 		}
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -65,7 +59,7 @@ func (smap *Smap) HrwHash2T(digest uint64) (si *Snode, err error) {
 func (smap *Smap) HrwHash2Tall(digest uint64) (si *Snode, err error) {
 	var maxH uint64
 	for _, tsi := range smap.Tmap {
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -89,7 +83,7 @@ func (smap *Smap) HrwProxy(idToSkip string) (pi *Snode, err error) {
 		if psi.InMaintOrDecomm() {
 			continue
 		}
-		if d := psi.Digest(); d >= maxH {
+		if d := psi.digest(); d >= maxH {
 			maxH = d
 			pi = psi
 		}
@@ -109,7 +103,7 @@ func (smap *Smap) HrwIC(uuid string) (pi *Snode, err error) {
 		if psi.InMaintOrDecomm() || !psi.IsIC() {
 			continue
 		}
-		cs := xoshiro256.Hash(psi.Digest() ^ digest)
+		cs := xoshiro256.Hash(psi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			pi = psi
@@ -132,8 +126,7 @@ func (smap *Smap) HrwTargetTask(uuid string) (si *Snode, err error) {
 		if tsi.InMaintOrDecomm() {
 			continue
 		}
-		// Assumes that sinfo.idDigest is initialized
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if cs >= maxH {
 			maxH = cs
 			si = tsi
@@ -172,7 +165,7 @@ func (smap *Smap) HrwTargetList(uname *string, count int) (sis Nodes, err error)
 	hlist := newHrwList(count)
 
 	for _, tsi := range smap.Tmap {
-		cs := xoshiro256.Hash(tsi.Digest() ^ digest)
+		cs := xoshiro256.Hash(tsi.digest() ^ digest)
 		if tsi.InMaintOrDecomm() {
 			continue
 		}

@@ -1,11 +1,10 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
 import (
-	"io"
 	"net/http"
 	"net/url"
 	"sync"
@@ -64,10 +63,12 @@ func call(reqArgs *cmn.HreqArgs) response {
 	}
 
 	resp, err := bcastClient.Do(req) //nolint:bodyclose // Closed inside `cos.Close`.
+
+	cmn.HreqFree(req)
 	if err != nil {
 		return response{err: err, statusCode: http.StatusInternalServerError}
 	}
-	out, err := io.ReadAll(resp.Body)
+	out, err := cos.ReadAll(resp.Body)
 	cos.Close(resp.Body)
 	return response{res: out, err: err, statusCode: resp.StatusCode}
 }

@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort_test
 
@@ -13,7 +13,7 @@ import (
 )
 
 func init() {
-	hk.TestInit()
+	hk.Init(false)
 }
 
 func TestDsort(t *testing.T) {

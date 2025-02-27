@@ -68,16 +68,17 @@ type (
 
 	// Snode - a node (gateway or target) in a cluster
 	Snode struct {
+		nmr        NetNamer
 		LocalNet   *net.IPNet `json:"-"`
-		PubNet     NetInfo    `json:"public_net"` // cmn.NetPublic
-		PubExtra   []NetInfo  `json:"pub_extra,omitempty"`
+		PubNet     NetInfo    `json:"public_net"`        // cmn.NetPublic
 		DataNet    NetInfo    `json:"intra_data_net"`    // cmn.NetIntraData
 		ControlNet NetInfo    `json:"intra_control_net"` // cmn.NetIntraControl
-		DaeType    string     `json:"daemon_type"`       // "target" or "proxy"
+		DaeType    string     `json:"daemon_type"`       // apc.Proxy | apc.Target
 		DaeID      string     `json:"daemon_id"`
 		name       string
+		PubExtra   []NetInfo    `json:"pub_extra,omitempty"`
 		Flags      cos.BitFlags `json:"flags"` // enum { SnodeNonElectable, SnodeIC, ... }
-		idDigest   uint64
+		IDDigest   uint64       `json:"id_digest"`
 	}
 
 	Nodes   []*Snode          // slice of Snodes
@@ -99,6 +100,7 @@ type (
 // Snode //
 ///////////
 
+// init self
 func (d *Snode) Init(id, daeType string) {
 	debug.Assert(d.DaeID == "" && d.DaeType == "")
 	debug.Assert(id != "" && daeType != "")
@@ -107,11 +109,11 @@ func (d *Snode) Init(id, daeType string) {
 	d.setDigest()
 }
 
-func (d *Snode) Digest() uint64 { return d.idDigest }
+func (d *Snode) digest() uint64 { return d.IDDigest }
 
 func (d *Snode) setDigest() {
-	if d.idDigest == 0 {
-		d.idDigest = xxhash.Checksum64S(cos.UnsafeB(d.ID()), cos.MLCG32)
+	if d.IDDigest == 0 {
+		d.IDDigest = xxhash.Checksum64S(cos.UnsafeB(d.ID()), cos.MLCG32)
 	}
 }
 
@@ -119,7 +121,7 @@ func (d *Snode) ID() string   { return d.DaeID }
 func (d *Snode) Type() string { return d.DaeType } // enum { apc.Proxy, apc.Target }
 
 func (d *Snode) Name() string   { return d.name }
-func (d *Snode) String() string { return d.Name() }
+func (d *Snode) String() string { return d.name }
 
 func (d *Snode) SetName() {
 	name := d.StringEx()
@@ -401,10 +403,15 @@ func (m *Smap) String() string {
 }
 
 func (m *Smap) StringEx() string {
-	var sb strings.Builder
 	if m == nil {
 		return "Smap <nil>"
 	}
+
+	var (
+		sb strings.Builder
+		l  = 80
+	)
+	sb.Grow(l)
 	sb.WriteString("Smap v")
 	sb.WriteString(strconv.FormatInt(m.Version, 10))
 	sb.WriteByte('[')
@@ -420,6 +427,7 @@ func (m *Smap) StringEx() string {
 	sb.WriteString(", p=")
 	_counts(&sb, m.CountProxies(), m.CountActivePs())
 	sb.WriteByte(']')
+
 	return sb.String()
 }
 
@@ -455,6 +463,22 @@ func (m *Smap) HasActiveTs(except string) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+func (m *Smap) HasPeersToRebalance(except string) bool {
+	for tid, t := range m.Tmap {
+		if tid == except {
+			continue
+		}
+		if !t.InMaintOrDecomm() {
+			return true
+		}
+		// is a "peer" if still transitioning to post-rebalance state
+		if !t.Flags.IsSet(SnodeMaintPostReb) {
+			return true
+		}
 	}
 	return false
 }

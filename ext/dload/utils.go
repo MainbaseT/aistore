@@ -1,6 +1,6 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
@@ -193,6 +193,9 @@ func attrsFromLink(link string, resp *http.Response, oah cos.OAH) (size int64) {
 		if v, ok := h.EncodeVersion(resp.Header.Get(cos.S3VersionHeader)); ok {
 			oah.SetCustomKey(cmn.VersionObjMD, v)
 		}
+		if v, ok := h.EncodeETag(resp.Header.Get(cos.HdrETag)); ok {
+			oah.SetCustomKey(cmn.ETag, v)
+		}
 		if v, ok := h.EncodeCksum(resp.Header.Get(cos.S3CksumHeader)); ok {
 			oah.SetCustomKey(cmn.MD5ObjMD, v)
 		}
@@ -205,6 +208,7 @@ func attrsFromLink(link string, resp *http.Response, oah cos.OAH) (size int64) {
 		if v, ok := h.EncodeCksum(resp.Header.Get(cos.AzCksumHeader)); ok {
 			oah.SetCustomKey(cmn.MD5ObjMD, v)
 		}
+		// [TODO] Add case, if necessary, for OCI here
 	default:
 		oah.SetCustomKey(cmn.SourceObjMD, cmn.WebObjMD)
 	}
@@ -257,7 +261,7 @@ func CompareObjects(lom *core.LOM, dst *DstElement) (bool /*equal*/, error) {
 	oa := &cmn.ObjAttrs{}
 	oa.Size = attrsFromLink(dst.Link, resp, oa) // fill in from resp
 
-	return lom.Equal(oa), nil
+	return lom.CheckEq(oa) == nil, nil
 }
 
 // called via ais/prxnotifs generic mechanism

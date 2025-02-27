@@ -49,7 +49,13 @@ source ${SCRIPTS_DIR}/utils.sh
 case $1 in
 lint)
   echo "Running lint..." >&2
-  golangci-lint --timeout=15m run $(list_all_go_dirs)
+  if [[ -z ${TAGS} ]]; then
+    # using build tags from .golangci.yml
+    golangci-lint --timeout=15m run $(list_all_go_dirs)
+  else
+    # using build tags from env
+    golangci-lint --timeout=15m --build-tags="${TAGS}" run $(list_all_go_dirs)
+  fi
   exit $?
   ;;
 
@@ -80,10 +86,10 @@ spell)
   echo "Running spell check..." >&2
   case $2 in
   --fix)
-    ${GOPATH}/bin/misspell -i "colour,importas" -w -locale=US ${AISTORE_PATH}
+    ${GOPATH}/bin/misspell -i "colour,importas,lustre" -w -locale=US ${AISTORE_PATH}
     ;;
   *)
-    ${GOPATH}/bin/misspell -i "colour,importas" -error -locale=US ${AISTORE_PATH}
+    ${GOPATH}/bin/misspell -i "colour,importas,lustre" -error -locale=US "" ${AISTORE_PATH}
     ;;
   esac
   ;;

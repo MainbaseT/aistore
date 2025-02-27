@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
 
@@ -21,7 +21,7 @@ class InvalidBckProvider(Exception):
     """
 
     def __init__(self, provider):
-        super().__init__(f"Invalid bucket provider {provider}")
+        super().__init__(f"Invalid bucket provider: '{provider}'")
 
 
 # pylint: disable=unused-variable
@@ -30,9 +30,6 @@ class ErrRemoteBckNotFound(AISError):
     Raised when a remote bucket its required and missing for the requested operation
     """
 
-    def __init__(self, status_code, message):
-        super().__init__(status_code=status_code, message=message)
-
 
 # pylint: disable=unused-variable
 class ErrBckNotFound(AISError):
@@ -40,8 +37,12 @@ class ErrBckNotFound(AISError):
     Raised when a bucket is expected and not found
     """
 
-    def __init__(self, status_code, message):
-        super().__init__(status_code=status_code, message=message)
+
+# pylint: disable=unused-variable
+class ErrObjNotFound(AISError):
+    """
+    Raised when an object is expected and not found
+    """
 
 
 # pylint: disable=unused-variable
@@ -50,9 +51,6 @@ class ErrBckAlreadyExists(AISError):
     Raised when a bucket is created but already exists in AIS
     """
 
-    def __init__(self, status_code, message):
-        super().__init__(status_code=status_code, message=message)
-
 
 # pylint: disable=unused-variable
 class ErrETLAlreadyExists(AISError):
@@ -60,8 +58,12 @@ class ErrETLAlreadyExists(AISError):
     Raised when an ETL is created but already exists in AIS
     """
 
-    def __init__(self, status_code, message):
-        super().__init__(status_code=status_code, message=message)
+
+# pylint: disable=unused-variable
+class ErrETLNotFound(AISError):
+    """
+    Raised when an ETL is expected but not found
+    """
 
 
 # pylint: disable=unused-variable

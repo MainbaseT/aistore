@@ -14,10 +14,10 @@ import (
 )
 
 func init() {
-	hk.TestInit()
+	hk.Init(false)
 }
 
-func TestCluster(t *testing.T) {
+func TestCore(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, t.Name())
 }

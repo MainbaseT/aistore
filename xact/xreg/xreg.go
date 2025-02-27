@@ -139,10 +139,9 @@ func RegWithHK() {
 
 func GetXact(uuid string) (core.Xact, error) { return dreg.getXact(uuid) }
 
-func (r *registry) getXact(uuid string) (xctn core.Xact, err error) {
-	if !xact.IsValidUUID(uuid) {
-		err = fmt.Errorf("invalid UUID %q", uuid)
-		return
+func (r *registry) getXact(uuid string) (xctn core.Xact, _ error) {
+	if err := xact.CheckValidUUID(uuid); err != nil {
+		return nil, err
 	}
 	e := &r.entries
 	e.mtx.RLock()
@@ -157,7 +156,7 @@ outer:
 		}
 	}
 	e.mtx.RUnlock()
-	return
+	return xctn, nil
 }
 
 func GetAllRunning(inout *core.AllRunningInOut, periodic bool) {
@@ -392,7 +391,7 @@ func (r *registry) matchingXactsStats(match func(xctn core.Xact) bool) []*core.S
 
 func (r *registry) incFinished() { r.finDelta.Inc() }
 
-func (r *registry) hkPruneActive() time.Duration {
+func (r *registry) hkPruneActive(int64) time.Duration {
 	if r.finDelta.Swap(0) == 0 {
 		return hk.PruneActiveIval
 	}
@@ -413,7 +412,7 @@ func (r *registry) hkPruneActive() time.Duration {
 	return hk.PruneActiveIval
 }
 
-func (r *registry) hkDelOld() time.Duration {
+func (r *registry) hkDelOld(int64) time.Duration {
 	var (
 		toRemove  []string
 		numNonLso int
@@ -431,7 +430,7 @@ func (r *registry) hkDelOld() time.Duration {
 			continue
 		}
 		if xctn.Finished() {
-			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeLso {
+			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeLsoX {
 				toRemove = append(toRemove, xctn.ID())
 			}
 		}
@@ -457,8 +456,12 @@ func (r *registry) hkDelOld() time.Duration {
 	}
 	r.entries.mtx.RUnlock()
 
-	if len(toRemove) == 0 {
-		return hk.DelOldIval
+	d, ll := hk.DelOldIval, len(toRemove)
+	if l-ll > keepOldThreshold<<1 {
+		d >>= 1
+	}
+	if ll == 0 {
+		return d
 	}
 
 	// cleanup
@@ -467,7 +470,8 @@ func (r *registry) hkDelOld() time.Duration {
 		r.entries.del(id)
 	}
 	r.entries.mtx.Unlock()
-	return hk.DelOldIval
+
+	return d
 }
 
 func (r *registry) renewByID(entry Renewable, bck *meta.Bck) (rns RenewRes) {
@@ -828,7 +832,10 @@ func (rns *RenewRes) beingRenewed() {
 /////////
 
 func (flt *Flt) String() string {
-	msg := xact.QueryMsg{OnlyRunning: flt.OnlyRunning, Bck: flt.Bck.Clone(), ID: flt.ID, Kind: flt.Kind}
+	msg := xact.QueryMsg{OnlyRunning: flt.OnlyRunning, ID: flt.ID, Kind: flt.Kind}
+	if flt.Bck != nil {
+		msg.Bck = flt.Bck.Clone()
+	}
 	return msg.String()
 }
 

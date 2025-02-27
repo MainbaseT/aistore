@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
 	"github.com/NVIDIA/aistore/xact/xreg"
+	"github.com/NVIDIA/aistore/xact/xs"
 )
 
 //
@@ -58,6 +60,7 @@ type (
 		workFQN    string        // temp fqn to be renamed
 		atime      int64         // access time.Now()
 		ltime      int64         // mono.NanoTime, to measure latency
+		rltime     int64         // mono.NanoTime, to measure remote bucket latency
 		size       int64         // aka Content-Length
 		owt        cmn.OWT       // object write transaction enum { OwtPut, ..., OwtGet* }
 		restful    bool          // being invoked via RESTful API
@@ -65,6 +68,7 @@ type (
 		skipEC     bool          // do not erasure-encode when finalizing
 		skipVC     bool          // skip loading existing Version and skip comparing Checksums (skip VC)
 		coldGET    bool          // (one implication: proceed to write)
+		remoteErr  bool          // to exclude `putRemote` errors when counting soft IO errors
 	}
 
 	getOI struct {
@@ -77,12 +81,21 @@ type (
 		ranges     byteRanges // range read (see https://www.rfc-editor.org/rfc/rfc7233#section-2.1)
 		atime      int64      // access time.Now()
 		ltime      int64      // mono.NanoTime, to measure latency
+		rstarttime int64      // mono.NanoTime, mark start of remote GET to measure latency
+		rltime     int64      // mono.NanoTime, to measure remote bucket latency
 		chunked    bool       // chunked transfer (en)coding: https://tools.ietf.org/html/rfc7230#page-36
 		unlocked   bool       // internal
 		verchanged bool       // version changed
 		retry      bool       // once
 		cold       bool       // true if executed backend.Get
 		latestVer  bool       // QparamLatestVer || 'versioning.*_warm_get'
+		isIOErr    bool       // to count GET error as a "IO error"; see `Trunner._softErrs()`
+	}
+	_uplock struct {
+		config  *cmn.Config
+		timeout time.Duration
+		elapsed time.Duration
+		sleep   time.Duration
 	}
 
 	// textbook append: (packed) handle and control structure (see also `putA2I` arch below)
@@ -92,7 +105,6 @@ type (
 		workFQN      string
 	}
 	apndOI struct {
-		started int64         // start time (nanoseconds)
 		r       io.ReadCloser // content reader
 		t       *target       // this
 		config  *cmn.Config   // (during this request)
@@ -100,10 +112,11 @@ type (
 		cksum   *cos.Cksum    // checksum expected once Flush-ed
 		hdl     aoHdl         // (packed)
 		op      string        // enum {apc.AppendOp, apc.FlushOp}
+		started int64         // start time (nanoseconds)
 		size    int64         // Content-Length
 	}
 
-	copyOI core.CopyParams
+	coi xs.CoiParams
 
 	sendArgs struct {
 		reader    cos.ReadOpenCloser
@@ -165,12 +178,23 @@ func (poi *putOI) do(resphdr http.Header, r *http.Request, dpq *dpq) (int, error
 }
 
 func (poi *putOI) putObject() (ecode int, err error) {
+	if lom := poi.lom; lom.IsFntl() {
+		// fixup fntl
+		var (
+			short = lom.ShortenFntl()
+			saved = lom.PushFntl(short)
+		)
+		lom.SetCustomKey(cmn.OrigFntl, saved[0])
+		poi.workFQN = fs.CSM.Gen(lom, fs.WorkfileType, "fntl-0x24")
+	}
+
 	poi.ltime = mono.NanoTime()
-	// PUT is a no-op if the checksums do match
-	if !poi.skipVC && !poi.coldGET && !poi.cksumToUse.IsEmpty() {
+
+	// if checksums match PUT is a no-op
+	if !poi.skipVC && !poi.coldGET {
 		if poi.lom.EqCksum(poi.cksumToUse) {
 			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-				nlog.Infof("destination %s has identical %s: PUT is a no-op", poi.lom, poi.cksumToUse)
+				nlog.Infoln(poi.lom.String(), "has identical", poi.cksumToUse.String(), "- PUT is a no-op")
 			}
 			cos.DrainReader(poi.r)
 			return 0, nil
@@ -188,45 +212,86 @@ func (poi *putOI) putObject() (ecode int, err error) {
 		goto rerr
 	}
 
-	// resp. header & stats
-	if !poi.t2t {
-		// NOTE: counting only user PUTs; ignoring EC and copies, on the one hand, and
-		// same-checksum-skip-writing, on the other
-		if poi.owt == cmn.OwtPut && poi.restful {
-			debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
-			size := poi.lom.Lsize()
-			poi.t.statsT.AddMany(
-				cos.NamedVal64{Name: stats.PutCount, Value: 1},
-				cos.NamedVal64{Name: stats.PutSize, Value: size},
-				cos.NamedVal64{Name: stats.PutThroughput, Value: size},
-				cos.NamedVal64{Name: stats.PutLatency, Value: mono.SinceNano(poi.ltime)},
-			)
-			// RESTful PUT response header
-			if poi.resphdr != nil {
-				cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr, 0 /*skip setting content-length*/)
-			}
+	// NOTE stats: counting xactions and user PUTs; not counting (cold-GET -> PUT)
+	if poi.xctn != nil {
+		poi.stats()
+		if poi.owt == cmn.OwtPromote {
+			poi.xctn.InObjsAdd(1, poi.lom.Lsize())
 		}
-	} else if poi.xctn != nil && poi.owt == cmn.OwtPromote {
-		// xaction in-objs counters, promote first
-		poi.xctn.InObjsAdd(1, poi.lom.Lsize())
+	} else if !poi.t2t && poi.owt == cmn.OwtPut && poi.restful {
+		// user PUT
+		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
+		poi.stats()
+		// response header
+		if poi.resphdr != nil {
+			cmn.ToHeader(poi.lom.ObjAttrs(), poi.resphdr, 0 /*skip setting content-length*/)
+		}
 	}
+
 	if cmn.Rom.FastV(5, cos.SmoduleAIS) {
 		nlog.Infoln(poi.loghdr())
 	}
-	return
+	return 0, nil
 rerr:
 	if poi.owt == cmn.OwtPut && poi.restful && !poi.t2t {
-		poi.t.statsT.IncErr(stats.PutCount)
+		vlabs := poi._vlabs()
+		poi.t.statsT.IncWith(stats.ErrPutCount, vlabs)
+
+		if err != cmn.ErrSkip && !poi.remoteErr && err != io.ErrUnexpectedEOF && !cos.IsRetriableConnErr(err) && !cos.IsErrMv(err) {
+			poi.t.statsT.IncWith(stats.IOErrPutCount, vlabs)
+			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
+				nlog.Warningln("io-error [", err, "]", poi.loghdr())
+			}
+		}
 	}
-	return
+	return ecode, err
+}
+
+func (poi *putOI) _vlabs() map[string]string {
+	vlabs := map[string]string{stats.VarlabBucket: poi.lom.Bck().Cname(""), stats.VarlabXactKind: "", stats.VarlabXactID: ""}
+	if poi.xctn != nil {
+		vlabs[stats.VarlabXactKind] = poi.xctn.Kind()
+		vlabs[stats.VarlabXactID] = poi.xctn.ID()
+	}
+	return vlabs
+}
+
+func (poi *putOI) stats() {
+	var (
+		bck   = poi.lom.Bck()
+		size  = poi.lom.Lsize()
+		delta = mono.SinceNano(poi.ltime)
+		vlabs = poi._vlabs()
+	)
+	poi.t.statsT.IncWith(stats.PutCount, vlabs)
+	poi.t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.PutSize, Value: size, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.PutThroughput, Value: size, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.PutLatency, Value: delta, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta, VarLabs: vlabs},
+	)
+	if poi.rltime > 0 {
+		debug.Assert(bck.IsRemote())
+		backend := poi.t.Backend(bck)
+		poi.t.statsT.IncWith(backend.MetricName(stats.PutCount), vlabs)
+		poi.t.statsT.AddWith(
+			cos.NamedVal64{Name: backend.MetricName(stats.PutLatencyTotal), Value: poi.rltime, VarLabs: vlabs},
+			cos.NamedVal64{Name: backend.MetricName(stats.PutE2ELatencyTotal), Value: delta, VarLabs: vlabs},
+			cos.NamedVal64{Name: backend.MetricName(stats.PutSize), Value: size, VarLabs: vlabs},
+		)
+	}
 }
 
 // verbose only
 func (poi *putOI) loghdr() string {
-	sb := strings.Builder{}
+	var (
+		sb strings.Builder
+		l  = 128
+	)
+	sb.Grow(l)
 	sb.WriteString(poi.owt.String())
 	sb.WriteString(", ")
-	sb.WriteString(poi.lom.String())
+	sb.WriteString(poi.lom.Cname())
 	if poi.xctn != nil {
 		sb.WriteString(", ")
 		sb.WriteString(poi.xctn.String())
@@ -246,10 +311,10 @@ func (poi *putOI) loghdr() string {
 func (poi *putOI) finalize() (ecode int, err error) {
 	if ecode, err = poi.fini(); err != nil {
 		if err1 := cos.Stat(poi.workFQN); err1 == nil || !os.IsNotExist(err1) {
+			// cleanup: rm work-fqn
 			if err1 == nil {
 				err1 = err
 			}
-			poi.t.fsErr(err1, poi.workFQN)
 			if err2 := cos.RemoveFile(poi.workFQN); err2 != nil && !os.IsNotExist(err2) {
 				nlog.Errorf(fmtNested, poi.t, err1, "remove", poi.workFQN, err2)
 			}
@@ -273,6 +338,19 @@ func (poi *putOI) finalize() (ecode int, err error) {
 	return 0, nil
 }
 
+// TODO: poor man's retry; rate-limit instead & handle cmn.ErrTooManyRequests - here and elsewhere
+// - only once; e.g. error message:
+// - googleapi: "Error 503: We encountered an internal error. Please try again."
+func (poi *putOI) _retry503() (ecode int, err error) {
+	time.Sleep(time.Second)
+	ecode, err = poi.putRemote()
+	if err != nil {
+		return ecode, err
+	}
+	nlog.Infoln("PUT [", poi.loghdr(), "] - retried 503 ok")
+	return 0, nil
+}
+
 // poi.workFQN => LOM
 func (poi *putOI) fini() (ecode int, err error) {
 	var (
@@ -283,18 +361,16 @@ func (poi *putOI) fini() (ecode int, err error) {
 	if bck.IsRemote() && poi.owt < cmn.OwtRebalance {
 		ecode, err = poi.putRemote()
 		if err != nil {
-			loghdr := poi.loghdr()
-			nlog.Errorf("PUT (%s): %v(%d)", loghdr, err, ecode)
+			if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+				loghdr := poi.loghdr()
+				nlog.Errorln("PUT [", loghdr, err, ecode, "]")
+			}
 			if ecode != http.StatusServiceUnavailable {
-				return
+				return ecode, err
 			}
-			// (googleapi: "Error 503: We encountered an internal error. Please try again.")
-			time.Sleep(time.Second)
-			ecode, err = poi.putRemote()
-			if err != nil {
-				return
+			if ecode, err = poi._retry503(); err != nil {
+				return ecode, err
 			}
-			nlog.Infof("PUT (%s): retried OK", loghdr)
 		}
 	}
 
@@ -305,15 +381,12 @@ func (poi *putOI) fini() (ecode int, err error) {
 		// do nothing: lom is already wlocked
 	case cmn.OwtGetPrefetchLock:
 		if !lom.TryLock(true) {
-			if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-				nlog.Warningln(poi.loghdr(), "is busy")
-			}
+			nlog.Warningln(poi.loghdr(), "is busy")
 			return 0, cmn.ErrSkip // e.g. prefetch can skip it and keep on going
 		}
 		defer lom.Unlock(true)
 	default:
-		// expecting valid atime passed with `poi`
-		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
+		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime) // expecting valid atime
 		lom.Lock(true)
 		defer lom.Unlock(true)
 		lom.SetAtimeUnix(poi.atime)
@@ -327,7 +400,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 				debug.AssertNoErr(err)
 			} else if remSrc, ok := lom.GetCustomKey(cmn.SourceObjMD); !ok || remSrc == "" {
 				if err = lom.IncVersion(); err != nil {
-					nlog.Errorln(err)
+					nlog.Errorln(err) // (unlikely)
 				}
 			}
 		}
@@ -335,7 +408,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 
 	// done
 	if err = lom.RenameFinalize(poi.workFQN); err != nil {
-		return
+		return 0, err
 	}
 	if lom.HasCopies() {
 		if errdc := lom.DelAllCopies(); errdc != nil {
@@ -345,31 +418,36 @@ func (poi *putOI) fini() (ecode int, err error) {
 	if lom.AtimeUnix() == 0 { // (is set when migrating within cluster; prefetch special case)
 		lom.SetAtimeUnix(poi.atime)
 	}
-	err = lom.PersistMain()
-	return
+	return 0, lom.PersistMain()
 }
 
 // via backend.PutObj()
-func (poi *putOI) putRemote() (ecode int, err error) {
+func (poi *putOI) putRemote() (int, error) {
 	var (
-		lom     = poi.lom
-		backend = poi.t.Backend(lom.Bck())
+		lom       = poi.lom
+		startTime = mono.NanoTime()
 	)
 	lmfh, err := cos.NewFileHandle(poi.workFQN)
 	if err != nil {
-		err = cmn.NewErrFailedTo(poi.t, "open", poi.workFQN, err)
-		return
+		return 0, cmn.NewErrFailedTo(poi.t, "open", poi.workFQN, err)
 	}
 	if poi.owt == cmn.OwtPut && !lom.Bck().IsRemoteAIS() {
-		// some/all of those are set by the backend.PutObj()
-		lom.ObjAttrs().DelCustomKeys(cmn.SourceObjMD, cmn.CRC32CObjMD, cmn.ETag, cmn.MD5ObjMD, cmn.VersionObjMD)
+		lom.ObjAttrs().DelStdCustom() // backend.PutObj() will set updated values
 	}
-
+	var (
+		ecode   int
+		backend = poi.t.Backend(lom.Bck())
+	)
 	ecode, err = backend.PutObj(lmfh, lom, poi.oreq)
-	if err == nil && !lom.Bck().IsRemoteAIS() {
-		lom.SetCustomKey(cmn.SourceObjMD, backend.Provider())
+	if err == nil {
+		if !lom.Bck().IsRemoteAIS() {
+			lom.SetCustomKey(cmn.SourceObjMD, backend.Provider())
+		}
+		poi.rltime = mono.SinceNano(startTime)
+		return 0, nil
 	}
-	return
+	poi.remoteErr = true
+	return ecode, err
 }
 
 // LOM is updated at the end of this call with size and checksum.
@@ -432,11 +510,8 @@ func (poi *putOI) write() (buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 		cksums.finalized = cksums.compt == cksums.store
 		cksums.compt.Finalize()
 		if !cksums.compt.Equal(cksums.expct) {
-			err = cos.NewErrDataCksum(cksums.expct, &cksums.compt.Cksum, poi.lom.String())
-			poi.t.statsT.AddMany(
-				cos.NamedVal64{Name: stats.ErrCksumCount, Value: 1},
-				cos.NamedVal64{Name: stats.ErrCksumSize, Value: written},
-			)
+			err = cos.NewErrDataCksum(cksums.expct, &cksums.compt.Cksum, poi.lom.Cname())
+			poi.t.statsT.IncWith(stats.ErrPutCksumCount, poi._vlabs())
 			return
 		}
 	}
@@ -482,7 +557,7 @@ func (poi *putOI) _cleanup(buf []byte, slab *memsys.Slab, lmfh cos.LomWriter, er
 
 func (poi *putOI) validateCksum(c *cmn.CksumConf) (v bool) {
 	switch poi.owt {
-	case cmn.OwtRebalance, cmn.OwtCopy:
+	case cmn.OwtRebalance, cmn.OwtCopy, cmn.OwtCopySameBucket:
 		v = c.ValidateObjMove
 	case cmn.OwtPut:
 		v = true
@@ -512,6 +587,7 @@ func (goi *getOI) getObject() (ecode int, err error) {
 // is under rlock
 func (goi *getOI) get() (ecode int, err error) {
 	var (
+		uplock      *_uplock
 		cs          fs.CapStatus
 		doubleCheck bool
 		retried     bool
@@ -522,6 +598,7 @@ do:
 	if err != nil {
 		cold = cos.IsNotExist(err, 0)
 		if !cold {
+			goi.isIOErr = true
 			return http.StatusInternalServerError, err
 		}
 		if goi.lom.IsFeatureSet(feat.DisableColdGET) && goi.lom.Bck().IsRemote() {
@@ -530,9 +607,6 @@ do:
 		cs = fs.Cap()
 		if cs.IsOOS() {
 			return http.StatusInsufficientStorage, cs.Err()
-		}
-		if errN := cmn.ValidateObjName(goi.lom.ObjName); errN != nil {
-			return 0, errN
 		}
 	}
 
@@ -546,6 +620,7 @@ do:
 			er2 := lom2.InitBck(goi.lom.Bucket())
 			if er2 == nil {
 				er2 = lom2.Load(true /*cache it*/, false /*locked*/)
+				goi.isIOErr = true
 			}
 			if er2 == nil {
 				core.FreeLOM(goi.lom)
@@ -561,6 +636,7 @@ do:
 		}
 		goi.lom.Lock(false)
 		if err = goi.lom.Load(true /*cache it*/, true /*locked*/); err != nil {
+			goi.isIOErr = true
 			return 0, err
 		}
 		goto fin // ok, done
@@ -586,16 +662,16 @@ do:
 				nlog.Errorln(err)
 				return ecode, err
 			}
-			nlog.Errorf("%v - proceeding to cold-GET from %s", err, goi.lom.Bck())
+			nlog.Errorln(err, "- proceeding to cold-GET from", goi.lom.Bck().Cname(""))
 		}
 	}
 
-	// cold-GET: upgrade rlock => wlock, call t.Backend.GetObjReader
+	// cold-GET: upgrade rlock => wlock and call t.Backend.GetObjReader
 	if cold {
 		var (
-			res    core.GetReaderResult
-			ckconf = goi.lom.CksumConf()
-			loaded bool
+			res     core.GetReaderResult
+			ckconf  = goi.lom.CksumConf()
+			backend = goi.t.Backend(goi.lom.Bck())
 		)
 		if cs.IsNil() {
 			cs = fs.Cap()
@@ -603,25 +679,34 @@ do:
 		if cs.IsOOS() {
 			return http.StatusInsufficientStorage, cs.Err()
 		}
+
+		// try upgrading rlock => wlock; poll for a while
+		if !goi.lom.UpgradeLock() {
+			if uplock == nil {
+				c := cmn.GCO.Get()
+				uplock = &_uplock{config: c, sleep: time.Second}
+				uplock.timeout = max(c.Timeout.MaxHostBusy.D()-c.Timeout.CplaneOperation.D(), 4*time.Second)
+
+				nlog.Warningln(uplockWarn, goi.lom.String())
+			}
+			if err := uplock.do(goi.lom); err != nil {
+				return http.StatusConflict, err
+			}
+			goto do
+		}
+
 		goi.lom.SetAtimeUnix(goi.atime)
-
-		if loaded, err = goi._coldLock(); err != nil {
-			return 0, err
-		}
-		if loaded {
-			goto fin
-		}
-
 		// zero-out prev. version custom metadata, if any
 		goi.lom.SetCustomMD(nil)
 
+		goi.rstarttime = mono.NanoTime()
 		// get remote reader (compare w/ t.GetCold)
-		res = goi.t.Backend(goi.lom.Bck()).GetObjReader(goi.ctx, goi.lom, 0, 0)
+		res = backend.GetObjReader(goi.ctx, goi.lom, 0, 0)
 		if res.Err != nil {
 			goi.lom.Unlock(true)
 			goi.unlocked = true
 			if !cos.IsNotExist(res.Err, res.ErrCode) {
-				nlog.Infoln(ftcg+"(read)", goi.lom.Cname(), res.Err, res.ErrCode)
+				nlog.Infoln(ftcg, "(read)", goi.lom.Cname(), res.Err, res.ErrCode)
 			}
 			return res.ErrCode, res.Err
 		}
@@ -644,60 +729,25 @@ do:
 			goi.unlocked = true
 			return ecode, err
 		}
-		// with remaining stats via goi.stats()
-		goi.t.statsT.AddMany(
-			cos.NamedVal64{Name: stats.GetColdCount, Value: 1},
-			cos.NamedVal64{Name: stats.GetColdSize, Value: res.Size},
-			cos.NamedVal64{Name: stats.GetColdRwLatency, Value: mono.SinceNano(goi.ltime)},
-		)
+		goi.rltime = mono.SinceNano(goi.rstarttime)
 	}
 
 	// read locally and stream back
 fin:
 	ecode, err = goi.txfini()
 	if err == nil {
-		debug.Assert(ecode == 0, ecode)
 		return 0, nil
 	}
 	goi.lom.Uncache()
 	if goi.retry {
 		goi.retry = false
 		if !retried {
-			nlog.Warningf("GET %s: retrying...", goi.lom)
-			retried = true // only once
+			nlog.Warningln("retrying", goi.lom.String(), err)
+			retried = true
 			goto do
 		}
-		nlog.Warningf("GET %s: failed retrying %v(%d)", goi.lom, err, ecode)
 	}
 	return ecode, err
-}
-
-// upgrade rlock => wlock
-// done early to prevent multiple cold-readers duplicating network/disk operation and overwriting each other
-func (goi *getOI) _coldLock() (loaded bool, err error) {
-	var (
-		t, lom = goi.t, goi.lom
-		now    int64
-	)
-outer:
-	for lom.UpgradeLock() {
-		if erl := lom.Load(true /*cache it*/, true /*locked*/); erl == nil {
-			// nothing to do
-			// (lock was upgraded by another goroutine that had also performed PUT on our behalf)
-			return true, nil
-		}
-		switch {
-		case now == 0:
-			now = mono.NanoTime()
-			fallthrough
-		case mono.Since(now) < max(cmn.Rom.CplaneOperation(), 2*time.Second):
-			nlog.Errorln(t.String()+": failed to load", lom.String(), err, "- retrying...")
-		default:
-			err = cmn.NewErrBusy("object", lom.Cname())
-			break outer
-		}
-	}
-	return
 }
 
 func (goi *getOI) _coldPut(res *core.GetReaderResult) (int, error) {
@@ -722,7 +772,7 @@ func (goi *getOI) _coldPut(res *core.GetReaderResult) (int, error) {
 
 	if err != nil {
 		lom.Unlock(true)
-		nlog.Infoln(ftcg+"(put)", lom.Cname(), err)
+		nlog.Infoln(ftcg, "(put)", lom.Cname(), err)
 		return code, err
 	}
 
@@ -738,9 +788,11 @@ func (goi *getOI) _coldPut(res *core.GetReaderResult) (int, error) {
 	return 0, nil
 }
 
-// - validate checksums
-// - if corrupted and IsAIS, try to recover from redundant replicas or EC slices
-// - otherwise, rely on the remote backend for recovery (tradeoff; TODO: make it configurable)
+// validateRecover first validates and tries to recover a corrupted object:
+//   - validate checksums
+//   - if corrupted and IsAIS or coldGET not permitted, try to recover from redundant
+//     replicas or EC slices
+//   - otherwise, rely on the remote backend for recovery (tradeoff; TODO: make it configurable)
 func (goi *getOI) validateRecover() (coldGet bool, code int, err error) {
 	var (
 		lom     = goi.lom
@@ -758,7 +810,7 @@ validate:
 	if _, ok := err.(*cos.ErrBadCksum); !ok {
 		return
 	}
-	if !lom.Bck().IsAIS() {
+	if !lom.Bck().IsAIS() && !goi.lom.IsFeatureSet(feat.DisableColdGET) {
 		coldGet = true
 		return
 	}
@@ -877,16 +929,16 @@ gfn:
 		}
 	}
 
-	// restore from existing EC slices, if possible
-	ecErr := ec.ECM.RestoreObject(goi.lom)
+	// restore from existing EC slices
+	ecErr := ec.ECM.Recover(goi.lom)
 	if ecErr == nil {
 		ecErr = goi.lom.Load(true /*cache it*/, false /*locked*/) // TODO: optimize locking
-		debug.AssertNoErr(ecErr)
 		if ecErr == nil {
-			nlog.Infoln(goi.t.String(), "EC-recovered", goi.lom.String())
+			nlog.Infoln(goi.t.String(), "EC-recovered", goi.lom.Cname())
 			return
 		}
 		err = cmn.NewErrFailedTo(goi.t, "load EC-recovered", goi.lom.Cname(), ecErr)
+		nlog.Errorln(ecErr)
 	} else if ecErr != ec.ErrorECDisabled {
 		err = cmn.NewErrFailedTo(goi.t, "EC-recover", goi.lom.Cname(), ecErr)
 		if cmn.IsErrCapExceeded(ecErr) {
@@ -896,7 +948,9 @@ gfn:
 	}
 
 	if err != nil {
-		err = cmn.NewErrFailedTo(goi.t, "goi-restore-any", goi.lom.Cname(), err)
+		if _, ok := err.(*cmn.ErrFailedTo); !ok {
+			err = cmn.NewErrFailedTo(goi.t, "goi-restore-any", goi.lom.Cname(), err)
+		}
 	} else {
 		err = cos.NewErrNotFound(goi.t, goi.lom.Cname())
 	}
@@ -919,12 +973,13 @@ func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
 		reqArgs.Query = query
 	}
 	config := cmn.GCO.Get()
-	req, _, cancel, err := reqArgs.ReqWithTimeout(config.Timeout.SendFile.D())
+	req, _, cancel, err := reqArgs.ReqWith(config.Timeout.SendFile.D())
 	if err != nil {
 		debug.AssertNoErr(err)
 		return false
 	}
 	defer cancel()
+	defer cmn.HreqFree(req)
 
 	resp, err := g.client.data.Do(req) //nolint:bodyclose // closed by `poi.putObject`
 	cmn.FreeHra(reqArgs)
@@ -950,7 +1005,7 @@ func (goi *getOI) getFromNeighbor(lom *core.LOM, tsi *meta.Snode) bool {
 	freePOI(poi)
 	if erp == nil {
 		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
-			nlog.Infof("%s: gfn %s <= %s", goi.t, goi.lom, tsi)
+			nlog.Infoln(goi.t.String(), "gfn", goi.lom.String(), "<=", tsi.StringEx())
 		}
 		return true
 	}
@@ -965,17 +1020,18 @@ func (goi *getOI) txfini() (ecode int, err error) {
 		fqn  = goi.lom.FQN
 		dpq  = goi.dpq
 	)
-	if !goi.cold && !dpq.isGFN {
+	if !goi.cold && !dpq.isGFN && !goi.lom.IsChunked() {
 		fqn = goi.lom.LBGet() // best-effort GET load balancing (see also mirror.findLeastUtilized())
 	}
 	// open
-	lmfh, err = os.Open(fqn)
+	lmfh, err = goi.lom.OpenFile()
 	if err != nil {
 		if os.IsNotExist(err) {
+			// NOTE: retry only once and only when ec-enabled - see goi.restoreFromAny()
 			ecode = http.StatusNotFound
-			goi.retry = true // (!lom.IsAIS() || lom.ECEnabled() || GFN...)
+			goi.retry = goi.lom.ECEnabled()
 		} else {
-			goi.t.fsErr(err, fqn)
+			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
 			ecode = http.StatusInternalServerError
 			err = cmn.NewErrFailedTo(goi.t, "goi-finalize", goi.lom.Cname(), err, ecode)
 		}
@@ -1023,6 +1079,7 @@ func (goi *getOI) _txrng(fqn string, lmfh *os.File, whdr http.Header, hrng *htra
 		_, cksumH, err := cos.CopyAndChecksum(sgl /*as ReaderFrom*/, r, nil, ckconf.Type)
 		if err != nil {
 			sgl.Free()
+			goi.isIOErr = true
 			return err
 		}
 		r = sgl
@@ -1034,6 +1091,9 @@ func (goi *getOI) _txrng(fqn string, lmfh *os.File, whdr http.Header, hrng *htra
 	// set response header
 	whdr.Set(cos.HdrContentType, cos.ContentBinary)
 	cmn.ToHeader(lom.ObjAttrs(), whdr, size, cksum)
+	if goi.dpq.isS3 {
+		s3.SetS3Headers(whdr, lom)
+	}
 
 	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
 	err = goi.transmit(r, buf, fqn)
@@ -1057,7 +1117,7 @@ func (goi *getOI) _txreg(fqn string, lmfh *os.File, whdr http.Header) (err error
 	cmn.ToHeader(lom.ObjAttrs(), whdr, size, cksum)
 	if dpq.isS3 {
 		// (expecting user to set bucket checksum = md5)
-		s3.SetEtag(whdr, lom)
+		s3.SetS3Headers(whdr, lom)
 	}
 
 	buf, slab := goi.t.gmm.AllocSize(min(size, memsys.DefaultBuf2Size))
@@ -1088,6 +1148,7 @@ func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
 		var csl cos.ReadCloseSizer
 		csl, err = ar.ReadOne(dpq.arch.path)
 		if err != nil {
+			goi.isIOErr = true
 			return cmn.NewErrFailedTo(goi.t, "extract "+dpq._archstr()+" from", lom.Cname(), err)
 		}
 		if csl == nil {
@@ -1108,6 +1169,7 @@ func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
 	whdr.Set(cos.HdrContentType, cos.ContentTar)
 	err = ar.ReadUntil(rcb, dpq.arch.regx, dpq.arch.mmode)
 	if err != nil {
+		goi.isIOErr = true
 		err = cmn.NewErrFailedTo(goi.t, "extract files that match "+dpq._archstr()+" from", lom.Cname(), err)
 	}
 	if err == nil && rcb.num == 0 {
@@ -1121,10 +1183,11 @@ func (goi *getOI) _txarch(fqn string, lmfh *os.File, whdr http.Header) error {
 func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 	written, err := cos.CopyBuffer(goi.w, r, buf)
 	if err != nil {
-		if !cos.IsRetriableConnErr(err) {
-			goi.t.fsErr(err, fqn)
+		if !cos.IsRetriableConnErr(err) || cmn.Rom.FastV(5, cos.SmoduleAIS) {
+			nlog.Warningln("failed to GET (Tx)", goi.lom.Cname(), err)
+			goi.t.FSHC(err, goi.lom.Mountpath(), fqn)
 		}
-		nlog.Errorln(cmn.NewErrFailedTo(goi.t, "GET", fqn, err))
+
 		// at this point, error is already written into the response -
 		// return special code to indicate just that
 		return errSendingResp
@@ -1138,7 +1201,8 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 		goi.t.reb.FilterAdd(*bname)
 	} else if !goi.cold { // GFN & cold-GET: must be already loaded w/ atime set
 		if err := goi.lom.Load(false /*cache it*/, true /*locked*/); err != nil {
-			nlog.Errorf("%s: GET post-transmission failure: %v", goi.t, err)
+			fs.CleanPathErr(err)
+			nlog.Errorln(goi.t.String(), "GET post-transmission failure:", err)
 			return errSendingResp
 		}
 		goi.lom.SetAtimeUnix(goi.atime)
@@ -1152,17 +1216,37 @@ func (goi *getOI) transmit(r io.Reader, buf []byte, fqn string) error {
 }
 
 func (goi *getOI) stats(written int64) {
-	goi.t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.GetCount, Value: 1},
-		cos.NamedVal64{Name: stats.GetSize, Value: written},
-		cos.NamedVal64{Name: stats.GetThroughput, Value: written},                // vis-à-vis user (as written m.b. range)
-		cos.NamedVal64{Name: stats.GetLatency, Value: mono.SinceNano(goi.ltime)}, // see also: stats.GetColdRwLatency
+	vlabs := map[string]string{stats.VarlabBucket: goi.lom.Bck().Cname("")}
+	delta := mono.SinceNano(goi.ltime)
+	goi.t.statsT.IncWith(stats.GetCount, vlabs)
+	goi.t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.GetSize, Value: written, VarLabs: vlabs},
+		cos.NamedVal64{Name: stats.GetThroughput, Value: written, VarLabs: vlabs}, // vis-à-vis user (as written m.b. range)
+		cos.NamedVal64{Name: stats.GetLatency, Value: delta, VarLabs: vlabs},      // see also: per-backend *LatencyTotal below
+		cos.NamedVal64{Name: stats.GetLatencyTotal, Value: delta, VarLabs: vlabs}, // ditto
 	)
 	if goi.verchanged {
-		goi.t.statsT.AddMany(
-			cos.NamedVal64{Name: stats.VerChangeCount, Value: 1},
-			cos.NamedVal64{Name: stats.VerChangeSize, Value: goi.lom.Lsize()},
+		goi.t.statsT.IncWith(stats.VerChangeCount, vlabs)
+		goi.t.statsT.AddWith(
+			cos.NamedVal64{Name: stats.VerChangeSize, Value: goi.lom.Lsize(), VarLabs: vlabs},
 		)
+	}
+
+	if goi.rltime > 0 {
+		bck := goi.lom.Bck()
+		backend := goi.t.Backend(bck)
+		goi.t.statsT.IncWith(backend.MetricName(stats.GetCount), vlabs)
+		goi.t.statsT.AddWith(
+			cos.NamedVal64{Name: backend.MetricName(stats.GetE2ELatencyTotal), Value: delta, VarLabs: vlabs},
+			cos.NamedVal64{Name: backend.MetricName(stats.GetLatencyTotal), Value: goi.rltime, VarLabs: vlabs},
+			cos.NamedVal64{Name: backend.MetricName(stats.GetSize), Value: written, VarLabs: vlabs},
+		)
+		if goi.verchanged {
+			goi.t.statsT.IncWith(backend.MetricName(stats.VerChangeCount), vlabs)
+			goi.t.statsT.AddWith(
+				cos.NamedVal64{Name: backend.MetricName(stats.VerChangeSize), Value: goi.lom.Lsize(), VarLabs: vlabs},
+			)
+		}
 	}
 }
 
@@ -1278,12 +1362,13 @@ func (a *apndOI) apnd(buf []byte) (packedHdl string, ecode int, err error) {
 
 	// stats (TODO: add `stats.FlushCount` for symmetry)
 	lat := time.Now().UnixNano() - a.started
-	a.t.statsT.AddMany(
-		cos.NamedVal64{Name: stats.AppendCount, Value: 1},
-		cos.NamedVal64{Name: stats.AppendLatency, Value: lat},
+	vlabs := map[string]string{stats.VarlabBucket: a.lom.Bck().Cname("")}
+	a.t.statsT.IncWith(stats.AppendCount, vlabs)
+	a.t.statsT.AddWith(
+		cos.NamedVal64{Name: stats.AppendLatency, Value: lat, VarLabs: vlabs},
 	)
 	if cmn.Rom.FastV(4, cos.SmoduleAIS) {
-		nlog.Infof("APPEND %s: %s", a.lom, lat)
+		nlog.Infoln("APPEND", a.lom.String(), time.Duration(lat))
 	}
 	return
 }
@@ -1350,13 +1435,13 @@ func (a *apndOI) pack(workFQN string) string {
 //
 
 // main method
-func (coi *copyOI) do(t *target, dm *bundle.DataMover, lom *core.LOM) (size int64, err error) {
+func (coi *coi) do(t *target, dm *bundle.DataMover, lom *core.LOM) (size int64, err error) {
 	if coi.DryRun {
 		return coi._dryRun(lom, coi.ObjnameTo)
 	}
 
 	// DP == nil: use default (no-op transform) if source bucket is remote
-	if coi.DP == nil && lom.Bck().IsRemote() {
+	if coi.DP == nil && (lom.Bck().IsRemote() || coi.BckTo.IsRemote()) {
 		coi.DP = &core.LDP{}
 	}
 
@@ -1373,23 +1458,55 @@ func (coi *copyOI) do(t *target, dm *bundle.DataMover, lom *core.LOM) (size int6
 	// dst is this target
 	// 2, 3: with transformation and without
 	dst := core.AllocLOM(coi.ObjnameTo)
+	defer core.FreeLOM(dst)
+
 	if err := dst.InitBck(coi.BckTo.Bucket()); err != nil {
-		core.FreeLOM(dst)
 		return 0, err
 	}
+	// check for no-op
+	if coi.isNOP(lom, dst, dm) {
+		if cmn.Rom.FastV(5, cos.SmoduleAIS) {
+			nlog.Infoln("copying", lom.String(), "=>", dst.String(), "is a no-op: destination exists and is identical")
+		}
+		return
+	}
+	// do
 	if coi.DP != nil {
 		var ecode int
 		size, ecode, err = coi._reader(t, dm, lom, dst)
 		debug.Assert(ecode != http.StatusNotFound || cos.IsNotExist(err, 0), err, ecode)
 	} else {
+		// fast path (Copy2FQN)
 		size, err = coi._regular(t, lom, dst)
 	}
-	core.FreeLOM(dst)
-
 	return size, err
 }
 
-func (coi *copyOI) _dryRun(lom *core.LOM, objnameTo string) (size int64, err error) {
+func (coi *coi) isNOP(lom, dst *core.LOM, dm *bundle.DataMover) bool {
+	if coi.LatestVer || coi.Sync {
+		return false
+	}
+	owt := coi.OWT
+	if dm != nil {
+		owt = dm.OWT()
+	}
+	if owt != cmn.OwtCopy {
+		return false
+	}
+	if err := lom.Load(true, false); err != nil {
+		return false
+	}
+	if err := dst.Load(true, false); err != nil {
+		return false
+	}
+	if lom.CheckEq(dst) != nil {
+		return false
+	}
+	res := dst.CheckRemoteMD(false /*locked*/, false, nil /*origReq*/)
+	return res.Eq
+}
+
+func (coi *coi) _dryRun(lom *core.LOM, objnameTo string) (size int64, err error) {
 	if coi.DP == nil {
 		uname := coi.BckTo.MakeUname(objnameTo)
 		if lom.Uname() != cos.UnsafeS(uname) {
@@ -1417,33 +1534,42 @@ func (coi *copyOI) _dryRun(lom *core.LOM, objnameTo string) (size int64, err err
 //
 // If destination bucket is remote:
 // - create a local replica of the object on one of the targets, and
-// - PUT to the relevant backend
+// - putRemote (with one exception below)
+//
 // An option for _not_ storing the object _in_ the cluster would be a _feature_ that can be
 // further debated.
-func (coi *copyOI) _reader(t *target, dm *bundle.DataMover, lom, dst *core.LOM) (size int64, _ int, _ error) {
+func (coi *coi) _reader(t *target, dm *bundle.DataMover, lom, dst *core.LOM) (size int64, _ int, _ error) {
 	reader, oah, errN := coi.DP.Reader(lom, coi.LatestVer, coi.Sync)
 	if errN != nil {
 		return 0, 0, errN
 	}
-	if lom.Bck().Equal(coi.BckTo, true, true) {
-		dst.CopyVersion(oah)
-	}
-
 	poi := allocPOI()
 	{
 		poi.t = t
 		poi.lom = dst
 		poi.config = coi.Config
 		poi.r = reader
-		poi.owt = coi.OWT
 		poi.xctn = coi.Xact // on behalf of
 		poi.workFQN = fs.CSM.Gen(dst, fs.WorkfileType, "copy-dp")
 		poi.atime = oah.AtimeUnix()
 		poi.cksumToUse = oah.Checksum()
+
+		poi.owt = coi.OWT
+		if dm != nil {
+			poi.owt = dm.OWT() // (precedence; cmn.OwtCopy, cmn.OwtTransform - what else?)
+		}
 	}
-	if dm != nil {
-		poi.owt = dm.OWT() // (compare with _send)
+	if poi.owt == cmn.OwtCopy {
+		// preserve src metadata when copying (vs. transforming)
+		dst.CopyVersion(lom)
+		dst.SetCustomMD(lom.GetCustomMD())
+
+		// [special] when src == dst (`ais cp s3://data s3://data --all`)
+		if backend := lom.Bck().RemoteBck(); backend != nil && backend.Equal(coi.BckTo.Bucket()) {
+			poi.owt = cmn.OwtCopySameBucket
+		}
 	}
+
 	ecode, err := poi.putObject()
 	freePOI(poi)
 	if err == nil {
@@ -1453,7 +1579,7 @@ func (coi *copyOI) _reader(t *target, dm *bundle.DataMover, lom, dst *core.LOM) 
 	return size, ecode, err
 }
 
-func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error) {
+func (coi *coi) _regular(t *target, lom, dst *core.LOM) (size int64, _ error) {
 	if lom.FQN == dst.FQN { // resilvering with a single mountpath?
 		return
 	}
@@ -1480,6 +1606,8 @@ func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error)
 			return 0, err
 		}
 	}
+
+	// TODO: add a metric to count and size local copying
 	dst2, err := lom.Copy2FQN(dst.FQN, coi.Buf)
 	if err == nil {
 		size = lom.Lsize()
@@ -1496,24 +1624,25 @@ func (coi *copyOI) _regular(t *target, lom, dst *core.LOM) (size int64, _ error)
 // send object => designated target
 // * source is a LOM or a reader (that may be reading from remote)
 // * one of the two equivalent transmission mechanisms: PUT or transport Send
-func (coi *copyOI) send(t *target, dm *bundle.DataMover, lom *core.LOM, objNameTo string, tsi *meta.Snode) (size int64, err error) {
+func (coi *coi) send(t *target, dm *bundle.DataMover, lom *core.LOM, objNameTo string, tsi *meta.Snode) (size int64, err error) {
 	debug.Assert(coi.OWT > 0)
 	sargs := allocSnda()
 	{
 		sargs.objNameTo = objNameTo
 		sargs.tsi = tsi
 		sargs.dm = dm
+
 		sargs.owt = coi.OWT
-	}
-	if dm != nil {
-		sargs.owt = dm.OWT() // takes precedence
+		if dm != nil {
+			sargs.owt = dm.OWT() // (precedence; cmn.OwtCopy, cmn.OwtTransform - what else?)
+		}
 	}
 	size, err = coi._send(t, lom, sargs)
 	freeSnda(sargs)
 	return
 }
 
-func (coi *copyOI) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64, _ error) {
+func (coi *coi) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64, _ error) {
 	debug.Assert(!coi.DryRun)
 	if sargs.dm != nil {
 		// clone the `lom` to use it in the async operation (free it via `_sendObjDM` callback)
@@ -1579,7 +1708,7 @@ func (coi *copyOI) _send(t *target, lom *core.LOM, sargs *sendArgs) (size int64,
 
 // use data mover to transmit objects to other targets
 // (compare with coi.put())
-func (coi *copyOI) _dm(lom *core.LOM, sargs *sendArgs) error {
+func (coi *coi) _dm(lom *core.LOM, sargs *sendArgs) error {
 	debug.Assert(sargs.dm.OWT() == sargs.owt)
 	debug.Assert(sargs.dm.GetXact() == coi.Xact || sargs.dm.GetXact().ID() == coi.Xact.ID())
 	o := transport.AllocSend()
@@ -1597,7 +1726,7 @@ func (coi *copyOI) _dm(lom *core.LOM, sargs *sendArgs) error {
 
 // PUT(lom) => destination target (compare with coi.dm())
 // always closes params.Reader, either explicitly or via Do()
-func (coi *copyOI) put(t *target, sargs *sendArgs) error {
+func (coi *coi) put(t *target, sargs *sendArgs) error {
 	var (
 		hdr   = make(http.Header, 8)
 		query = sargs.bckTo.NewQuery()
@@ -1616,23 +1745,30 @@ func (coi *copyOI) put(t *target, sargs *sendArgs) error {
 		Header: hdr,
 		BodyR:  sargs.reader,
 	}
-	req, _, cancel, err := reqArgs.ReqWithTimeout(coi.Config.Timeout.SendFile.D())
-	if err != nil {
+	req, _, cancel, errN := reqArgs.ReqWith(coi.Config.Timeout.SendFile.D())
+	if errN != nil {
 		cos.Close(sargs.reader)
-		return fmt.Errorf("unexpected failure to create request, err: %w", err)
+		return fmt.Errorf("unexpected failure to create request, err: %w", errN)
 	}
-	defer cancel()
+
 	resp, err := g.client.data.Do(req)
 	if err != nil {
-		return cmn.NewErrFailedTo(t, "coi.put "+sargs.bckTo.Name+"/"+sargs.objNameTo, sargs.tsi, err)
+		err = cmn.NewErrFailedTo(t, "coi.put "+sargs.bckTo.Name+"/"+sargs.objNameTo, sargs.tsi, err)
+	} else {
+		cos.DrainReader(resp.Body)
+		resp.Body.Close()
 	}
-	cos.DrainReader(resp.Body)
-	resp.Body.Close()
-	return nil
+
+	cmn.HreqFree(req)
+	cancel()
+	return err
 }
 
-func (coi *copyOI) stats(size int64, err error) {
+func (coi *coi) stats(size int64, err error) {
 	if err == nil && coi.Xact != nil {
+		if size == cos.ContentLengthUnknown {
+			size = 0
+		}
 		coi.Xact.ObjsAdd(1, size)
 	}
 }
@@ -1801,7 +1937,7 @@ func (t *target) putMirror(lom *core.LOM) {
 		return
 	}
 	if mpathCnt := fs.NumAvail(); mpathCnt < int(mconfig.Copies) {
-		t.statsT.IncErr(stats.ErrPutMirrorCount)
+		// removed: inc stats.ErrPutMirrorCount
 		nanotim := mono.NanoTime()
 		if nanotim&0x7 == 7 {
 			if mpathCnt == 0 {
@@ -1821,6 +1957,31 @@ func (t *target) putMirror(lom *core.LOM) {
 	xctn := rns.Entry.Get()
 	xputlrep := xctn.(*mirror.XactPut)
 	xputlrep.Repl(lom)
+}
+
+//
+// uplock
+//
+
+const uplockWarn = "conflict getting remote"
+
+func (u *_uplock) do(lom *core.LOM) error {
+	if u.elapsed > u.timeout {
+		err := cmn.NewErrBusy("node", core.T.String(), uplockWarn+" '"+lom.Cname()+"'")
+		nlog.ErrorDepth(1, err)
+		return err
+	}
+
+	lom.Unlock(false)
+	runtime.Gosched()
+	time.Sleep(u.sleep)
+	lom.Lock(false) // all over again: try load and check all respective conditions
+
+	u.elapsed += u.sleep
+	if u.elapsed == 3*u.sleep && u.sleep < u.config.Timeout.CplaneOperation.D() {
+		u.sleep <<= 1
+	}
+	return nil
 }
 
 // TODO:

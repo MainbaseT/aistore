@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -24,13 +24,20 @@ var loggedUserToken string
 func Init(args []string) (err error) {
 	cfg, err = config.Load(args, cmdReset)
 	if err != nil {
-		return
+		return err
 	}
 	// kubernetes
 	k8sDetected = detectK8s()
 
 	// auth
-	loggedUserToken = authn.LoadToken("")
+	token := os.Getenv(env.AisAuthToken)
+	tokenFile := os.Getenv(env.AisAuthTokenFile)
+
+	if token != "" && tokenFile != "" {
+		fmt.Fprintf(os.Stderr, "Warning: both `%s` and `%s` are set, using `%s`\n", env.AisAuthToken, env.AisAuthTokenFile, env.AisAuthToken)
+	}
+
+	loggedUserToken, _ = authn.LoadToken("") // No error handling as token might not be needed
 
 	// http clients: the main one and the auth, if enabled
 	clusterURL = _clusterURL(cfg)
@@ -48,9 +55,7 @@ func Init(args []string) (err error) {
 		}
 	)
 
-	clientH = cmn.NewClient(cargs)
 	cmn.EnvToTLS(&sargs)
-	clientTLS = cmn.NewClientTLS(cargs, sargs)
 
 	apiBP = api.BaseParams{
 		URL:   clusterURL,
@@ -58,8 +63,11 @@ func Init(args []string) (err error) {
 		UA:    ua,
 	}
 	if cos.IsHTTPS(clusterURL) {
+		// TODO -- FIXME: cfg.WarnTLS("aistore at " + clusterURL)
+		clientTLS = cmn.NewClientTLS(cargs, sargs, false /*intra-cluster*/)
 		apiBP.Client = clientTLS
 	} else {
+		clientH = cmn.NewClient(cargs)
 		apiBP.Client = clientH
 	}
 
@@ -70,12 +78,19 @@ func Init(args []string) (err error) {
 			UA:    ua,
 		}
 		if cos.IsHTTPS(authnURL) {
+			if clientTLS == nil {
+				// TODO -- FIXME: cfg.WarnTLS("AuthN at " + authnURL)
+				clientTLS = cmn.NewClientTLS(cargs, sargs, false /*intra-cluster*/)
+			}
 			authParams.Client = clientTLS
 		} else {
+			if clientH == nil {
+				clientH = cmn.NewClient(cargs)
+			}
 			authParams.Client = clientH
 		}
 	}
-	return
+	return nil
 }
 
 // resolving order:
@@ -84,7 +99,7 @@ func Init(args []string) (err error) {
 // 3. Docker default; if not present:
 // 4. Default as cfg.Cluster.DefaultAISHost
 func _clusterURL(cfg *config.Config) string {
-	if envURL := os.Getenv(env.AIS.Endpoint); envURL != "" {
+	if envURL := os.Getenv(env.AisEndpoint); envURL != "" {
 		return envURL
 	}
 	if cfg.Cluster.URL != "" {

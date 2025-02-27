@@ -1,6 +1,6 @@
 // Package dsort provides distributed massively parallel resharding for very large datasets.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package dsort
 
@@ -282,7 +282,7 @@ func (ds *dsorterGeneral) loadLocal(w io.Writer, obj *shard.RecordObj) (written 
 	)
 
 	if storeType != shard.SGLStoreType { // SGL does not need buffer as it is buffer itself
-		buf, slab = g.mm.AllocSize(obj.Size)
+		buf, slab = g.mem.AllocSize(obj.Size)
 	}
 
 	defer func() {
@@ -383,10 +383,8 @@ func (ds *dsorterGeneral) loadRemote(w io.Writer, rec *shard.Record, obj *shard.
 	} else {
 		// stats
 		delta := mono.Since(beforeRecv)
-		g.tstats.AddMany(
-			cos.NamedVal64{Name: stats.DsortCreationRespCount, Value: 1},
-			cos.NamedVal64{Name: stats.DsortCreationRespLatency, Value: int64(delta)},
-		)
+		g.tstats.Inc(stats.DsortCreationRespCount)
+		g.tstats.Add(stats.DsortCreationRespLatency, int64(delta))
 	}
 
 	// If we timed out or were stopped but failed to pull the
@@ -556,7 +554,7 @@ func (ds *dsorterGeneral) recvResp(hdr *transport.ObjHdr, object io.Reader, err 
 		return nil
 	}
 
-	buf, slab := g.mm.AllocSize(hdr.ObjAttrs.Size)
+	buf, slab := g.mem.AllocSize(hdr.ObjAttrs.Size)
 	writer.n, writer.err = io.CopyBuffer(writer.w, object, buf)
 	writer.wg.Done()
 	slab.Free(buf)

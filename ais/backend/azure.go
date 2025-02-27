@@ -2,7 +2,7 @@
 
 // Package backend contains implementation of various backend providers.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -39,15 +39,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-)
-
-type (
-	azbp struct {
-		t     core.TargetPut
-		creds *azblob.SharedKeyCredential
-		u     string
-		base
-	}
+	"github.com/NVIDIA/aistore/stats"
 )
 
 const (
@@ -66,6 +58,15 @@ const (
 	azErrPrefix = "azure-error["
 )
 
+type (
+	azbp struct {
+		t     core.TargetPut
+		creds *azblob.SharedKeyCredential
+		u     string
+		base
+	}
+)
+
 // parse azure errors
 var (
 	azCleanErrRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
@@ -75,11 +76,7 @@ var (
 var _ core.Backend = (*azbp)(nil)
 
 func azProto() string {
-	proto := os.Getenv(azProtoEnvVar)
-	if proto == "" {
-		proto = azDefaultProto
-	}
-	return proto
+	return cos.Right(azDefaultProto, os.Getenv(azProtoEnvVar))
 }
 
 func azAccName() string { return os.Getenv(azAccNameEnvVar) }
@@ -101,7 +98,7 @@ func asEndpoint() string {
 	}
 }
 
-func NewAzure(t core.TargetPut) (core.Backend, error) {
+func NewAzure(t core.TargetPut, tstats stats.Tracker, startingUp bool) (core.Backend, error) {
 	blurl := asEndpoint()
 
 	// NOTE: NewSharedKeyCredential requires account name and its primary or secondary key
@@ -109,13 +106,16 @@ func NewAzure(t core.TargetPut) (core.Backend, error) {
 	if err != nil {
 		return nil, cmn.NewErrFailedTo(nil, azErrPrefix+": init]", "credentials", err)
 	}
-
-	return &azbp{
+	bp := &azbp{
 		t:     t,
 		creds: creds,
 		u:     blurl,
-		base:  base{apc.Azure},
-	}, nil
+		base:  base{provider: apc.Azure},
+	}
+	// register metrics
+	bp.base.init(t.Snode(), tstats, startingUp)
+
+	return bp, nil
 }
 
 // (compare w/ cmn/backend)
@@ -172,13 +172,20 @@ func azureErrorToAISError(azureError error, bck *cmn.Bck, objName string) (int, 
 		return http.StatusNotFound, cmn.NewErrRemoteBckNotFound(bck)
 	}
 
-	// azure error is usually a sizeable multi-line text with items including:
-	// request ID, authorization, variery of x-ms-* headers, server and user agent, and more
+	status, err := _azureErr(azureError, stgErr)
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		return status, cmn.NewErrTooManyRequests(err, status)
+	}
+	return status, err
+}
 
+// azure error is usually a sizeable multi-line text with items including:
+// request ID, authorization, variery of x-ms-* headers, server and user agent, and more
+func _azureErr(azureError error, stgErr *azcore.ResponseError) (int, error) {
 	var (
-		status      = stgErr.StatusCode
 		code        string
 		description string
+		status      = stgErr.StatusCode
 		lines       = strings.Split(azureError.Error(), "\n")
 	)
 	if resp := stgErr.RawResponse; resp != nil {
@@ -275,11 +282,11 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 	}
 
 	var (
-		custom     cos.StrKVs
 		wantCustom = msg.WantProp(apc.GetPropsCustom)
+		custom     []string
 	)
 	if wantCustom {
-		custom = make(cos.StrKVs, 4) // reuse
+		custom = make([]string, 0, 8)
 	}
 	lst.Entries = lst.Entries[:0]
 	for _, blob := range resp.Segment.BlobItems {
@@ -297,18 +304,18 @@ func (azbp *azbp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (
 		etag := azEncodeEtag(*blob.Properties.ETag)
 		en.Version = etag // (TODO a the top)
 		if wantCustom {
-			clear(custom)
-			custom[cmn.ETag] = etag
+			custom = custom[:0]
+			custom = append(custom, cmn.ETag, etag)
 			if !blob.Properties.LastModified.IsZero() {
-				custom[cmn.LastModified] = fmtTime(*blob.Properties.LastModified)
+				custom = append(custom, cmn.LastModified, fmtTime(*blob.Properties.LastModified))
 			}
 			if blob.Properties.ContentType != nil {
-				custom[cos.HdrContentType] = *blob.Properties.ContentType
+				custom = append(custom, cos.HdrContentType, *blob.Properties.ContentType)
 			}
 			if blob.VersionID != nil {
-				custom[cmn.VersionObjMD] = *blob.VersionID
+				custom = append(custom, cmn.VersionObjMD, *blob.VersionID)
 			}
-			en.Custom = cmn.CustomMD2S(custom)
+			en.Custom = cmn.CustomProps2S(custom...)
 		}
 		lst.Entries = append(lst.Entries, &en)
 	}

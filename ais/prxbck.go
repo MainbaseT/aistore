@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -97,7 +97,7 @@ func (p *proxy) a2u(aliasOrUUID string) string {
 }
 
 // initialize bucket and check access permissions
-func (bctx *bctx) init() (ecode int, err error) {
+func (bctx *bctx) init() (_ int, err error) {
 	debug.Assert(bctx.bck != nil)
 
 	bck := bctx.bck
@@ -118,8 +118,7 @@ func (bctx *bctx) init() (ecode int, err error) {
 	}
 
 	if err = bctx.accessSupported(); err != nil {
-		ecode = http.StatusMethodNotAllowed
-		return
+		return http.StatusMethodNotAllowed, err
 	}
 	if bctx.skipBackend {
 		err = bck.InitNoBackend(bctx.p.owner.bmd)
@@ -127,11 +126,10 @@ func (bctx *bctx) init() (ecode int, err error) {
 		err = bck.Init(bctx.p.owner.bmd)
 	}
 	if err != nil {
-		ecode = http.StatusBadRequest
 		if cmn.IsErrBucketNought(err) {
-			ecode = http.StatusNotFound
+			return http.StatusNotFound, err
 		}
-		return
+		return http.StatusBadRequest, err
 	}
 
 	bctx.isPresent = true
@@ -144,8 +142,7 @@ func (bctx *bctx) init() (ecode int, err error) {
 		}
 		bctx.perms = dtor.Access
 	}
-	ecode, err = bctx.accessAllowed(bck)
-	return
+	return bctx.accessAllowed(bck)
 }
 
 // returns true when operation requires the 'perm' type access
@@ -163,7 +160,7 @@ func (bctx *bctx) accessSupported() error {
 		goto rerr
 	}
 	// HTTP buckets are not writeable
-	if bctx.bck.IsHTTP() && bctx._perm(apc.AcePUT) {
+	if bctx.bck.IsHT() && bctx._perm(apc.AcePUT) {
 		op = "write to HTTP bucket"
 		goto rerr
 	}
@@ -198,6 +195,14 @@ func (bctx *bctx) initAndTry() (bck *meta.Bck, err error) {
 		return
 	}
 	if ecode != http.StatusNotFound {
+		// user GET and PUT requests: making a _silent_ exception for assorted error codes
+		// (counting them via stats.Inc though)
+		if bctx.perms == apc.AceGET || bctx.perms == apc.AcePUT {
+			if ecode == http.StatusUnauthorized || ecode == http.StatusForbidden {
+				bctx.p.writeErr(bctx.w, bctx.r, err, ecode, Silent)
+				return
+			}
+		}
 		bctx.p.writeErr(bctx.w, bctx.r, err, ecode)
 		return
 	}
@@ -221,7 +226,7 @@ func (bctx *bctx) initAndTry() (bck *meta.Bck, err error) {
 			return
 		}
 	default:
-		debug.Assertf(false, "%q: unexpected %v(%d)", bctx.bck, err, ecode)
+		debug.Assertf(false, "%q: unexpected %v(%d)", bctx.bck.String(), err, ecode)
 		bctx.p.writeErr(bctx.w, bctx.r, err, ecode)
 		return
 	}
@@ -238,12 +243,13 @@ func (bctx *bctx) try() (bck *meta.Bck, err error) {
 		return bck, err
 	case cmn.IsErrBucketAlreadyExists(err):
 		// e.g., when (re)setting backend two times in a row
-		nlog.Infoln(bctx.p.String()+":", err, " - nothing to do")
+		nlog.Infoln(bctx.p.String(), err, " - nothing to do")
 		return bck, nil
 	default:
 		if bctx.perms == apc.AceBckHEAD {
 			bctx.p.writeErr(bctx.w, bctx.r, err, ecode, Silent)
 		} else {
+			// likely, apc.AceObjLIST
 			bctx.p.writeErr(bctx.w, bctx.r, err, ecode)
 		}
 		return bck, err
@@ -256,13 +262,10 @@ func (bctx *bctx) try() (bck *meta.Bck, err error) {
 
 func (bctx *bctx) _try() (bck *meta.Bck, ecode int, err error) {
 	if err = bctx.bck.Validate(); err != nil {
-		ecode = http.StatusBadRequest
-		return
+		return bck, http.StatusBadRequest, err
 	}
-
 	if bctx.p.forwardCP(bctx.w, bctx.r, bctx.msg, "add-bucket", bctx.reqBody) {
-		err = errForwarded
-		return
+		return bck, 0, errForwarded
 	}
 
 	// am primary from this point on
@@ -276,22 +279,27 @@ func (bctx *bctx) _try() (bck *meta.Bck, ecode int, err error) {
 	}
 	if bck.IsAIS() {
 		if err = bctx.p.access(bctx.r.Header, nil /*bck*/, apc.AceCreateBucket); err != nil {
-			ecode = aceErrToCode(err)
-			return
+			return bck, aceErrToCode(err), err
 		}
-		nlog.Warningf("%s: %q doesn't exist, proceeding to create", bctx.p, bctx.bck)
+		nlog.Warningf("%s: %q doesn't exist, proceeding to create", bctx.p, bctx.bck.String())
 		goto creadd
 	}
 	action = apc.ActAddRemoteBck // only if requested via bctx
 
 	// lookup remote
-	if remoteHdr, ecode, err = bctx.lookup(bck); err != nil {
-		bck = nil
-		return
+	remoteHdr, ecode, err = bctx.lookup(bck)
+	if err == nil && ecode != http.StatusOK && bck.IsCloud() {
+		debug.Assert(ecode == http.StatusNotFound, ecode)
+		e := cmn.NewErrRemoteBckNotFound(bck.Bucket())
+		e.Set(" (cannot create cloud bucket on the fly)")
+		err = e
+	}
+	if err != nil {
+		return nil, ecode, err
 	}
 
 	// orig-url for the ht:// bucket
-	if bck.IsHTTP() {
+	if bck.IsHT() {
 		if bctx.origURLBck != "" {
 			remoteHdr.Set(apc.HdrOrigURLBck, bctx.origURLBck)
 		} else {
@@ -300,8 +308,7 @@ func (bctx *bctx) _try() (bck *meta.Bck, ecode int, err error) {
 				origURL = bctx.getOrigURL()
 			)
 			if origURL == "" {
-				err = cmn.NewErrFailedTo(bctx.p, "initialize", bctx.bck, errors.New("missing HTTP URL"))
-				return
+				return bck, 0, cmn.NewErrFailedTo(bctx.p, "initialize", bctx.bck, errors.New("missing HTTP URL"))
 			}
 			if hbo, err = cmn.NewHTTPObjPath(origURL); err != nil {
 				return
@@ -335,15 +342,18 @@ func (bctx *bctx) _try() (bck *meta.Bck, ecode int, err error) {
 	// add/create
 creadd:
 	if err = bctx.p.createBucket(&apc.ActMsg{Action: action}, bck, remoteHdr); err != nil {
-		ecode = crerrStatus(err)
-		return
+		return bck, crerrStatus(err), err
 	}
+
 	// finally, initialize the newly added/created
 	if err = bck.Init(bctx.p.owner.bmd); err != nil {
 		debug.AssertNoErr(err)
-		ecode = http.StatusInternalServerError
-		err = cmn.NewErrFailedTo(bctx.p, "post create-bucket init", bck, err, ecode)
+		return bck, http.StatusInternalServerError,
+			cmn.NewErrFailedTo(bctx.p, "post create-bucket init", bck, err, ecode)
 	}
+
+	err = bctx.p.onEC(bck)
+
 	bck = bctx.bck
 	return
 }
@@ -363,7 +373,7 @@ func (bctx *bctx) lookup(bck *meta.Bck) (hdr http.Header, code int, err error) {
 		q       = url.Values{}
 		retried bool
 	)
-	if bck.IsHTTP() {
+	if bck.IsHT() {
 		origURL := bctx.getOrigURL()
 		q.Set(apc.QparamOrigURL, origURL)
 	}
@@ -378,8 +388,8 @@ retry:
 			return
 		}
 		// NOTE: assuming OK
-		nlog.Warningf("Proceeding to add remote bucket %s to the BMD after getting err: %v(%d)", bck, err, code)
-		nlog.Warningf("Using all cluster defaults for %s property values", bck)
+		nlog.Warningf("Proceeding to add remote bucket %s to the BMD after getting err: %v(%d)", bck.String(), err, code)
+		nlog.Warningf("Using all cluster defaults for %s property values", bck.String())
 		hdr = make(http.Header, 2)
 		hdr.Set(apc.HdrBackendProvider, bck.Provider)
 		hdr.Set(apc.HdrBucketVerEnabled, "false")
@@ -388,7 +398,7 @@ retry:
 	}
 	// NOTE: retrying once (via random target)
 	if err != nil && !retried && cos.IsErrClientURLTimeout(err) {
-		nlog.Warningf("%s: HEAD(%s) timeout %q - retrying...", bctx.p, bck, errors.Unwrap(err))
+		nlog.Warningf("%s: HEAD(%s) timeout %q - retrying...", bctx.p, bck.String(), errors.Unwrap(err))
 		retried = true
 		goto retry
 	}

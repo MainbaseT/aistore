@@ -1,6 +1,6 @@
 // Package meta: cluster-level metadata
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package meta
 
@@ -8,10 +8,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 )
 
 type Bck cmn.Bck
@@ -48,7 +53,7 @@ func (b *Bck) Bucket() *cmn.Bck { return (*cmn.Bck)(b) }
 
 func (b *Bck) IsAIS() bool                  { return (*cmn.Bck)(b).IsAIS() }
 func (b *Bck) HasProvider() bool            { return (*cmn.Bck)(b).HasProvider() }
-func (b *Bck) IsHTTP() bool                 { return (*cmn.Bck)(b).IsHTTP() }
+func (b *Bck) IsHT() bool                   { return (*cmn.Bck)(b).IsHT() }
 func (b *Bck) IsCloud() bool                { return (*cmn.Bck)(b).IsCloud() }
 func (b *Bck) IsRemote() bool               { return (*cmn.Bck)(b).IsRemote() }
 func (b *Bck) IsRemoteAIS() bool            { return (*cmn.Bck)(b).IsRemoteAIS() }
@@ -68,7 +73,12 @@ func (b *Bck) IsRemoteS3() bool {
 	return backend != nil && backend.Provider == apc.AWS
 }
 
-func (b *Bck) NewQuery() url.Values               { return (*cmn.Bck)(b).NewQuery() }
+// TODO: mem-pool
+func (b *Bck) NewQuery() (q url.Values) {
+	q = make(url.Values, 4)
+	(*cmn.Bck)(b).SetQuery(q)
+	return q
+}
 func (b *Bck) AddToQuery(q url.Values) url.Values { return (*cmn.Bck)(b).AddToQuery(q) }
 
 func (b *Bck) Backend() *Bck { backend := (*cmn.Bck)(b).Backend(); return (*Bck)(backend) }
@@ -79,21 +89,23 @@ func (b *Bck) AddUnameToQuery(q url.Values, uparam string) url.Values {
 }
 
 func (b *Bck) String() string {
-	var (
-		s   string
-		bid uint64
-		bck = (*cmn.Bck)(b)
+	if b.Props == nil {
+		return b.Bucket().String()
+	}
+
+	// [NOTE]
+	// add BID
+	// for the mask to clear "ais" bit and/or other high bits reserved for LOM flags, see core/lombid
+	const (
+		aisBID = uint64(1 << 63)
 	)
-	if bck.Props != nil {
-		bid = b.Props.BID
-	}
-	if bid == 0 {
-		return bck.String()
-	}
-	if backend := bck.Backend(); backend != nil {
-		s = ", backend=" + backend.String()
-	}
-	return fmt.Sprintf("%s(%#x%s)", bck, BID(bid).serial(), s)
+	var sb strings.Builder
+	sb.Grow(64)
+	b.Bucket().Str(&sb)
+	sb.WriteString("(0x")
+	sb.WriteString(strconv.FormatUint((b.Props.BID &^ aisBID), 16))
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
@@ -115,6 +127,8 @@ func (b *Bck) Equal(other *Bck, sameID, sameBackend bool) bool {
 	}
 	return true
 }
+
+func (b *Bck) Eq(other *cmn.Bck) bool { return other.Equal(b.Bucket()) }
 
 // when the bucket is not present in the BMD:
 // - always returns the corresponding *DoesNotExist error
@@ -187,10 +201,11 @@ func (b *Bck) init(bmd *BMD) error {
 func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, ecode int) {
 	bmd := bowner.Get()
 	all := bmd.getAllByName(bckName)
-	if all == nil {
+	switch {
+	case all == nil:
 		err = cmn.NewErrBckNotFound(&cmn.Bck{Name: bckName})
 		ecode = http.StatusNotFound
-	} else if len(all) == 1 {
+	case len(all) == 1:
 		bck = &all[0]
 		if bck.Props == nil {
 			err = cmn.NewErrBckNotFound(bck.Bucket())
@@ -199,12 +214,11 @@ func InitByNameOnly(bckName string, bowner Bowner) (bck *Bck, err error, ecode i
 			debug.Assert(apc.IsRemoteProvider(backend.Provider))
 			err = backend.init(bmd)
 		}
-	} else {
-		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)",
-			bckName, all)
+	default:
+		err = fmt.Errorf("cannot unambiguously resolve bucket name %q to a single bucket (%v)", bckName, all)
 		ecode = http.StatusUnprocessableEntity
 	}
-	return
+	return bck, err, ecode
 }
 
 func (b *Bck) CksumConf() (conf *cmn.CksumConf) { return &b.Props.Cksum }
@@ -251,7 +265,53 @@ func (b *Bck) MaxPageSize() int64 {
 	case apc.Azure:
 		// ref: https://docs.microsoft.com/en-us/connectors/azureblob/#general-limits
 		return apc.MaxPageSizeAzure
+	case apc.OCI:
+		// ref: https://docs.oracle.com/en-us/iaas/api/#/en/objectstorage/20160918/Object/ListObjects
+		return apc.MaxPageSizeOCI
 	default:
 		return 1000
 	}
+}
+
+//
+// rate limits: frontend, backend with respect to `nat` (number active targets)
+//
+
+func (b *Bck) NewFrontendRateLim(na int) (*cos.BurstRateLim, time.Duration) {
+	conf := b.Props.RateLimit.Frontend
+	if !conf.Enabled {
+		return nil, 0
+	}
+	maxTokens := cos.DivRound(conf.MaxTokens, na)
+	brl, err := cos.NewBurstRateLim(maxTokens, conf.Size, conf.Interval.D())
+	if err != nil {
+		nlog.ErrorDepth(1, err)
+		debug.AssertNoErr(err)
+	}
+	return brl, divRound(conf.Interval.D(), maxTokens)
+}
+
+func divRound(ival time.Duration, maxTokens int) time.Duration {
+	a, b := int64(ival), int64(maxTokens)
+	return time.Duration((a + b/2) / b)
+}
+
+func (b *Bck) NewBackendRateLim(nat int) (*cos.AdaptRateLim, time.Duration) {
+	conf := b.Props.RateLimit.Backend
+	if !conf.Enabled {
+		return nil, 0
+	}
+	if b.IsCloud() && conf.NumRetries < 3 {
+		nlog.Warningf("%s: backend.num_retries set to %d is, which is dangerously low", b.Cname(""), conf.NumRetries)
+	}
+	// slightly increase, to compensate for potential intra-cluster imbalance
+	maxTokens := cos.DivRound(conf.MaxTokens, nat)
+	maxTokens = max(maxTokens+maxTokens>>2, 2) // slightly increase, to compensate for potential intra-cluster imbalance
+
+	arl, err := cos.NewAdaptRateLim(maxTokens, conf.NumRetries, conf.Interval.D())
+	if err != nil {
+		nlog.Errorln(err)
+		debug.AssertNoErr(err)
+	}
+	return arl, divRound(conf.Interval.D(), maxTokens)
 }

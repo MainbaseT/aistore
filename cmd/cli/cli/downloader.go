@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles download jobs in the cluster.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -79,8 +79,11 @@ func (d downloadingResult) String() string {
 			d.finishedFiles, d.errFiles)
 	}
 
-	var sb strings.Builder
-
+	var (
+		sb strings.Builder
+		l  = 1024
+	)
+	sb.Grow(l)
 	if d.totalFiles > 0 {
 		sb.WriteString(fmt.Sprintf("Downloaded %d out of %d files.", d.finishedFiles, d.totalFiles))
 	} else {
@@ -329,7 +332,7 @@ func downloadJobsList(c *cli.Context, regex string, caption bool) (int, error) {
 		return 0, V(err)
 	}
 	if caption {
-		jobCptn(c, cmdDownload, onlyActive, "", false)
+		jobCptn(c, cmdDownload, "" /*xid*/, "" /*ctlmsg*/, onlyActive, false)
 	}
 	l := len(list)
 	if l == 0 {
@@ -356,7 +359,8 @@ func downloadJobsList(c *cli.Context, regex string, caption bool) (int, error) {
 	var (
 		hideHeader  = flagIsSet(c, noHeaderFlag)
 		units, errU = parseUnitsFlag(c, unitsFlag)
-		opts        = teb.Opts{AltMap: teb.FuncMapUnits(units), UseJSON: flagIsSet(c, jsonFlag)}
+		datedTime   = flagIsSet(c, dateTimeFlag)
+		opts        = teb.Opts{AltMap: teb.FuncMapUnits(units, datedTime), UseJSON: flagIsSet(c, jsonFlag)}
 		verbose     = flagIsSet(c, verboseJobFlag)
 	)
 	debug.AssertNoErr(errU)

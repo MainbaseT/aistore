@@ -14,6 +14,7 @@ spec:
   selector:
     app: ais
     type: ais-proxy
+    pod-name: ${POD_NAME}
 ---  
 apiVersion: v1
 kind: Pod
@@ -22,6 +23,7 @@ metadata:
   labels:
     app: ais
     type: ais-proxy
+    pod-name: ${POD_NAME}
 spec:
   containers:
   - name: aisnode
@@ -50,8 +52,6 @@ spec:
       - name: AIS_NODE_ROLE
         value: "proxy"
     volumeMounts:
-     - name: aws-credentials
-       mountPath: /root/.aws/
      - name: ais-tls-certs
        mountPath: /var/certs
      - name: ais-logs
@@ -74,6 +74,7 @@ spec:
         export AIS_SKIP_VERIFY_CRT=${AIS_SKIP_VERIFY_CRT} &&
         export AIS_SERVER_CRT=${AIS_SERVER_CRT} &&
         export AIS_SERVER_KEY=${AIS_SERVER_KEY} &&
+        source /etc/ais/utils.sh &&
         source /etc/ais/aisnode_config.sh &&
         aisnode -config=/etc/ais/ais.json -local_config=/etc/ais/ais_local.json -role=proxy -ntargets=${NUM_TARGET};
   volumes:
@@ -83,10 +84,6 @@ spec:
     - name: statsd-config
       configMap:
         name: statsd-config
-    - name: aws-credentials
-      secret:
-        secretName: aws-credentials
-        optional: true
     - name: ais-tls-certs
       secret:
         secretName: ais-tls-certs

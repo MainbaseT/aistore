@@ -73,6 +73,17 @@ func SetXattrCksum(fqn string, bck cmn.Bck, cksum *cos.Cksum) error {
 	return lom.Persist()
 }
 
+func ModifyLOM(t *testing.T, fqn string, bck cmn.Bck, modify func(*testing.T, *core.LOM)) {
+	lom := &core.LOM{}
+	// NOTE: this is an intentional hack to go ahead and corrupt the checksum
+	//       - init and/or load errors are ignored on purpose
+	_ = lom.InitFQN(fqn, &bck)
+	_ = lom.LoadMetaFromFS()
+	modify(t, lom)
+	err := lom.Persist()
+	tassert.CheckFatal(t, err)
+}
+
 func CheckPathExists(t *testing.T, path string, dir bool) {
 	if fi, err := os.Stat(path); err != nil {
 		t.Fatal(err)
@@ -252,15 +263,13 @@ func AddMpath(t *testing.T, path string) {
 	tassert.Errorf(t, err == nil, "Failed adding mountpath %q, err: %v", path, err)
 }
 
-func AssertMountpathCount(t *testing.T, availableCount, disabledCount int) {
-	availableMountpaths, disabledMountpaths := fs.Get()
-	if len(availableMountpaths) != availableCount ||
-		len(disabledMountpaths) != disabledCount {
-		t.Errorf(
-			"wrong mountpaths: %d/%d, %d/%d",
-			len(availableMountpaths), availableCount,
-			len(disabledMountpaths), disabledCount,
-		)
+func AssertMountpathCount(t *testing.T, na, nd int) {
+	var (
+		avail, disabled = fs.Get()
+		la, ld          = len(avail), len(disabled)
+	)
+	if la != na || ld != nd {
+		t.Errorf("wrong mountpath count: avail (have %d, expect %d), disabled (have %d, expect %d)", la, na, ld, nd)
 	}
 }
 

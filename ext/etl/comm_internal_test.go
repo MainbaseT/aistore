@@ -1,18 +1,17 @@
 // Package etl provides utilities to initialize and use transformation pods.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package etl
 
 import (
 	cryptorand "crypto/rand"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
-	"testing"
 	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -27,14 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func TestETLTransform(t *testing.T) {
-	if testing.Short() {
-		t.Skipf("skipping %s in short mode", t.Name())
-	}
-	RegisterFailHandler(Fail)
-	RunSpecs(t, t.Name())
-}
-
 var _ = Describe("CommunicatorTest", func() {
 	var (
 		tmpDir            string
@@ -43,12 +34,13 @@ var _ = Describe("CommunicatorTest", func() {
 		targetServer      *httptest.Server
 		proxyServer       *httptest.Server
 
-		dataSize      = int64(cos.MiB * 50)
+		dataSize      = int64(50 * cos.MiB)
 		transformData = make([]byte, dataSize)
 
-		bck        = cmn.Bck{Name: "commBck", Provider: apc.AIS, Ns: cmn.NsGlobal}
-		objName    = "commObj"
-		clusterBck = meta.NewBck(
+		bck              = cmn.Bck{Name: "commBck", Provider: apc.AIS, Ns: cmn.NsGlobal}
+		objName          = "commObj"
+		etlTransformArgs = "{\"from_time\":2.43,\"to_time\":3.43}"
+		clusterBck       = meta.NewBck(
 			bck.Name, bck.Provider, bck.Ns,
 			&cmn.Bprops{Cksum: cmn.CksumConf{Type: cos.ChecksumXXHash}},
 		)
@@ -86,16 +78,24 @@ var _ = Describe("CommunicatorTest", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Initialize the HTTP servers.
-		transformerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		transformerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedEtlTransformArgs := r.URL.Query().Get(apc.QparamETLTransformArgs)
+			Expect(receivedEtlTransformArgs).To(Equal(etlTransformArgs))
+
 			_, err := w.Write(transformData)
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		targetServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			err := comm.InlineTransform(w, r, lom)
+			receivedEtlTransformArgs := r.URL.Query().Get(apc.QparamETLTransformArgs)
+			err := comm.InlineTransform(w, r, lom, receivedEtlTransformArgs)
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		proxyServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, targetServer.URL, http.StatusMovedPermanently)
+			redirectURL := targetServer.URL + r.URL.Path + "?"
+			if r.URL.RawQuery != "" {
+				redirectURL += r.URL.RawQuery + "&"
+			}
+			http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
 		}))
 	})
 
@@ -128,13 +128,15 @@ var _ = Describe("CommunicatorTest", func() {
 				uri:  transformerServer.URL,
 				xctn: xctn,
 			}
-			comm = newCommunicator(nil, boot)
+			comm = newCommunicator(nil, boot, nil)
 
-			resp, err := http.Get(proxyServer.URL)
+			q := url.Values{}
+			q.Add(apc.QparamETLTransformArgs, etlTransformArgs)
+			resp, err := http.Get(proxyServer.URL + "?" + q.Encode())
 			Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()
 
-			b, err := io.ReadAll(resp.Body)
+			b, err := cos.ReadAll(resp.Body)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(b)).To(Equal(len(transformData)))
 			Expect(b).To(Equal(transformData))

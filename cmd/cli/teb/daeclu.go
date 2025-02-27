@@ -7,9 +7,7 @@ package teb
 import (
 	"fmt"
 
-	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/stats"
 )
@@ -24,10 +22,12 @@ const (
 	colLoadAvg   = "LOAD AVERAGE"
 	colRebalance = "REBALANCE"
 	colUptime    = "UPTIME"
+	colPodName   = "K8s POD"
 	colStatus    = "STATUS"
 	colVersion   = "VERSION"
 	colBuildTime = "BUILD TIME"
-	colPodName   = "K8s POD"
+
+	colStateFlags = "ALERT"
 )
 
 // TODO: extend api.GetClusterSysInfo() and api.GetStatsAndStatus to return memsys.Pressure
@@ -39,37 +39,13 @@ const (
 	memOOM      = 200 * cos.MiB
 )
 
-func NewDaeStatus(st *stats.NodeStatus, smap *meta.Smap, daeType, units string) *Table {
-	switch daeType {
-	case apc.Proxy:
-		return newTableProxies(StstMap{st.Snode.ID(): st}, smap, units)
-	case apc.Target:
-		return newTableTargets(StstMap{st.Snode.ID(): st}, smap, units)
-	default:
-		debug.Assert(false)
-		return nil
-	}
-}
-
-func NewDaeMapStatus(ds *StatsAndStatusHelper, smap *meta.Smap, daeType, units string) *Table {
-	switch daeType {
-	case apc.Proxy:
-		return newTableProxies(ds.Pmap, smap, units)
-	case apc.Target:
-		return newTableTargets(ds.Tmap, smap, units)
-	default:
-		debug.Assert(false)
-		return nil
-	}
-}
-
 // proxy(ies)
-func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
+func (h *StatsAndStatusHelper) MakeTabP(smap *meta.Smap, units string) *Table {
 	var (
-		h        = StatsAndStatusHelper{Pmap: ps}
 		pods     = h.pods()
 		status   = h.onlineStatus()
 		versions = h.versions()
+		builds   = h.buildTimes()
 		cols     = []*header{
 			{name: colProxy},
 			{name: colMemUsed},
@@ -78,16 +54,17 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 			{name: colUptime},
 			{name: colPodName, hide: len(pods) == 1 && pods[0] == ""},
 			{name: colStatus, hide: len(status) == 1 && status[0] == NodeOnline},
-			{name: colVersion, hide: len(versions) == 1 && len(ps) > 1},
-			{name: colBuildTime, hide: len(versions) == 1 && len(ps) > 1}, // intended
+			{name: colVersion, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colBuildTime, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colStateFlags, hide: h.Pmap.allStateFlagsOK()},
 		}
 		table = newTable(cols...)
 	)
 
-	ids := ps.sortedSIDs()
+	ids := h.Pmap.sortPODs(smap, true)
 
 	for _, sid := range ids {
-		ds := ps[sid]
+		ds := h.Pmap[sid]
 
 		if ds.Status != NodeOnline {
 			nid, nstatus := fmtStatusSID(ds.Snode.ID(), smap, ds.Status)
@@ -101,6 +78,7 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 				nstatus,
 				ds.Version,
 				ds.BuildTime,
+				unknownVal,
 			}
 			table.addRow(row)
 			continue
@@ -130,6 +108,7 @@ func newTableProxies(ps StstMap, smap *meta.Smap, units string) *Table {
 			ds.Status,
 			ds.Version,
 			ds.BuildTime,
+			fmtAlerts(ds.Cluster.Flags),
 		}
 		table.addRow(row)
 	}
@@ -164,12 +143,12 @@ func _memAvail(avail int64, units, status string, high, oom bool) (string, strin
 }
 
 // target(s)
-func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
+func (h *StatsAndStatusHelper) MakeTabT(smap *meta.Smap, units string) *Table {
 	var (
-		h        = StatsAndStatusHelper{Tmap: ts}
 		pods     = h.pods()
 		status   = h.onlineStatus()
 		versions = h.versions()
+		builds   = h.buildTimes()
 		cols     = []*header{
 			{name: colTarget},
 			{name: colMemUsed},
@@ -181,15 +160,16 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 			{name: colUptime},
 			{name: colPodName, hide: len(pods) == 1 && pods[0] == ""},
 			{name: colStatus, hide: len(status) == 1 && status[0] == NodeOnline},
-			{name: colVersion, hide: len(versions) == 1 && len(ts) > 1},
-			{name: colBuildTime, hide: len(versions) == 1 && len(ts) > 1}, // intended
+			{name: colVersion, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colBuildTime, hide: len(versions) == 1 && len(builds) == 1},
+			{name: colStateFlags, hide: h.Tmap.allStateFlagsOK()},
 		}
 		table = newTable(cols...)
 	)
-	ids := ts.sortedSIDs()
+	ids := h.Tmap.sortPODs(smap, false)
 
 	for _, sid := range ids {
-		ds := ts[sid]
+		ds := h.Tmap[sid]
 
 		if ds.Status != NodeOnline {
 			nid, nstatus := fmtStatusSID(ds.Snode.ID(), smap, ds.Status)
@@ -206,6 +186,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 				nstatus,
 				ds.Version,
 				ds.BuildTime,
+				unknownVal,
 			}
 			table.addRow(row)
 			continue
@@ -225,7 +206,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 		if ds.MemCPUInfo.LoadAvg.One == 0 && ds.MemCPUInfo.LoadAvg.Five == 0 && ds.MemCPUInfo.LoadAvg.Fifteen == 0 {
 			load = UnknownStatusVal
 		}
-		capUsed := fmt.Sprintf("%d%%", ds.TargetCDF.PctAvg)
+		capUsed := fmt.Sprintf("%d%%", ds.Tcdf.PctAvg)
 		v := calcCap(ds)
 		capAvail := FmtSize(int64(v), units, 3)
 		if v == 0 {
@@ -244,6 +225,7 @@ func newTableTargets(ts StstMap, smap *meta.Smap, units string) *Table {
 			ds.Status,
 			ds.Version,
 			ds.BuildTime,
+			fmtAlerts(ds.Cluster.Flags),
 		}
 		table.addRow(row)
 	}

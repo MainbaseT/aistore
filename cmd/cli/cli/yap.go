@@ -1,6 +1,6 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -93,8 +93,8 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 	if flagIsSet(c, progressFlag) || flagIsSet(c, listFlag) || flagIsSet(c, templateFlag) {
 		// check connectivity (since '--progress' steals STDOUT with multi-object producing
 		// scary looking errors when there's no cluster)
-		if _, err = api.GetClusterMap(apiBP); err != nil {
-			return
+		if _, err := api.GetClusterMap(apiBP); err != nil {
+			return err
 		}
 	}
 	switch {
@@ -133,7 +133,7 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 			return err
 		}
 
-		const efmt = "source (%q) and flag (%s) cannot are mutually exclusive"
+		const efmt = "source (%q) and flag (%s) are mutually exclusive"
 		if flagIsSet(c, listFlag) {
 			return fmt.Errorf(efmt, a.src.arg, qflprn(listFlag))
 		}
@@ -148,24 +148,27 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 				err = fmt.Errorf("missing destination object name (in %s) - required when writing directly from standard input",
 					c.Command.ArgsUsage)
 			}
-			return
+			return err
 		}
 		// file or files
 		if a.src.abspath, err = absPath(a.src.arg); err != nil {
-			return
+			return err
 		}
+
+		// best-effort parsing: (inline range) | (local file or directrory)
+
 		// inline "range" w/ no flag, e.g.: "/tmp/www/test{0..2}{0..2}.txt" ais://nnn/www
-		pt, errV := cos.ParseBashTemplate(a.src.abspath)
-		if errV == nil {
+		pt, e1 := cos.ParseBashTemplate(a.src.abspath)
+		if e1 == nil {
 			a.pt = &pt
-			return
+			return nil
 		}
 		// local file or dir?
-		finfo, errV := os.Stat(a.src.abspath)
-		if errV != nil {
+		finfo, e2 := os.Stat(a.src.abspath)
+		if e2 != nil {
 			// must be a csv list of files embedded with the first arg
 			a.src.fdnames = splitCsv(a.src.arg)
-			return
+			return nil
 		}
 
 		a.src.finfo = finfo
@@ -175,25 +178,21 @@ func (a *putargs) parse(c *cli.Context, emptyDstOnameOK bool) (err error) {
 				// PUT [convention]: use `basename` as the destination object name, unless specified
 				a.dst.oname = filepath.Base(a.src.abspath)
 			}
-			return
+			return nil
 		}
+
 		// finally: a local (or rather, client-accessible) directory
 		a.src.isdir = true
 		a.src.recurs = flagIsSet(c, recursFlag)
-		return
+		return nil
 	}
 
 	if err := errTailArgsContainFlag(c.Args()[2:]); err != nil {
 		return err
 	}
 
-	const efmt = "too many arguments: '%s'"
-	var hint = fmt.Sprintf("(hint: wildcards must be in single or double quotes, see %s for details)", qflprn(cli.HelpFlag))
-	l := c.NArg()
-	if l > 4 {
-		return fmt.Errorf(efmt+" ...\n%s\n", strings.Join(c.Args()[2:4], " "), hint)
-	}
-	return fmt.Errorf(efmt+"\n%s\n", strings.Join(c.Args()[2:], " "), hint)
+	hint := fmt.Sprintf("(hint: wildcards must be in single or double quotes, see %s for details)", qflprn(cli.HelpFlag))
+	return fmt.Errorf("too many arguments: '%s'\n"+hint, strings.Join(c.Args(), " "))
 }
 
 func (*archbck) verb() string { return "ARCHIVE" }
@@ -226,17 +225,18 @@ func (a *archbck) parse(c *cli.Context) (err error) {
 	if a.rsrc.bck, objNameOrTmpl, err = parseBckObjURI(c, uri, true /*emptyObjnameOK*/); err != nil {
 		return err
 	}
-	objName, listObjs, tmplObjs, err := parseObjListTemplate(c, objNameOrTmpl)
+
+	oltp, err := dopOLTP(c, a.rsrc.bck, objNameOrTmpl)
 	if err != nil {
 		return err
 	}
-	if listObjs == "" && tmplObjs == "" {
-		listObjs = objName // NOTE: "pure" prefix comment in parseObjListTemplate (above)
+	if oltp.list == "" && oltp.tmpl == "" {
+		oltp.list = oltp.objName // (compare with `_prefetchOne`, `copyTransform`)
 	}
-	if listObjs != "" {
-		a.rsrc.lr.ObjNames = splitCsv(listObjs)
+	if oltp.list != "" {
+		a.rsrc.lr.ObjNames = splitCsv(oltp.list)
 	} else {
-		a.rsrc.lr.Template = tmplObjs
+		a.rsrc.lr.Template = oltp.tmpl
 	}
 	return
 }

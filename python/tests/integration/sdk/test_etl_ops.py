@@ -1,21 +1,29 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
-from itertools import cycle
-import unittest
 import hashlib
 import sys
 import time
+import unittest
+from itertools import cycle
 
 import pytest
+import xxhash
 
 from aistore.sdk import Client, Bucket
-from aistore.sdk.etl_const import ETL_COMM_HPUSH, ETL_COMM_IO
+from aistore.sdk.etl import ETLConfig
 from aistore.sdk.errors import AISError
-from aistore.sdk.etl_templates import MD5, ECHO
+from aistore.sdk.etl.etl_templates import MD5, ECHO, HASH
+from aistore.sdk.etl.etl_const import (
+    ETL_COMM_HPUSH,
+    ETL_COMM_IO,
+    ETL_COMM_HPULL,
+    ETL_COMM_HREV,
+)
+
 from tests.integration import CLUSTER_ENDPOINT
-from tests.utils import create_and_put_object, random_string
+from tests.utils import cases, create_and_put_object, random_string
 
 ETL_NAME_CODE = "etl-" + random_string(5)
 ETL_NAME_CODE_IO = "etl-" + random_string(5)
@@ -68,7 +76,11 @@ class TestETLOps(unittest.TestCase):
         code_etl = self.client.etl(ETL_NAME_CODE)
         code_etl.init_code(transform=transform)
 
-        obj = self.bucket.object(self.obj_name).get(etl_name=code_etl.name).read_all()
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=code_etl.name))
+            .read_all()
+        )
         self.assertEqual(obj, transform(bytes(self.content)))
         self.assertEqual(
             self.current_etl_count + 1, len(self.client.cluster().list_running_etls())
@@ -85,7 +97,9 @@ class TestETLOps(unittest.TestCase):
         code_io_etl.init_code(transform=main, communication_type=ETL_COMM_IO)
 
         obj_io = (
-            self.bucket.object(self.obj_name).get(etl_name=code_io_etl.name).read_all()
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=code_io_etl.name))
+            .read_all()
         )
         self.assertEqual(obj_io, transform(bytes(self.content)))
 
@@ -97,7 +111,11 @@ class TestETLOps(unittest.TestCase):
         spec_etl = self.client.etl(ETL_NAME_SPEC)
         spec_etl.init_spec(template=template)
 
-        obj = self.bucket.object(self.obj_name).get(etl_name=spec_etl.name).read_all()
+        obj = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name))
+            .read_all()
+        )
         self.assertEqual(obj, transform(bytes(self.content)))
 
         self.assertEqual(
@@ -120,7 +138,7 @@ class TestETLOps(unittest.TestCase):
         # Should transform only the object defined by the prefix filter
         self.assertEqual(len(starting_obj) - 1, len(transformed_obj))
 
-        md5_obj = temp_bck1.object(self.obj_name).get().read_all()
+        md5_obj = temp_bck1.object(self.obj_name).get_reader().read_all()
 
         # Verify bucket-level transformation and object-level transformation are the same
         self.assertEqual(obj, md5_obj)
@@ -144,7 +162,7 @@ class TestETLOps(unittest.TestCase):
         for obj_iter in temp_bck2.list_objects().entries:
             self.assertEqual(obj_iter.name.split(".")[1], "txt")
 
-        echo_obj = temp_bck2.object("temp-obj1.txt").get().read_all()
+        echo_obj = temp_bck2.object("temp-obj1.txt").get_reader().read_all()
 
         # Verify different bucket-level transformations are not the same (compare ECHO transformation and MD5
         # transformation)
@@ -230,10 +248,14 @@ class TestETLOps(unittest.TestCase):
 
         for key, value in content.items():
             transformed_obj_hpush = (
-                self.bucket.object(key).get(etl_name=md5_hpush_etl.name).read_all()
+                self.bucket.object(key)
+                .get_reader(etl=ETLConfig(name=md5_hpush_etl.name))
+                .read_all()
             )
             transformed_obj_io = (
-                self.bucket.object(key).get(etl_name=md5_io_etl.name).read_all()
+                self.bucket.object(key)
+                .get_reader(etl=ETLConfig(name=md5_io_etl.name))
+                .read_all()
             )
 
             self.assertEqual(transform(bytes(value)), transformed_obj_hpush)
@@ -252,7 +274,7 @@ class TestETLOps(unittest.TestCase):
 
         obj = (
             self.bucket.object(self.obj_name)
-            .get(etl_name=code_stream_etl.name)
+            .get_reader(etl=ETLConfig(code_stream_etl.name))
             .read_all()
         )
         md5 = hashlib.md5()
@@ -273,7 +295,9 @@ class TestETLOps(unittest.TestCase):
         xor_etl = self.client.etl("etl-xor1")
         xor_etl.init_code(transform=transform, chunk_size=32)
         transformed_obj = (
-            self.bucket.object(self.obj_name).get(etl_name=xor_etl.name).read_all()
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(xor_etl.name))
+            .read_all()
         )
         data, checksum = transformed_obj[:-32], transformed_obj[-32:]
         computed_checksum = hashlib.md5(data).hexdigest().encode()
@@ -288,7 +312,11 @@ class TestETLOps(unittest.TestCase):
         url_etl.init_code(
             transform=url_transform, arg_type="url", communication_type="hpull"
         )
-        res = self.bucket.object(self.obj_name).get(etl_name=url_etl.name).read_all()
+        res = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=url_etl.name))
+            .read_all()
+        )
         result_url = res.decode("utf-8")
 
         self.assertTrue(self.bucket.name in result_url)
@@ -315,7 +343,11 @@ class TestETLOps(unittest.TestCase):
             etl = self.client.etl(f"etl-{random_string(5)}")
             etl.init_code(transform=transform)
 
-            obj = self.bucket.object(obj_name).get(etl_name=etl.name).read_all()
+            obj = (
+                self.bucket.object(obj_name)
+                .get_reader(etl=ETLConfig(etl.name))
+                .read_all()
+            )
             self.assertEqual(obj, transform(bytes(content)))
 
     @pytest.mark.etl
@@ -363,9 +395,57 @@ class TestETLOps(unittest.TestCase):
         for src_bck, content in contents_in_bucket:
             for key, value in content.items():
                 transformed_obj = (
-                    src_bck.object(key).get(etl_name=f"etl-{src_bck.name}").read_all()
+                    src_bck.object(key)
+                    .get_reader(etl=ETLConfig(f"etl-{src_bck.name}"))
+                    .read_all()
                 )
                 self.assertEqual(transform(bytes(value)), transformed_obj)
+
+    @pytest.mark.etl
+    @cases(ETL_COMM_HPUSH, ETL_COMM_HPULL, ETL_COMM_HREV)
+    def test_etl_args(self, communication_type):
+        """
+        Test ETL with different communication types: HPUSH, HREV, HPULL.
+        """
+        template = HASH.format(communication_type=communication_type)
+        spec_etl = self.client.etl(ETL_NAME_SPEC)
+        spec_etl.init_spec(template=template)
+
+        # Check if ETL is initialized
+        self.assertEqual(
+            self.current_etl_count + 1, len(self.client.cluster().list_running_etls())
+        )
+
+        # Function to calculate xxhash
+        def calculate_xxhash(data, seed):
+            hasher = xxhash.xxh64(seed=seed)
+            hasher.update(data)
+            return hasher.hexdigest()
+
+        # Default hash (seed = 0)
+        default_hash = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name))
+            .read_all()
+        )
+        self.assertEqual(
+            default_hash.decode(), calculate_xxhash(bytes(self.content), 0)
+        )
+
+        # Hash with seed = 10000
+        seed = 10000
+        new_hash = (
+            self.bucket.object(self.obj_name)
+            .get_reader(etl=ETLConfig(name=spec_etl.name, args=seed))
+            .read_all()
+        )
+        self.assertEqual(new_hash.decode(), calculate_xxhash(bytes(self.content), seed))
+
+        # Ensure hashes are different
+        self.assertNotEqual(default_hash, new_hash)
+
+        spec_etl.stop()
+        spec_etl.delete()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2021, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -24,7 +24,7 @@ const (
 )
 
 func IsHTTPS(url string) bool { return strings.HasPrefix(url, "https://") }
-func IsHTTP(url string) bool  { return strings.HasPrefix(url, "http://") }
+func IsHT(url string) bool    { return strings.HasPrefix(url, "http://") }
 
 func ParseURL(s string) (u *url.URL, valid bool) {
 	if s == "" {
@@ -52,6 +52,9 @@ func IsS3URL(link string) bool {
 func IsAzureURL(u *url.URL) bool {
 	return strings.Contains(u.Host, azBlobURL)
 }
+
+// [TODO]
+// func IsOCIURL(u *url.URL) bool {}
 
 // WARNING: `ReparseQuery` might affect non-tensorflow clients using S3-compatible API
 // with AIStore. To be used with caution.
@@ -93,4 +96,21 @@ func JoinPath(url, path string) string {
 		return url + "/" + path
 	}
 	return url + path
+}
+
+// JoinQuery merges new query parameters into the existing URL.
+func JoinQuery(base string, newQuery url.Values) string {
+	url, valid := ParseURL(base)
+	if !valid || len(newQuery) == 0 {
+		return base
+	}
+
+	query := url.Query()
+	for key, values := range newQuery {
+		for _, value := range values {
+			query.Add(key, value)
+		}
+	}
+	url.RawQuery = query.Encode()
+	return url.String()
 }

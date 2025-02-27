@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -19,8 +19,10 @@ import (
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/NVIDIA/aistore/transport/bundle"
+	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
@@ -34,6 +36,9 @@ type Manager struct {
 	reqBundle  ratomic.Pointer[bundle.Streams]
 	respBundle ratomic.Pointer[bundle.Streams]
 
+	// ref count
+	_refc atomic.Int32
+
 	bundleEnabled atomic.Bool // to disable and enable on the fly
 }
 
@@ -42,36 +47,56 @@ var (
 	errSkipped = errors.New("skipped") // CT is skipped due to EC unsupported for the content type
 )
 
-func initManager() (err error) {
+func initManager() error {
 	ECM = &Manager{
 		netReq:  cmn.NetIntraControl,
 		netResp: cmn.NetIntraData,
 		bmd:     core.T.Bowner().Get(),
 	}
-	if ECM.bmd.IsECUsed() {
-		err = ECM.initECBundles()
-	}
-	return err
-}
-
-func (mgr *Manager) req() *bundle.Streams  { return mgr.reqBundle.Load() }
-func (mgr *Manager) resp() *bundle.Streams { return mgr.respBundle.Load() }
-
-func (mgr *Manager) initECBundles() error {
-	if !mgr.bundleEnabled.CAS(false, true) {
-		return nil
-	}
+	// EC `trnames` (ReqStreamName, RespStreamName) are constants, receive handlers static
 	if err := transport.Handle(ReqStreamName, ECM.recvRequest); err != nil {
 		return fmt.Errorf("failed to register recvRequest: %v", err)
 	}
 	if err := transport.Handle(RespStreamName, ECM.recvResponse); err != nil {
 		return fmt.Errorf("failed to register respResponse: %v", err)
 	}
-	cbReq := func(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
-		if err != nil {
-			nlog.Errorf("failed to request %s: %v", hdr.Cname(), err)
-		}
+	return nil
+}
+
+func (mgr *Manager) req() *bundle.Streams  { return mgr.reqBundle.Load() }
+func (mgr *Manager) resp() *bundle.Streams { return mgr.respBundle.Load() }
+
+func (mgr *Manager) IsActive() bool { return mgr._refc.Load() != 0 }
+
+func (mgr *Manager) incActive(xctn core.Xact) {
+	mgr._refc.Inc()
+	mgr.OpenStreams(false)
+	notif := &xact.NotifXact{
+		Base: nl.Base{When: core.UponTerm, F: mgr.notifyTerm},
+		Xact: xctn,
 	}
+	xctn.AddNotif(notif)
+}
+
+func (mgr *Manager) notifyTerm(core.Notif, error, bool) {
+	rc := mgr._refc.Dec()
+	debug.Assert(rc >= 0, "rc: ", rc)
+}
+
+func cbReq(hdr *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
+	if err != nil {
+		nlog.Errorln("failed to request", hdr.Cname(), "err: [", err, "]")
+	}
+}
+
+func (mgr *Manager) OpenStreams(withRefc bool) {
+	if withRefc {
+		mgr._refc.Inc()
+	}
+	if !mgr.bundleEnabled.CAS(false, true) {
+		return
+	}
+	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActEcOpen)
 	var (
 		client      = transport.NewIntraDataClient()
 		config      = cmn.GCO.Get()
@@ -93,18 +118,19 @@ func (mgr *Manager) initECBundles() error {
 
 	mgr.reqBundle.Store(bundle.New(client, reqSbArgs))
 	mgr.respBundle.Store(bundle.New(client, respSbArgs))
-
-	return nil
 }
 
-func (mgr *Manager) closeECBundles() {
+func (mgr *Manager) CloseStreams(justRefc bool) {
+	if justRefc {
+		mgr._refc.Dec()
+		return
+	}
 	if !mgr.bundleEnabled.CAS(true, false) {
 		return
 	}
+	nlog.InfoDepth(1, core.T.String(), "ECM", apc.ActEcClose)
 	mgr.req().Close(false)
 	mgr.resp().Close(false)
-	transport.Unhandle(ReqStreamName)
-	transport.Unhandle(RespStreamName)
 }
 
 func (mgr *Manager) NewGetXact(bck *cmn.Bck) *XactGet         { return newGetXact(bck, mgr) }
@@ -161,19 +187,22 @@ func (mgr *Manager) recvRequest(hdr *transport.ObjHdr, objReader io.Reader, err 
 	// command requests should not have a body, but if it has,
 	// the body must be drained to avoid errors
 	if hdr.ObjAttrs.Size != 0 {
-		if _, err := io.ReadAll(objReader); err != nil {
+		n, err := io.Copy(io.Discard, objReader)
+		if err != nil && !cos.IsEOF(err) {
 			nlog.Errorf("failed to read request body: %v", err)
 			return err
 		}
+		debug.Assert(n == 0, "command requests should not have a body: ", n)
 	}
 	bck := meta.CloneBck(&hdr.Bck)
 	if err = bck.Init(core.T.Bowner()); err != nil {
 		if _, ok := err.(*cmn.ErrRemoteBckNotFound); !ok { // is ais
-			nlog.Errorf("failed to init bucket %s: %v", bck, err)
+			nlog.Errorf("failed to init bucket %s: %v", bck.String(), err)
 			return err
 		}
 	}
-	mgr.RestoreBckRespXact(bck).DispatchReq(iReq, hdr, bck)
+	xctn := mgr.RestoreBckRespXact(bck)
+	xctn.dispatchReq(iReq, hdr, bck)
 	return nil
 }
 
@@ -198,19 +227,23 @@ func (mgr *Manager) recvResponse(hdr *transport.ObjHdr, objReader io.Reader, err
 		return err
 	}
 	bck := meta.CloneBck(&hdr.Bck)
-	if err = bck.Init(core.T.Bowner()); err != nil {
-		if _, ok := err.(*cmn.ErrRemoteBckNotFound); !ok { // is ais
+	if err := bck.Init(core.T.Bowner()); err != nil {
+		if !cmn.IsErrRemoteBckNotFound(err) { // is ais://
 			nlog.Errorln(err)
 			return err
 		}
 	}
 	switch hdr.Opcode {
 	case reqPut:
-		mgr.RestoreBckRespXact(bck).DispatchResp(iReq, hdr, objReader)
+		xctn := mgr.RestoreBckRespXact(bck)
+		xctn.IncPending()
+		xctn.dispatchResp(iReq, hdr, objReader)
+		xctn.DecPending()
 	case respPut:
 		// Process the request even if the number of targets is insufficient
 		// (might've started when we had enough)
-		mgr.RestoreBckGetXact(bck).DispatchResp(iReq, hdr, bck, objReader)
+		xctn := mgr.RestoreBckGetXact(bck)
+		xctn.dispatchResp(iReq, hdr, bck, objReader)
 	default:
 		debug.Assertf(false, "unknown EC response action %d", hdr.Opcode)
 	}
@@ -221,7 +254,7 @@ func (mgr *Manager) recvResponse(hdr *transport.ObjHdr, objReader io.Reader, err
 //   - lom - object to encode
 //   - intra - if true, it is internal request and has low priority
 //   - cb - optional callback that is called after the object is encoded
-func (mgr *Manager) EncodeObject(lom *core.LOM, cb core.OnFinishObj) error {
+func (mgr *Manager) EncodeObject(lom *core.LOM, cb onFin) error {
 	if !lom.ECEnabled() {
 		return ErrorECDisabled
 	}
@@ -229,11 +262,6 @@ func (mgr *Manager) EncodeObject(lom *core.LOM, cb core.OnFinishObj) error {
 	if err := cs.Err(); err != nil {
 		return err
 	}
-	spec, _ := fs.CSM.FileSpec(lom.FQN)
-	if spec != nil && !spec.PermToProcess() {
-		return errSkipped
-	}
-
 	req := allocateReq(ActSplit, lom.LIF())
 	req.IsCopy = IsECCopy(lom.Lsize(), &lom.Bprops().EC)
 	if cb != nil {
@@ -253,25 +281,6 @@ func (mgr *Manager) CleanupObject(lom *core.LOM) {
 	debug.Assert(lom.FQN != "" && lom.Mountpath().Path != "")
 	req := allocateReq(ActDelete, lom.LIF())
 	mgr.RestoreBckPutXact(lom.Bck()).cleanup(req, lom)
-}
-
-func (mgr *Manager) RestoreObject(lom *core.LOM) error {
-	if !lom.ECEnabled() {
-		return ErrorECDisabled
-	}
-	cs := fs.Cap()
-	if err := cs.Err(); err != nil {
-		return err
-	}
-
-	debug.Assert(lom.Mountpath() != nil && lom.Mountpath().Path != "")
-	req := allocateReq(ActRestore, lom.LIF())
-	errCh := make(chan error) // unbuffered
-	req.ErrCh = errCh
-	mgr.RestoreBckGetXact(lom.Bck()).decode(req, lom)
-
-	// wait for EC completes restoring the object
-	return <-errCh
 }
 
 // disableBck starts to reject new EC requests, rejects pending ones
@@ -296,16 +305,6 @@ func (mgr *Manager) BMDChanged() error {
 	}
 	mgr.bmd = newBMD
 
-	// globally
-	if newBMD.IsECUsed() && !oldBMD.IsECUsed() {
-		if err := mgr.initECBundles(); err != nil {
-			return err
-		}
-	} else if !newBMD.IsECUsed() && oldBMD.IsECUsed() {
-		mgr.closeECBundles()
-		return nil
-	}
-
 	// by bucket
 	newBMD.Range(nil, nil, func(nbck *meta.Bck) bool {
 		oprops, ok := oldBMD.Get(nbck)
@@ -324,4 +323,23 @@ func (mgr *Manager) BMDChanged() error {
 		return false
 	})
 	return nil
+}
+
+func (mgr *Manager) Recover(lom *core.LOM) error {
+	if !lom.ECEnabled() {
+		return ErrorECDisabled
+	}
+	cs := fs.Cap()
+	if err := cs.Err(); err != nil {
+		return err
+	}
+
+	req := allocateReq(ActRestore, lom.LIF())
+	errCh := make(chan error) // unbuffered
+	req.ErrCh = errCh
+	xctn := mgr.RestoreBckGetXact(lom.Bck())
+	xctn.decode(req, lom)
+
+	// wait here
+	return <-errCh
 }

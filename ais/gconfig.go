@@ -1,6 +1,6 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -52,6 +52,7 @@ var _ revs = (*globalConfig)(nil)
 // as revs
 func (*globalConfig) tag() string           { return revsConfTag }
 func (config *globalConfig) version() int64 { return config.Version }
+func (config *globalConfig) uuid() string   { return config.UUID }
 func (*globalConfig) jit(p *proxy) revs     { g, _ := p.owner.config.get(); return g }
 
 func (config *globalConfig) sgl() *memsys.SGL {

@@ -5,7 +5,15 @@ COMMUNICATION TYPE:  hpush://
 ARGUMENT TYPE:
 Hello World!
 ^ETL\[etl.*\]stopped$
+^ETL\[etl.*\] successfully deleted$
 COMMUNICATION TYPE:  hpush://
 ARGUMENT TYPE: fqn
 Hello World!
 ^ETL\[etl.*\]stopped$
+^ETL\[etl.*\] successfully deleted$
+COMMUNICATION TYPE:  hpush://
+ARGUMENT TYPE:
+5328b3c272b5aab0
+aecb71fa663c6460
+^ETL\[etl.*\]stopped$
+^ETL\[etl.*\] successfully deleted$

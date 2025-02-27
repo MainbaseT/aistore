@@ -1,13 +1,12 @@
 // Package tetl provides helpers for ETL.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package tetl
 
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -29,13 +28,13 @@ import (
 )
 
 const (
-	commTypeAnnotation    = "communication_type"
-	waitTimeoutAnnotation = "wait_timeout"
-
+	NonExistImage = "non-exist-image"
+	InvalidYaml   = "invalid-yaml"
 	Tar2TF        = "tar2tf"
 	Echo          = "transformer-echo"
 	EchoGolang    = "echo-go"
 	MD5           = "transformer-md5"
+	HashWithArgs  = "hash-with-args"
 	Tar2tfFilters = "tar2tf-filters"
 	tar2tfFilter  = `
 {
@@ -51,13 +50,57 @@ const (
 `
 )
 
+const (
+	nonExistImageSpec = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: non-exist-image
+  annotations:
+    communication_type: ${COMMUNICATION_TYPE:-"\"hpull://\""}
+    wait_timeout: 5m
+spec:
+  containers:
+    - name: server
+      image: aistorage/non-exist-image:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - name: default
+          containerPort: 80
+      command: ['/code/server.py', '--listen', '0.0.0.0', '--port', '80']
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: default
+`
+	invalidYamlSpec = `
+apiVersion: v1
+kind: Pod
+metadata
+  name: invalid-syntax
+spec:
+  containers:
+    - name: server
+      image: aistorage/runtime_python:latest
+      ports
+        - name: default
+          containerPort: 80
+`
+)
+
 var (
 	links = map[string]string{
-		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/md5/pod.yaml",
-		Tar2TF:        "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/tar2tf/pod.yaml",
-		Tar2tfFilters: "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/tar2tf/pod.yaml",
-		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/echo/pod.yaml",
-		EchoGolang:    "https://raw.githubusercontent.com/NVIDIA/ais-etl/master/transformers/go_echo/pod.yaml",
+		MD5:           "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/md5/pod.yaml",
+		HashWithArgs:  "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/hash_with_args/pod.yaml",
+		Tar2TF:        "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
+		Tar2tfFilters: "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/tar2tf/pod.yaml",
+		Echo:          "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/echo/pod.yaml",
+		EchoGolang:    "https://raw.githubusercontent.com/NVIDIA/ais-etl/main/transformers/go_echo/pod.yaml",
+	}
+
+	invalidSpecs = map[string]string{
+		NonExistImage: nonExistImageSpec,
+		InvalidYaml:   invalidYamlSpec,
 	}
 
 	client = &http.Client{}
@@ -71,6 +114,9 @@ func validateETLName(name string) error {
 }
 
 func GetTransformYaml(etlName string) ([]byte, error) {
+	if spec, ok := invalidSpecs[etlName]; ok {
+		return []byte(spec), nil
+	}
 	if err := validateETLName(etlName); err != nil {
 		return nil, err
 	}
@@ -92,7 +138,7 @@ func GetTransformYaml(etlName string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := cos.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -366,19 +412,19 @@ func SpecToInitMsg(spec []byte /*yaml*/) (msg *etl.InitSpecMsg, err error) {
 }
 
 func podTransformCommType(pod *corev1.Pod) string {
-	if pod.Annotations == nil || pod.Annotations[commTypeAnnotation] == "" {
+	if pod.Annotations == nil || pod.Annotations[etl.CommTypeAnnotation] == "" {
 		// By default assume `Hpush`.
 		return etl.Hpush
 	}
-	return pod.Annotations[commTypeAnnotation]
+	return pod.Annotations[etl.CommTypeAnnotation]
 }
 
 func podTransformTimeout(errCtx *cmn.ETLErrCtx, pod *corev1.Pod) (cos.Duration, error) {
-	if pod.Annotations == nil || pod.Annotations[waitTimeoutAnnotation] == "" {
+	if pod.Annotations == nil || pod.Annotations[etl.WaitTimeoutAnnotation] == "" {
 		return 0, nil
 	}
 
-	v, err := time.ParseDuration(pod.Annotations[waitTimeoutAnnotation])
+	v, err := time.ParseDuration(pod.Annotations[etl.WaitTimeoutAnnotation])
 	if err != nil {
 		return cos.Duration(v), cmn.NewErrETL(errCtx, err.Error()).WithPodName(pod.Name)
 	}

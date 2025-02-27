@@ -1,6 +1,6 @@
 // Package feat: global runtime-configurable feature flags
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package feat
 
@@ -14,9 +14,9 @@ import (
 type Flags cos.BitFlags
 
 // NOTE:
-// - `Bucket` features(*) are a strict subset of all `Cluster` features, and can be changed
-//    for individual buckets
-// - when making any changes, make sure to update `Cluster` and maybe the `Bucket` enum as well (NOTE)
+// - `Bucket` features are a strict subset of all `Cluster` features, and can be changed for individual buckets;
+// - when making any changes, make sure to update `Cluster` and maybe the `Bucket` enum as well;
+// - finally, check cmd/cli/cli/feat.go where we currently hardcode feature descriptions in the same exact order.
 
 const (
 	PropName = "features"
@@ -36,11 +36,15 @@ const (
 	DontOptimizeVirtualDir    // when prefix doesn't end with '/' and is a subdirectory: don't assume there are no _prefixed_ obj names
 	DisableColdGET            // disable cold-GET (from remote bucket)
 	StreamingColdGET          // write and transmit cold-GET content back to user in parallel, without _finalizing_ in-cluster object
-	S3ReverseProxy            // use reverse proxy calls instead of HTTP-redirect for S3 API
+	S3ReverseProxy            // intra-cluster communications: instead of regular HTTP redirects reverse-proxy S3 API calls to designated targets
 	S3UsePathStyle            // use older path-style addressing (as opposed to virtual-hosted style), e.g., https://s3.amazonaws.com/BUCKET/KEY
+	DontDeleteWhenRebalancing // when objects get _rebalanced_ to their proper locations, do not delete their respective _misplaced_ sources
+	DontSetControlPlaneToS    // intra-cluster control plane: do not set IPv4 ToS field (to low-latency)
+	TrustCryptoSafeChecksums  // when checking whether objects are identical trust only cryptographically secure checksums
+	S3ListObjectVersions      // when versioning info is requested, use ListObjectVersions API (beware: extremely slow, versioned S3 buckets only)
 )
 
-var Cluster = []string{
+var Cluster = [...]string{
 	"Enforce-IntraCluster-Access",
 	"Skip-Loading-VersionChecksum-MD",
 	"Do-not-Auto-Detect-FileShare",
@@ -48,24 +52,31 @@ var Cluster = []string{
 	"Fsync-PUT",
 	"LZ4-Block-1MB",
 	"LZ4-Frame-Checksum",
-	"Dont-Allow-Passing-FQN-to-ETL",
+	"Do-not-Allow-Passing-FQN-to-ETL",
 	"Ignore-LimitedCoexistence-Conflicts",
 	"S3-Presigned-Request",
-	"Dont-Optimize-Listing-Virtual-Dirs",
+	"Do-not-Optimize-Listing-Virtual-Dirs",
 	"Disable-Cold-GET",
 	"Streaming-Cold-GET",
 	"S3-Reverse-Proxy",
 	"S3-Use-Path-Style", // https://aws.amazon.com/blogs/aws/amazon-s3-path-deprecation-plan-the-rest-of-the-story
+	"Do-not-Delete-When-Rebalancing",
+	"Do-not-Set-Control-Plane-ToS",
+	"Trust-Crypto-Safe-Checksums",
+	"S3-ListObjectVersions",
+
 	// "none" ====================
 }
 
-var Bucket = []string{
+var Bucket = [...]string{
 	"Skip-Loading-VersionChecksum-MD",
 	"Fsync-PUT",
 	"S3-Presigned-Request",
 	"Disable-Cold-GET",
 	"Streaming-Cold-GET",
 	"S3-Use-Path-Style", // https://aws.amazon.com/blogs/aws/amazon-s3-path-deprecation-plan-the-rest-of-the-story
+	"S3-ListObjectVersions",
+
 	// "none" ====================
 }
 
@@ -73,7 +84,14 @@ func (f Flags) IsSet(flag Flags) bool { return cos.BitFlags(f).IsSet(cos.BitFlag
 func (f Flags) Set(flags Flags) Flags { return Flags(cos.BitFlags(f).Set(cos.BitFlags(flags))) }
 func (f Flags) String() string        { return strconv.FormatUint(uint64(f), 10) }
 
-func IsBucketScope(name string) bool { return cos.StringInSlice(name, Bucket) }
+func IsBucketScope(name string) bool {
+	for i := range Bucket {
+		if name == Bucket[i] {
+			return true
+		}
+	}
+	return false
+}
 
 func CSV2Feat(s string) (Flags, error) {
 	if s == "" || s == "none" {

@@ -1,7 +1,7 @@
 // Package cli provides easy-to-use commands to manage, monitor, and utilize AIS clusters.
 // This file handles commands that interact with objects in the cluster
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cli
 
@@ -39,8 +39,8 @@ const (
 			"input_format": {"template": "shard-{0..9}"},
 			"output_shard_size": "200KB",
 			"description": "pack records into categorized shards",
-			"order_file": "http://website.web/static/order_file.txt",
-			"order_file_sep": " "
+			"ekm_file": "http://website.web/static/ekm_file.txt",
+			"ekm_file_sep": " "
 		}'`
 	dsortExampleY = `$ ais start dsort -f - <<EOM
 			input_extension: .tar
@@ -98,11 +98,11 @@ var dsortStartCmd = cli.Command{
 		indent1 + "Tip: use '--verbose' to print the spec (with all its parameters including applied defaults)\n" +
 		indent1 + "See also: docs/dsort.md, docs/cli/dsort.md, and ais/test/scripts/dsort*",
 	ArgsUsage: dsortSpecArgument,
-	Flags:     startSpecialFlags[cmdDsort],
+	Flags:     sortFlags(startSpecialFlags[cmdDsort]),
 	Action:    startDsortHandler,
 }
 
-var phasesOrdered = []string{
+var phasesOrdered = [...]string{
 	dsort.ExtractionPhase,
 	dsort.SortingPhase,
 	dsort.CreationPhase,
@@ -246,7 +246,7 @@ func _flattenSpec(spec *dsort.RequestSpec) (flat, config nvpairList) {
 				if v == "" {
 					v = dsort.Alphanumeric
 				}
-			case "order_file_sep":
+			case "ekm_file_sep":
 				if v == "" {
 					v = `\t`
 				}
@@ -305,7 +305,11 @@ func (d dsortResult) String() string {
 		return apc.ActDsort + " job was aborted"
 	}
 
-	var sb strings.Builder
+	var (
+		sb strings.Builder
+		l  = 1024
+	)
+	sb.Grow(l)
 
 	sb.WriteString(fmt.Sprintf("Created %d new shards. Job duration: %s", d.created, d.dur))
 	if len(d.errors) > 0 {
@@ -522,7 +526,7 @@ func printCondensedStats(c *cli.Context, id, units string, errhint bool) error {
 		}
 		jobInfo.Aggregate(job)
 	}
-	opts := teb.Opts{AltMap: teb.FuncMapUnits(units)}
+	opts := teb.Opts{AltMap: teb.FuncMapUnits(units, flagIsSet(c, dateTimeFlag))}
 	err = teb.Print([]*dsort.JobInfo{&jobInfo}, teb.DsortListTmpl, opts)
 	if err != nil {
 		return err
@@ -620,7 +624,7 @@ func dsortJobsList(c *cli.Context, list []*dsort.JobInfo, usejs bool) error {
 	var (
 		hideHeader  = flagIsSet(c, noHeaderFlag)
 		units, errU = parseUnitsFlag(c, unitsFlag)
-		opts        = teb.Opts{AltMap: teb.FuncMapUnits(units), UseJSON: usejs}
+		opts        = teb.Opts{AltMap: teb.FuncMapUnits(units, flagIsSet(c, dateTimeFlag)), UseJSON: usejs}
 		verbose     = flagIsSet(c, verboseJobFlag)
 	)
 	debug.AssertNoErr(errU)

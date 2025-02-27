@@ -1,6 +1,6 @@
 // Package mpather provides per-mountpath concepts.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package mpather
 
@@ -26,22 +26,12 @@ import (
 
 // walk all or selected buckets, one at a time
 
-const (
-	throttleNumObjects = 64 // unit of self-throttling
-)
-
 type LoadType int
 
 const (
 	noLoad LoadType = iota
 	LoadUnsafe
 	Load
-)
-
-const (
-	ThrottleMinDur = time.Millisecond
-	ThrottleAvgDur = time.Millisecond * 10
-	ThrottleMaxDur = time.Millisecond * 100
 )
 
 type (
@@ -94,26 +84,29 @@ type (
 	}
 )
 
-func NewJoggerGroup(opts *JgroupOpts, config *cmn.Config, mpath string) *Jgroup {
+func NewJoggerGroup(opts *JgroupOpts, config *cmn.Config, smi *fs.Mountpath) *Jgroup {
 	var (
 		joggers map[string]*jogger
 		avail   = fs.GetAvail()
+		la      = len(avail)
 		wg, ctx = errgroup.WithContext(context.Background())
+		jg      = &Jgroup{wg: wg}
 	)
 	debug.Assert(!opts.IncludeCopy || (opts.IncludeCopy && opts.DoLoad > noLoad))
 
-	jg := &Jgroup{wg: wg}
 	opts.onFinish = jg.markFinished
 
 	switch {
-	case mpath != "":
-		joggers = make(map[string]*jogger, 1)
-		if mi, ok := avail[mpath]; ok {
-			joggers[mi.Path] = newJogger(ctx, opts, mi, config)
+	case smi != nil: // selected mountpath
+		if _, ok := avail[smi.Path]; !ok {
+			nlog.Errorln(smi.String(), "is not available, nothing to do")
+		} else {
+			joggers = make(map[string]*jogger, 1)
+			joggers[smi.Path] = newJogger(ctx, opts, smi, config)
 		}
 	case opts.PerBucket:
 		debug.Assert(len(opts.Buckets) > 1)
-		joggers = make(map[string]*jogger, len(avail)*len(opts.Buckets))
+		joggers = make(map[string]*jogger, la*len(opts.Buckets))
 		for _, bck := range opts.Buckets {
 			nopts := *opts
 			nopts.Buckets = nil
@@ -125,16 +118,18 @@ func NewJoggerGroup(opts *JgroupOpts, config *cmn.Config, mpath string) *Jgroup 
 			}
 		}
 	default:
-		joggers = make(map[string]*jogger, len(avail))
+		joggers = make(map[string]*jogger, la)
 		for _, mi := range avail {
 			joggers[mi.Path] = newJogger(ctx, opts, mi, config)
 		}
 	}
 
-	// this jogger group is a no-op (unlikely)
 	if len(joggers) == 0 {
-		_, disabled := fs.Get()
-		nlog.Errorf("%v: avail=%v, disabled=%v, selected=%q", cmn.ErrNoMountpaths, avail, disabled, mpath)
+		// this jogger group is a no-op (unlikely)
+		if smi == nil {
+			_, disabled := fs.Get()
+			nlog.Errorf("%v: avail=%v, disabled=%v", cmn.ErrNoMountpaths, avail, disabled)
+		}
 	}
 
 	jg.joggers = joggers
@@ -201,7 +196,19 @@ func newJogger(ctx context.Context, opts *JgroupOpts, mi *fs.Mountpath, config *
 	return
 }
 
+////////////
+// jogger //
+////////////
+
+func (j *jogger) String() string { return fmt.Sprintf("jogger [%s/%s]", j.mi, j.opts.Bck.String()) }
+
 func (j *jogger) run() (err error) {
+	if err = j.mi.CheckFS(); err != nil {
+		nlog.Errorln(err)
+		core.T.FSHC(err, j.mi, "")
+		goto ex
+	}
+
 	if j.opts.Slab != nil {
 		if j.opts.Parallel <= 1 {
 			j.bufs = [][]byte{j.opts.Slab.Alloc()}
@@ -224,6 +231,7 @@ func (j *jogger) run() (err error) {
 		_, err = j.runBck(&j.opts.Bck)
 	}
 
+ex:
 	// cleanup
 	if j.opts.Slab != nil {
 		for _, buf := range j.bufs {
@@ -231,7 +239,7 @@ func (j *jogger) run() (err error) {
 		}
 	}
 	j.opts.onFinish()
-	return
+	return err
 }
 
 // run selected buckets, one at a time
@@ -345,9 +353,10 @@ func (j *jogger) jog(fqn string, de fs.DirEntry) error {
 		})
 	}
 
+	// poor man's throttle; see "rate limit"
 	if j.opts.Throttle {
 		j.num++
-		if (j.num % throttleNumObjects) == 0 {
+		if fs.IsThrottle(j.num) {
 			j.throttle()
 		} else {
 			runtime.Gosched()
@@ -443,9 +452,8 @@ func (sg *joggerSyncGroup) abortAsyncTasks() error {
 func (j *jogger) throttle() {
 	curUtil := fs.GetMpathUtil(j.mi.Path)
 	if curUtil >= j.config.Disk.DiskUtilHighWM {
-		time.Sleep(ThrottleMinDur)
+		time.Sleep(fs.Throttle1ms)
 	}
 }
 
-func (j *jogger) abort()         { j.stopCh.Close() }
-func (j *jogger) String() string { return fmt.Sprintf("jogger [%s/%s]", j.mi, j.opts.Bck) }
+func (j *jogger) abort() { j.stopCh.Close() }

@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/memsys"
+	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/transport"
 	"github.com/klauspost/reedsolomon"
 )
@@ -88,7 +89,7 @@ func (*getJogger) freeCtx(ctx *restoreCtx) {
 }
 
 func (c *getJogger) run() {
-	nlog.Infof("started EC for mountpath: %s, bucket %s", c.mpath, c.parent.bck)
+	nlog.Infoln("start [", c.parent.bck.Cname(""), c.mpath, "]")
 
 	for {
 		select {
@@ -106,7 +107,7 @@ func (c *getJogger) run() {
 }
 
 func (c *getJogger) stop() {
-	nlog.Infof("stopping EC for mountpath: %s, bucket: %s", c.mpath, c.parent.bck)
+	nlog.Infoln("stop [", c.parent.bck.Cname(""), c.mpath, "]")
 	c.stopCh.Close()
 }
 
@@ -202,6 +203,7 @@ func (c *getJogger) copyMissingReplicas(ctx *restoreCtx, reader cos.ReadOpenClos
 			nlog.Errorf("%s failed to send %s to %v: %v", core.T, ctx.lom, daemons, err)
 		}
 		freeObject(reader)
+		srcReader.Close()
 	}
 	src := &dataSource{
 		reader:   srcReader,
@@ -331,7 +333,7 @@ loop: //nolint:gocritic // keeping label for readability
 
 	b := cos.MustMarshal(ctx.meta)
 	ctMeta := core.NewCTFromLOM(ctx.lom, fs.ECMetaType)
-	if err := ctMeta.Write(bytes.NewReader(b), -1); err != nil {
+	if err := ctMeta.Write(bytes.NewReader(b), -1, "" /*work fqn*/); err != nil {
 		return err
 	}
 	if _, exists := core.T.Bowner().Get().Get(ctMeta.Bck()); !exists {
@@ -365,7 +367,7 @@ func (c *getJogger) requestSlices(ctx *restoreCtx) error {
 
 	for k, v := range ctx.nodes {
 		if v.SliceID < 1 || v.SliceID > sliceCnt {
-			nlog.Warningf("Node %s has invalid slice ID %d", k, v.SliceID)
+			nlog.Warningf("node %s has invalid slice ID %d", k, v.SliceID)
 			continue
 		}
 
@@ -477,13 +479,21 @@ func cksumSlice(reader io.Reader, recvCksum *cos.Cksum, objName string) error {
 	return err
 }
 
+func closeReaders(objs []io.ReadCloser) {
+	for _, obj := range objs {
+		if obj != nil {
+			obj.Close()
+		}
+	}
+}
+
 // Reconstruct the main object from slices. Returns the list of reconstructed slices.
 func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	var (
 		err       error
 		sliceCnt  = ctx.meta.Data + ctx.meta.Parity
 		sliceSize = SliceSize(ctx.meta.Size, ctx.meta.Data)
-		readers   = make([]io.Reader, sliceCnt)
+		readers   = make([]io.ReadCloser, sliceCnt)
 		writers   = make([]io.Writer, sliceCnt)
 		restored  = make([]*slice, sliceCnt)
 		cksums    = make([]*cos.CksumHash, sliceCnt)
@@ -511,7 +521,7 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 			continue
 		}
 
-		var cksmReader io.Reader
+		var cksmReader io.ReadCloser
 		if sgl, ok := sl.writer.(*memsys.SGL); ok {
 			readers[i] = memsys.NewReader(sgl)
 			cksmReader = memsys.NewReader(sgl)
@@ -536,9 +546,11 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 			}
 			readers[i] = nil
 		}
+		cksmReader.Close()
 	}
 
 	if err != nil {
+		closeReaders(readers)
 		return restored, err
 	}
 
@@ -547,10 +559,16 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	}
 	stream, err := reedsolomon.NewStreamC(ctx.meta.Data, ctx.meta.Parity, true, true)
 	if err != nil {
+		closeReaders(readers)
 		return restored, err
 	}
 
-	if err := stream.Reconstruct(readers, writers); err != nil {
+	rebuildReaders := make([]io.Reader, len(readers))
+	for i, rdr := range readers {
+		rebuildReaders[i] = rdr
+	}
+	if err := stream.Reconstruct(rebuildReaders, writers); err != nil {
+		closeReaders(readers)
 		return restored, err
 	}
 
@@ -565,7 +583,7 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	}
 
 	version := ""
-	srcReaders := make([]io.Reader, ctx.meta.Data)
+	srcReaders := make([]io.ReadCloser, ctx.meta.Data)
 	for i := range ctx.meta.Data {
 		if ctx.slices[i] != nil && ctx.slices[i].writer != nil {
 			if version == "" {
@@ -575,10 +593,12 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 				srcReaders[i] = memsys.NewReader(sgl)
 			} else {
 				if ctx.slices[i].workFQN == "" {
+					closeReaders(readers)
 					return restored, fmt.Errorf("invalid writer: %T", ctx.slices[i].writer)
 				}
 				srcReaders[i], err = cos.NewFileHandle(ctx.slices[i].workFQN)
 				if err != nil {
+					closeReaders(readers)
 					return restored, err
 				}
 			}
@@ -592,18 +612,22 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 		if restored[i].workFQN != "" {
 			srcReaders[i], err = cos.NewFileHandle(restored[i].workFQN)
 			if err != nil {
+				closeReaders(srcReaders)
+				closeReaders(readers)
 				return restored, err
 			}
 		} else {
 			sgl, ok := restored[i].obj.(*memsys.SGL)
 			if !ok {
+				closeReaders(srcReaders)
+				closeReaders(readers)
 				return restored, fmt.Errorf("empty slice %s[%d]", ctx.lom, i)
 			}
 			srcReaders[i] = memsys.NewReader(sgl)
 		}
 	}
 
-	src := io.MultiReader(srcReaders...)
+	src := newMultiReader(srcReaders...)
 	if cmn.Rom.FastV(4, cos.SmoduleEC) {
 		nlog.Infof("Saving main object %s to %q", ctx.lom, ctx.lom.FQN)
 	}
@@ -615,13 +639,15 @@ func (c *getJogger) restoreMainObj(ctx *restoreCtx) ([]*slice, error) {
 	mainMeta := *ctx.meta
 	mainMeta.SliceID = 0
 	args := &WriteArgs{
-		Reader:     src,
+		Reader:     src.mr,
 		MD:         mainMeta.NewPack(),
 		Cksum:      cos.NewCksum(cksumType, ""),
 		Generation: mainMeta.Generation,
 		Xact:       c.parent,
 	}
 	err = WriteReplicaAndMeta(ctx.lom, args)
+	src.Close()
+	closeReaders(readers)
 	return restored, err
 }
 
@@ -732,14 +758,15 @@ func (c *getJogger) uploadRestoredSlices(ctx *restoreCtx, slices []*slice) error
 		}
 
 		// Every slice's SGL is freed upon transfer completion
-		cb := func(daemonID string, s *slice) transport.ObjSentCB {
+		cb := func(daemonID string, s *slice, rdr cos.ReadOpenCloser) transport.ObjSentCB {
 			return func(_ *transport.ObjHdr, _ io.ReadCloser, _ any, err error) {
 				if err != nil {
 					nlog.Errorf("%s failed to send %s to %v: %v", core.T, ctx.lom, daemonID, err)
 				}
 				s.free()
+				rdr.Close()
 			}
-		}(tid, sl)
+		}(tid, sl, reader)
 		if err := c.parent.writeRemote([]string{tid}, ctx.lom, dataSrc, cb); err != nil {
 			remoteErr = err
 			nlog.Errorf("%s failed to send slice %s[%d] to %s", core.T, ctx.lom, sliceID, tid)
@@ -767,7 +794,7 @@ func (c *getJogger) freeDownloaded(ctx *restoreCtx) {
 // Main function that starts restoring an object that was encoded
 func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
 	if cmn.Rom.FastV(4, cos.SmoduleEC) {
-		nlog.Infof("Starting EC restore %s", ctx.lom)
+		nlog.Infoln("Starting EC restore", ctx.lom.Cname())
 	}
 
 	// Download all slices from the targets that have sent metadata
@@ -792,7 +819,7 @@ func (c *getJogger) restoreEncoded(ctx *restoreCtx) error {
 	if err := c.uploadRestoredSlices(ctx, restored); err != nil {
 		nlog.Errorf("failed to upload restored slices of %s: %v", ctx.lom, err)
 	} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
-		nlog.Infof("slices %s restored successfully", ctx.lom)
+		nlog.Infof("restored %s slices", ctx.lom)
 	}
 
 	c.freeDownloaded(ctx)
@@ -836,7 +863,7 @@ func (c *getJogger) restore(ctx *restoreCtx) error {
 // nodes(with their EC metadata) that have the lastest object version
 func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 	var (
-		wg     = cos.NewLimitedWaitGroup(cmn.MaxParallelism(), 8)
+		wg     = cos.NewLimitedWaitGroup(sys.MaxParallelism(), 8)
 		mtx    = &sync.Mutex{}
 		tmap   = core.T.Sowner().Get().Tmap
 		ctMeta = core.NewCTFromLOM(ctx.lom, fs.ECMetaType)
@@ -849,6 +876,9 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 		nodes := md.RemoteTargets()
 		ctx.nodes = make(map[string]*Metadata, len(nodes))
 		for _, node := range nodes {
+			if node.InMaintOrDecomm() {
+				continue
+			}
 			wg.Add(1)
 			go func(si *meta.Snode, c *getJogger, mtx *sync.Mutex, mdExists bool) {
 				ctx.requestMeta(si, c, mtx, mdExists)
@@ -860,6 +890,9 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 		ctx.nodes = make(map[string]*Metadata, len(tmap))
 		for _, node := range tmap {
 			if node.ID() == core.T.SID() {
+				continue
+			}
+			if node.InMaintOrDecomm() {
 				continue
 			}
 			wg.Add(1)
@@ -895,10 +928,11 @@ func (c *getJogger) requestMeta(ctx *restoreCtx) error {
 func (ctx *restoreCtx) requestMeta(si *meta.Snode, c *getJogger, mtx *sync.Mutex, mdExists bool) {
 	md, err := RequestECMeta(ctx.lom.Bucket(), ctx.lom.ObjName, si, c.client)
 	if err != nil {
+		warn := fmt.Sprintf("%s: %s failed request-meta(%s) request: %v", core.T, ctx.lom.Cname(), si, err)
 		if mdExists {
-			nlog.Errorf("No EC meta %s from %s: %v", ctx.lom.Cname(), si, err)
+			nlog.Warningln(warn)
 		} else if cmn.Rom.FastV(4, cos.SmoduleEC) {
-			nlog.Infof("No EC meta %s from %s: %v", ctx.lom.Cname(), si, err)
+			nlog.Infoln(warn)
 		}
 		return
 	}

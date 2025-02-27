@@ -1,7 +1,7 @@
 // Package transport provides long-lived http/tcp connections for
 // intra-cluster communications (see README for details and usage example).
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package transport
 
@@ -17,6 +17,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 )
@@ -35,12 +36,12 @@ const (
 func ReservedOpcode(opc int) bool { return opc >= opcFin }
 
 const (
-	SizeUnknown = -1
+	SizeUnknown = -1 // obj size unknown (not set)
 
-	dfltSizePDU    = memsys.DefaultBufSize
-	maxSizePDU     = memsys.MaxPageSlabSize
-	dfltSizeHeader = memsys.PageSize
-	maxSizeHeader  = memsys.MaxPageSlabSize
+	dfltSizePDU = memsys.DefaultBufSize
+	maxSizePDU  = memsys.MaxPageSlabSize
+
+	// see also: cmn/config for (max, default) transport header sizes
 )
 
 const sizeofh = int(unsafe.Sizeof(Obj{}))
@@ -48,14 +49,14 @@ const sizeofh = int(unsafe.Sizeof(Obj{}))
 type (
 	// advanced usage: additional stream control
 	Extra struct {
-		Callback     ObjSentCB     // typical usage: to free SGLs, close files, etc.
+		Xact         core.Xact     // usage: sender ID; abort
+		Callback     ObjSentCB     // typical usage: to free SGLs, close files
 		Config       *cmn.Config   // (to optimize-out GCO.Get())
 		Compression  string        // see CompressAlways, etc. enum
-		SenderID     string        // e.g., xaction ID (optional)
 		IdleTeardown time.Duration // when exceeded, causes PUT to terminate (and to renew upon the very next send)
-		SizePDU      int32         // NOTE: 0(zero): no PDUs; must be below maxSizePDU; unknown size _requires_ PDUs
-		MaxHdrSize   int32         // overrides `dfltMaxHdr`
-		WorkChBurst  int           // overrides `dfltBurstNum`
+		ChanBurst    int           // overrides config.Transport.Burst
+		SizePDU      int32         // NOTE: 0(zero): no PDUs; must be <= `maxSizePDU`; unknown size _requires_ PDUs
+		MaxHdrSize   int32         // overrides config.Transport.MaxHeaderSize
 	}
 
 	// receive-side session stats indexed by session ID (see recv.go for "uid")
@@ -159,7 +160,7 @@ func (s *Stream) Send(obj *Obj) (err error) {
 	}
 
 	s.workCh <- obj
-	if l, c := len(s.workCh), cap(s.workCh); l > c/2 {
+	if l, c := len(s.workCh), cap(s.workCh); l > (c - c>>2) {
 		runtime.Gosched() // poor man's throttle
 		if l == c {
 			s.chanFull.Inc()

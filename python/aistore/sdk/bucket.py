@@ -1,20 +1,22 @@
 #
-# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
 #
 
-from __future__ import annotations  # pylint: disable=unused-variable
+from __future__ import annotations
 
 import json
 import logging
 import os
 from pathlib import Path
 import time
-from typing import Dict, List, NewType, Iterable
+from typing import Dict, List, NewType, Iterable, Union, Optional
 import requests
+from requests import structures
 
 from aistore.sdk.ais_source import AISSource
-from aistore.sdk.etl_const import DEFAULT_ETL_TIMEOUT
-from aistore.sdk.object_iterator import ObjectIterator
+from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
+from aistore.sdk.obj.object_iterator import ObjectIterator
+from aistore.sdk.etl import ETLConfig
 from aistore.sdk.const import (
     ACT_COPY_BCK,
     ACT_CREATE_BCK,
@@ -33,7 +35,6 @@ from aistore.sdk.const import (
     HTTP_METHOD_HEAD,
     HTTP_METHOD_POST,
     MSGPACK_CONTENT_TYPE,
-    PROVIDER_AIS,
     QPARAM_BCK_TO,
     QPARAM_BSUMM_REMOTE,
     QPARAM_FLT_PRESENCE,
@@ -48,6 +49,7 @@ from aistore.sdk.const import (
     DEFAULT_JOB_POLL_TIME,
 )
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.provider import Provider
 from aistore.sdk.dataset.dataset_config import DatasetConfig
 
 from aistore.sdk.errors import (
@@ -58,7 +60,7 @@ from aistore.sdk.errors import (
 )
 from aistore.sdk.multiobj import ObjectGroup, ObjectRange
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.object import Object
+from aistore.sdk.obj.object import Object, BucketDetails
 from aistore.sdk.types import (
     ActionMsg,
     BucketEntry,
@@ -73,11 +75,12 @@ from aistore.sdk.types import (
 )
 from aistore.sdk.list_object_flag import ListObjectFlag
 from aistore.sdk.utils import validate_directory, get_file_size
+from aistore.sdk.obj.object_props import ObjectProps
 
-Header = NewType("Header", requests.structures.CaseInsensitiveDict)
+Header = NewType("Header", structures.CaseInsensitiveDict)
 
 
-# pylint: disable=unused-variable,too-many-public-methods,too-many-lines
+# pylint: disable=too-many-public-methods,too-many-lines
 class Bucket(AISSource):
     """
     A class representing a bucket that contains user data.
@@ -85,7 +88,7 @@ class Bucket(AISSource):
     Args:
         client (RequestClient): Client for interfacing with AIS cluster
         name (str): name of bucket
-        provider (str, optional): Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
+        provider (str or Provider, optional): Provider of bucket (one of "ais", "aws", "gcp", ...), defaults to "ais"
         namespace (Namespace, optional): Namespace of bucket, defaults to None
     """
 
@@ -93,21 +96,26 @@ class Bucket(AISSource):
         self,
         name: str,
         client: RequestClient = None,
-        provider: str = PROVIDER_AIS,
+        provider: Union[Provider, str] = Provider.AIS,
         namespace: Namespace = None,
     ):
         self._client = client
         self._name = name
-        self._provider = provider
+        self._provider = Provider.parse(provider)
         self._namespace = namespace
-        self._qparam = {QPARAM_PROVIDER: provider}
+        self._qparam = {QPARAM_PROVIDER: self.provider.value}
         if self.namespace:
             self._qparam[QPARAM_NAMESPACE] = namespace.get_path()
 
     @property
     def client(self) -> RequestClient:
-        """The client bound to this bucket."""
+        """The client used by this bucket."""
         return self._client
+
+    @client.setter
+    def client(self, client):
+        """Update the client used by this bucket."""
+        self._client = client
 
     @property
     def qparam(self) -> Dict:
@@ -115,7 +123,7 @@ class Bucket(AISSource):
         return self._qparam
 
     @property
-    def provider(self) -> str:
+    def provider(self) -> Provider:
         """The provider for this bucket."""
         return self._provider
 
@@ -129,34 +137,41 @@ class Bucket(AISSource):
         """The namespace for this bucket."""
         return self._namespace
 
-    def list_urls(self, prefix: str = "", etl_name: str = None) -> Iterable[str]:
+    def list_urls(
+        self, prefix: str = "", etl: Optional[ETLConfig] = None
+    ) -> Iterable[str]:
         """
-        Implementation of the abstract method from AISSource that provides an iterator
-        of full URLs to every object in this bucket matching the specified prefix
+        Generates full URLs for all objects in the bucket that match the specified prefix.
 
         Args:
-            prefix (str, optional): Limit objects selected by a given string prefix
-            etl_name (str, optional): ETL to include in URLs
+            prefix (str, optional): A string prefix to filter objects. Only objects with names starting
+                with this prefix will be included. Defaults to an empty string (no filtering).
+            etl (Optional[ETLConfig], optional): An optional ETL configuration. If provided, the URLs
+                will include ETL processing parameters. Defaults to None.
 
         Returns:
-            Iterator of full URLs of all objects matching the prefix
+            Iterable[str]: An iterator yielding full URLs of all objects matching the prefix.
         """
         for entry in self.list_objects_iter(prefix=prefix, props="name"):
-            yield self.object(entry.name).get_url(etl_name=etl_name)
+            yield self.object(entry.name).get_url(etl=etl)
 
-    def list_all_objects_iter(self, prefix: str = "") -> Iterable[Object]:
+    def list_all_objects_iter(
+        self, prefix: str = "", props: str = "name,size"
+    ) -> Iterable[Object]:
         """
         Implementation of the abstract method from AISSource that provides an iterator
-        of all the objects in this bucket matching the specified prefix
+        of all the objects in this bucket matching the specified prefix.
 
         Args:
             prefix (str, optional): Limit objects selected by a given string prefix
+            props (str, optional): Comma-separated list of object properties to return. Default value is "name,size".
+                Properties: "name", "size", "atime", "version", "checksum", "target_url", "copies".
 
         Returns:
             Iterator of all object URLs matching the prefix
         """
-        for entry in self.list_objects_iter(prefix=prefix, props="name"):
-            yield self.object(entry.name)
+        for entry in self.list_objects_iter(prefix=prefix, props=props):
+            yield self.object(entry.name, entry.generate_object_props())
 
     def create(self, exist_ok=False):
         """
@@ -418,6 +433,8 @@ class Bucket(AISSource):
         bucket_props = response.headers.get(HEADER_BUCKET_PROPS, "{}")
         uuid = response.headers.get(HEADER_XACTION_ID, "").strip('"')
         params[QPARAM_UUID] = uuid
+
+        result = {}
 
         # Initial response status code should be 202
         if response.status_code != int(STATUS_ACCEPTED):
@@ -751,7 +768,7 @@ class Bucket(AISSource):
         Args:
             path (str): Local filepath, can be relative or absolute
             prefix_filter (str, optional): Only put files with names starting with this prefix
-            pattern (str, optional): Regex pattern to filter files
+            pattern (str, optional): Shell-style wildcard pattern to filter files
             basename (bool, optional): Whether to use the file names only as object names and omit the path information
             prepend (str, optional): Optional string to use as a prefix in the object name for all objects uploaded
                 No delimiter ("/", "-", etc.) is automatically applied between the prepend value and the object name
@@ -783,7 +800,7 @@ class Bucket(AISSource):
                 continue
             obj_name = self._get_uploaded_obj_name(file, path, basename, prepend)
             if not dry_run:
-                self.object(obj_name).put_file(str(file))
+                self.object(obj_name).get_writer().put_file(str(file))
             logger.info(
                 "%s File '%s' uploaded as object '%s' with size %s",
                 dry_run_prefix,
@@ -807,25 +824,26 @@ class Bucket(AISSource):
             return prepend + obj_name
         return obj_name
 
-    def object(self, obj_name: str) -> Object:
+    def object(self, obj_name: str, props: ObjectProps = None) -> Object:
         """
         Factory constructor for an object in this bucket.
         Does not make any HTTP request, only instantiates an object in a bucket owned by the client.
 
         Args:
             obj_name (str): Name of object
+            props (ObjectProps, optional): Properties of the object, as updated by head(), optionally pre-initialized.
 
         Returns:
             The object created.
         """
+        details = BucketDetails(self.name, self.provider, self.qparam, self.get_path())
         return Object(
-            bucket=self,
-            name=obj_name,
+            client=self.client, bck_details=details, name=obj_name, props=props
         )
 
     def objects(
         self,
-        obj_names: list = None,
+        obj_names: List = None,
         obj_range: ObjectRange = None,
         obj_template: str = None,
     ) -> ObjectGroup:
@@ -851,8 +869,8 @@ class Bucket(AISSource):
         self,
         method: str,
         action: str,
-        value: dict = None,
-        params: dict = None,
+        value: Dict = None,
+        params: Dict = None,
     ) -> requests.Response:
         """
         Use the bucket's client to make a request to the bucket endpoint on the AIS server
@@ -884,14 +902,14 @@ class Bucket(AISSource):
         """
         Verify the bucket provider is AIS
         """
-        if self.provider is not PROVIDER_AIS:
+        if self.provider.is_remote():
             raise InvalidBckProvider(self.provider)
 
     def verify_cloud_bucket(self):
         """
         Verify the bucket provider is a cloud provider
         """
-        if self.provider is PROVIDER_AIS:
+        if not self.provider.is_remote():
             raise InvalidBckProvider(self.provider)
 
     def get_path(self) -> str:
@@ -899,7 +917,7 @@ class Bucket(AISSource):
         Get the path representation of this bucket
         """
         namespace_path = self.namespace.get_path() if self.namespace else "@#"
-        return f"{ self.provider }/{ namespace_path }/{ self.name }/"
+        return f"{ self.provider.value }/{ namespace_path }/{ self.name }/"
 
     def as_model(self) -> BucketModel:
         """
@@ -909,7 +927,7 @@ class Bucket(AISSource):
             BucketModel representation
         """
         return BucketModel(
-            name=self.name, namespace=self.namespace, provider=self.provider
+            name=self.name, namespace=self.namespace, provider=self.provider.value
         )
 
     def write_dataset(
@@ -928,12 +946,12 @@ class Bucket(AISSource):
             **kwargs (optional): Optional keyword arguments to pass to the ShardWriter
         """
 
-        # Add the upload shard logic to the original post processing function
+        # Add the upload shard logic to the original post-processing function
         original_post = kwargs.get("post", lambda path: None)
 
         def combined_post_processing(shard_path):
             original_post(shard_path)
-            self.object(shard_path).put_file(shard_path)
+            self.object(shard_path).get_writer().put_file(shard_path)
             os.unlink(shard_path)
 
         kwargs["post"] = combined_post_processing

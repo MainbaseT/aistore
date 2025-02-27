@@ -1,6 +1,6 @@
 // Package core provides core metadata and in-cluster API
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
  */
 package core
 
@@ -156,7 +156,12 @@ func (lom *LOM) syncMetaWithCopies() (err error) {
 		}
 		lom.delCopyMd(copyFQN)
 		if err1 := cos.Stat(copyFQN); err1 != nil && !os.IsNotExist(err1) {
-			T.FSHC(err, copyFQN) // TODO: notify scrubber
+			mi, _, err2 := fs.FQN2Mpath(copyFQN)
+			if err2 != nil {
+				nlog.Errorln("nested err:", err2, "fqn:", copyFQN)
+			} else {
+				T.FSHC(err, mi, copyFQN)
+			}
 		}
 	}
 	return
@@ -222,18 +227,21 @@ func (lom *LOM) Copy(mi *fs.Mountpath, buf []byte) (err error) {
 		copyFQN = mi.MakePathFQN(lom.Bucket(), fs.ObjectType, lom.ObjName)
 		workFQN = mi.MakePathFQN(lom.Bucket(), fs.WorkfileType, fs.WorkfileCopy+"."+lom.ObjName)
 	)
-	// check if the copy destination exists and then skip copying if it's also identical
-	if errExists := cos.Stat(copyFQN); errExists == nil {
+	// copy is a no-op if the destination exists and is identical
+	errExists := cos.Stat(copyFQN)
+	if errExists == nil {
 		cplom := AllocLOM(lom.ObjName)
 		defer FreeLOM(cplom)
 		if errExists = cplom.InitFQN(copyFQN, lom.Bucket()); errExists == nil {
-			if errExists = cplom.Load(false /*cache it*/, true /*locked*/); errExists == nil && cplom.Equal(lom) {
-				goto add
+			if errExists = cplom.Load(false /*cache it*/, true /*locked*/); errExists == nil {
+				if cplom.CheckEq(lom) == nil {
+					goto add // skip copying
+				}
 			}
 		}
 	}
 
-	// copy
+	// do
 	_, _, err = cos.CopyFile(lom.FQN, workFQN, buf, cos.ChecksumNone) // TODO: checksumming
 	if err != nil {
 		return
@@ -323,7 +331,7 @@ func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 		lom.md.copies[lom.FQN], dst.md.copies[lom.FQN] = lom.mi, lom.mi
 		if err = lom.syncMetaWithCopies(); err != nil {
 			if _, ok := lom.md.copies[dst.FQN]; !ok {
-				if errRemove := os.Remove(dst.FQN); errRemove != nil && !os.IsNotExist(errRemove) {
+				if errRemove := cos.RemoveFile(dst.FQN); errRemove != nil {
 					nlog.Errorln("nested err:", errRemove)
 				}
 			}
@@ -335,7 +343,7 @@ func (lom *LOM) copy2fqn(dst *LOM, buf []byte) (err error) {
 		}
 		err = lom.Persist()
 	} else if err = dst.Persist(); err != nil {
-		if errRemove := os.Remove(dst.FQN); errRemove != nil && !os.IsNotExist(errRemove) {
+		if errRemove := cos.RemoveFile(dst.FQN); errRemove != nil {
 			nlog.Errorln("nested err:", errRemove)
 		}
 	}

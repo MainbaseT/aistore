@@ -10,6 +10,7 @@ import (
 
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/nlog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -43,6 +44,7 @@ type (
 	wbeHeap []wbeInfo
 )
 
+// lso and tests
 func WalkBck(opts *WalkBckOpts) error {
 	debug.Assert(opts.Mi == nil && opts.Sorted) // TODO: support `opts.Sorted == false`
 	var (
@@ -99,22 +101,27 @@ func WalkBck(opts *WalkBckOpts) error {
 // joggerBck //
 ///////////////
 
-func (jg *joggerBck) walk() (err error) {
-	err = Walk(&jg.opts)
-	close(jg.workCh)
-	return
+func (j *joggerBck) walk() (err error) {
+	if err = j.opts.Mi.CheckFS(); err != nil {
+		nlog.Errorln(err)
+		mfs.hc.FSHC(err, j.opts.Mi, "")
+	} else {
+		err = Walk(&j.opts)
+	}
+	close(j.workCh)
+	return err
 }
 
-func (jg *joggerBck) cb(fqn string, de DirEntry) error {
+func (j *joggerBck) cb(fqn string, de DirEntry) error {
 	const tag = "fs-walk-bck-mpath"
 	select {
-	case <-jg.ctx.Done():
-		return cmn.NewErrAborted(jg.mi.String(), tag, nil)
+	case <-j.ctx.Done():
+		return cmn.NewErrAborted(j.mi.String(), tag, nil)
 	default:
 		break
 	}
-	if jg.validate != nil {
-		if err := jg.validate(fqn, de); err != nil {
+	if j.validate != nil {
+		if err := j.validate(fqn, de); err != nil {
 			// If err != filepath.SkipDir, the Walk will propagate the error to group.Go.
 			// Context will be canceled, which then will terminate all running goroutines.
 			return err
@@ -124,9 +131,9 @@ func (jg *joggerBck) cb(fqn string, de DirEntry) error {
 		return nil
 	}
 	select {
-	case <-jg.ctx.Done():
-		return cmn.NewErrAborted(jg.mi.String(), tag, nil)
-	case jg.workCh <- &wbe{de, fqn}:
+	case <-j.ctx.Done():
+		return cmn.NewErrAborted(j.mi.String(), tag, nil)
+	case j.workCh <- &wbe{de, fqn}:
 		return nil
 	}
 }

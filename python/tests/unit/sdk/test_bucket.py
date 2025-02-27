@@ -1,12 +1,15 @@
 import unittest
-from unittest.mock import Mock, call, patch, MagicMock
+from unittest.mock import Mock, call, patch, MagicMock, mock_open
+
+from requests.structures import CaseInsensitiveDict
 
 from aistore.sdk.ais_source import AISSource
 from aistore.sdk.bucket import Bucket, Header
-from aistore.sdk.object import Object
-from aistore.sdk.etl_const import DEFAULT_ETL_TIMEOUT
-from aistore.sdk.object_iterator import ObjectIterator
+from aistore.sdk.obj.object import Object
+from aistore.sdk.etl.etl_const import DEFAULT_ETL_TIMEOUT
+from aistore.sdk.obj.object_iterator import ObjectIterator
 from aistore.sdk import ListObjectFlag
+from aistore.sdk.etl import ETLConfig
 
 from aistore.sdk.const import (
     ACT_COPY_BCK,
@@ -17,8 +20,6 @@ from aistore.sdk.const import (
     ACT_LIST,
     ACT_MOVE_BCK,
     ACT_SUMMARY_BCK,
-    PROVIDER_AMAZON,
-    PROVIDER_AIS,
     QPARAM_BCK_TO,
     QPARAM_NAMESPACE,
     QPARAM_PROVIDER,
@@ -48,6 +49,7 @@ from aistore.sdk.errors import (
     ErrBckNotFound,
     UnexpectedHTTPStatusCode,
 )
+from aistore.sdk.obj.object_props import ObjectProps
 from aistore.sdk.request_client import RequestClient
 from aistore.sdk.types import (
     ActionMsg,
@@ -60,7 +62,9 @@ from aistore.sdk.types import (
     CopyBckMsg,
 )
 from aistore.sdk.enums import FLTPresence
+from aistore.sdk.provider import Provider
 from tests.const import ETL_NAME, PREFIX_NAME
+from tests.utils import cases
 
 BCK_NAME = "bucket_name"
 
@@ -70,7 +74,7 @@ class TestBucket(unittest.TestCase):
     def setUp(self) -> None:
         self.mock_client = Mock(RequestClient)
         self.amz_bck = Bucket(
-            name=BCK_NAME, client=self.mock_client, provider=PROVIDER_AMAZON
+            name=BCK_NAME, client=self.mock_client, provider=Provider.AMAZON
         )
         self.amz_bck_params = self.amz_bck.qparam.copy()
         self.ais_bck = Bucket(name=BCK_NAME, client=self.mock_client)
@@ -79,31 +83,41 @@ class TestBucket(unittest.TestCase):
 
     def test_default_props(self):
         bucket = Bucket(name=BCK_NAME, client=self.mock_client)
-        self.assertEqual({QPARAM_PROVIDER: PROVIDER_AIS}, bucket.qparam)
-        self.assertEqual(PROVIDER_AIS, bucket.provider)
+        self.assertEqual({QPARAM_PROVIDER: Provider.AIS.value}, bucket.qparam)
+        self.assertEqual(Provider.AIS, bucket.provider)
         self.assertIsNone(bucket.namespace)
 
     def test_properties(self):
         self.assertEqual(self.mock_client, self.ais_bck.client)
         expected_ns = Namespace(uuid="ns-id", name="ns-name")
-        client = RequestClient("test client name", skip_verify=False, ca_cert="")
+        client = RequestClient("test client name", session_manager=Mock())
         bck = Bucket(
             client=client,
             name=BCK_NAME,
-            provider=PROVIDER_AMAZON,
+            provider=Provider.AMAZON,
             namespace=expected_ns,
         )
         self.assertEqual(client, bck.client)
-        self.assertEqual(PROVIDER_AMAZON, bck.provider)
+        self.assertEqual(Provider.AMAZON, bck.provider)
         self.assertEqual(
             {
-                QPARAM_PROVIDER: PROVIDER_AMAZON,
+                QPARAM_PROVIDER: Provider.AMAZON.value,
                 QPARAM_NAMESPACE: expected_ns.get_path(),
             },
             bck.qparam,
         )
         self.assertEqual(BCK_NAME, bck.name)
         self.assertEqual(expected_ns, bck.namespace)
+
+    @cases(("gs", Provider.GOOGLE), ("s3", Provider.AMAZON))
+    def test_init_mapped_provider(self, test_case):
+        alias, provider = test_case
+        bck = Bucket(
+            client=self.mock_client,
+            name="test-bck",
+            provider=alias,
+        )
+        self.assertEqual(provider, bck.provider)
 
     def test_ais_source(self):
         self.assertIsInstance(self.ais_bck, AISSource)
@@ -140,7 +154,7 @@ class TestBucket(unittest.TestCase):
     def test_rename_success(self):
         new_bck_name = "new_bucket"
         expected_response = "rename_op_123"
-        self.ais_bck_params[QPARAM_BCK_TO] = f"{PROVIDER_AIS}/@#/{new_bck_name}/"
+        self.ais_bck_params[QPARAM_BCK_TO] = f"{Provider.AIS.value}/@#/{new_bck_name}/"
         mock_response = Mock()
         mock_response.text = expected_response
         self.mock_client.request.return_value = mock_response
@@ -213,12 +227,13 @@ class TestBucket(unittest.TestCase):
         )
         self.assertEqual(headers, mock_header.headers)
 
-    def test_copy_default_params(self):
+    @cases(*Provider)
+    def test_copy_default_params(self, provider):
         dest_bck = Bucket(
             client=self.mock_client,
             name="test-bck",
             namespace=Namespace(uuid="namespace-id", name="ns-name"),
-            provider="any-provider",
+            provider=provider,
         )
         action_value = {
             "prefix": "",
@@ -527,51 +542,60 @@ class TestBucket(unittest.TestCase):
         self.assertEqual(expected_response, result_id)
 
     def test_object(self):
-        new_obj = self.ais_bck.object(obj_name="name")
-        self.assertEqual(self.ais_bck, new_obj.bucket)
+        obj_name = "testobject"
+        props = ObjectProps(CaseInsensitiveDict({"testkey": "testval"}))
 
-    @patch("aistore.sdk.object.read_file_bytes")
-    @patch("aistore.sdk.object.validate_file")
+        new_obj = self.ais_bck.object(obj_name=obj_name, props=props)
+
+        self.assertEqual(self.ais_bck.name, new_obj.bucket_name)
+        self.assertEqual(self.ais_bck.provider, new_obj.bucket_provider)
+        self.assertEqual(self.ais_bck.qparam, new_obj.query_params)
+        self.assertEqual(props, new_obj.props)
+
+    @patch("aistore.sdk.obj.object_writer.validate_file")
     @patch("aistore.sdk.bucket.validate_directory")
     @patch("pathlib.Path.glob")
-    def test_put_files(
-        self, mock_glob, mock_validate_dir, mock_validate_file, mock_read
-    ):
+    def test_put_files(self, mock_glob, mock_validate_dir, mock_validate_file):
         path = "directory"
-        file_1 = ("file_1_name", b"bytes in the first file")
-        file_2 = ("file_2_name", b"bytes in the second file")
+        file_names = ["file_1_name", "file_2_name"]
+        file_sizes = [123, 4567]
 
-        path_1 = Mock()
-        path_1.is_file.return_value = True
-        path_1.relative_to.return_value = file_1[0]
-        path_1.stat.return_value = Mock(st_size=123)
+        file_readers = [
+            mock_open(read_data=b"bytes in the first file").return_value,
+            mock_open(read_data=b"bytes in the second file").return_value,
+        ]
+        mock_file = mock_open()
+        mock_file.side_effect = file_readers
 
-        path_2 = Mock()
-        path_2.is_file.return_value = True
-        path_2.relative_to.return_value = file_2[0]
-        path_2.stat.return_value = Mock(st_size=4567)
+        # Set up mock files
+        mock_files = [
+            Mock(
+                is_file=Mock(return_value=True),
+                relative_to=Mock(return_value=name),
+                stat=Mock(return_value=Mock(st_size=size)),
+            )
+            for name, size in zip(file_names, file_sizes)
+        ]
+        mock_glob.return_value = mock_files
 
-        mock_glob.return_value = [path_1, path_2]
-        expected_obj_names = [file_1[0], file_2[0]]
-        mock_read.side_effect = [file_1[1], file_2[1]]
-
-        res = self.ais_bck.put_files(path)
+        with patch("builtins.open", mock_file):
+            res = self.ais_bck.put_files(path)
 
         # Ensure that put_files is called for files for the directory at path
         mock_validate_dir.assert_called_with(path)
         # Ensure that files have been created with the proper path
-        mock_validate_file.assert_has_calls([call(str(path_1)), call(str(path_2))])
+        mock_validate_file.assert_has_calls([call(str(f)) for f in mock_files])
         # Ensure that the files put in the bucket have the sane names
-        self.assertEqual(expected_obj_names, res)
+        self.assertEqual(file_names, res)
         expected_calls = []
 
-        for file_name, file_data in [file_1, file_2]:
+        for file_name, file_reader in zip(file_names, file_readers):
             expected_calls.append(
                 call(
                     HTTP_METHOD_PUT,
                     path=f"objects/{BCK_NAME}/{file_name}",
                     params=self.ais_bck_params,
-                    data=file_data,
+                    data=file_reader,
                 )
             )
 
@@ -580,12 +604,14 @@ class TestBucket(unittest.TestCase):
 
     def test_get_path(self):
         namespace = Namespace(uuid="ns-id", name="ns-name")
-        bucket = Bucket(name=BCK_NAME, namespace=namespace, provider=PROVIDER_AMAZON)
+        bucket = Bucket(name=BCK_NAME, namespace=namespace, provider=Provider.AMAZON)
         expected_path = (
-            f"{PROVIDER_AMAZON}/@{namespace.uuid}#{namespace.name}/{bucket.name}/"
+            f"{Provider.AMAZON.value}/@{namespace.uuid}#{namespace.name}/{bucket.name}/"
         )
         self.assertEqual(expected_path, bucket.get_path())
-        self.assertEqual(f"{PROVIDER_AIS}/@#/{bucket.name}/", self.ais_bck.get_path())
+        self.assertEqual(
+            f"{Provider.AIS.value}/@#/{bucket.name}/", self.ais_bck.get_path()
+        )
 
     @patch("aistore.sdk.bucket.Bucket.object")
     @patch("aistore.sdk.bucket.Bucket.list_objects_iter")
@@ -596,9 +622,9 @@ class TestBucket(unittest.TestCase):
         # Should create an object reference and get url for every object returned by listing
         for name in object_names:
             expected_obj_calls.append(call(name))
-            expected_obj_calls.append(call().get_url(etl_name=ETL_NAME))
+            expected_obj_calls.append(call().get_url(etl=ETLConfig(name=ETL_NAME)))
         mock_list_obj.return_value = [BucketEntry(n=name) for name in object_names]
-        list(self.ais_bck.list_urls(prefix=prefix, etl_name=ETL_NAME))
+        list(self.ais_bck.list_urls(prefix=prefix, etl=ETLConfig(name=ETL_NAME)))
         mock_list_obj.assert_called_with(prefix=prefix, props="name")
         mock_object.assert_has_calls(expected_obj_calls)
 

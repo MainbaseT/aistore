@@ -1,10 +1,11 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -20,14 +21,14 @@ import (
 	"github.com/NVIDIA/aistore/ios"
 	"github.com/NVIDIA/aistore/nl"
 	"github.com/NVIDIA/aistore/space"
-	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/xact"
 	"github.com/NVIDIA/aistore/xact/xreg"
 )
 
 const (
 	// - note that an API call (e.g. CLI) will go through anyway
-	// - compare with cmn/cos/oom.go
+	// - compare with cmn/cos/oom
+	// - compare with fs/health/fshc
 	minAutoDetectInterval = 10 * time.Minute
 )
 
@@ -36,19 +37,30 @@ var (
 )
 
 // triggers by an out-of-space condition or a suspicion of thereof
-func (t *target) OOS(csRefreshed *fs.CapStatus) (cs fs.CapStatus) {
+
+func (t *target) oos(config *cmn.Config) fs.CapStatus {
+	debug.Assert(config != nil)
+	return t.OOS(nil, config, nil)
+}
+
+func (t *target) OOS(csRefreshed *fs.CapStatus, config *cmn.Config, tcdf *fs.Tcdf) (cs fs.CapStatus) {
 	var errCap error
 	if csRefreshed != nil {
 		cs = *csRefreshed
 		errCap = cs.Err()
 	} else {
 		var err error
-		cs, err, errCap = fs.CapRefresh(nil, nil)
+		cs, err, errCap = fs.CapRefresh(config, tcdf)
 		if err != nil {
 			nlog.Errorln(t.String(), "failed to update capacity stats:", err)
 			return
 		}
 	}
+
+	//
+	// TODO: refactor
+	//
+
 	if errCap == nil {
 		return // unlikely; nothing to do
 	}
@@ -58,29 +70,40 @@ func (t *target) OOS(csRefreshed *fs.CapStatus) (cs fs.CapStatus) {
 	}
 
 	if cs.IsOOS() {
-		t.statsT.Flag(stats.NodeStateFlags, cos.OOS, 0)
+		t.statsT.SetFlag(cos.NodeAlerts, cos.OOS)
 	} else {
-		t.statsT.Flag(stats.NodeStateFlags, cos.LowCapacity, 0)
+		t.statsT.SetFlag(cos.NodeAlerts, cos.LowCapacity)
 	}
 	nlog.Warningln(t.String(), "running store cleanup:", cs.String())
-	// run serially, cleanup first and LRU second, iff out-of-space persists
+
+	//
+	// run serially - cleanup first, LRU second (but only if out-of-space persists)
+	//
 	go func() {
-		cs := t.runStoreCleanup("" /*uuid*/, nil /*wg*/)
+		var xargs xact.ArgsMsg // no bucket, no xid - nothing
+		cs := t.runSpaceCleanup(&xargs, nil /*wg*/)
 		lastTrigOOS.Store(mono.NanoTime())
 		if cs.Err() != nil {
 			nlog.Warningln(t.String(), "still out of space, running LRU eviction now:", cs.String())
 			t.runLRU("" /*uuid*/, nil /*wg*/, false)
 		}
 	}()
+
 	return
 }
 
 func (t *target) runLRU(id string, wg *sync.WaitGroup, force bool, bcks ...cmn.Bck) {
-	regToIC := id == ""
+	var (
+		ctlmsg  string
+		regToIC = id == ""
+	)
 	if regToIC {
 		id = cos.GenUUID()
 	}
-	rns := xreg.RenewLRU(id)
+	if len(bcks) > 0 {
+		ctlmsg = fmt.Sprintf("%v", bcks)
+	}
+	rns := xreg.RenewLRU(id, ctlmsg)
 	if rns.Err != nil || rns.IsRunning() {
 		debug.Assert(rns.Err == nil || cmn.IsErrXactUsePrev(rns.Err))
 		if wg != nil {
@@ -112,12 +135,18 @@ func (t *target) runLRU(id string, wg *sync.WaitGroup, force bool, bcks ...cmn.B
 	space.RunLRU(&ini)
 }
 
-func (t *target) runStoreCleanup(id string, wg *sync.WaitGroup, bcks ...cmn.Bck) fs.CapStatus {
-	regToIC := id == ""
-	if regToIC {
-		id = cos.GenUUID()
+func (t *target) runSpaceCleanup(xargs *xact.ArgsMsg, wg *sync.WaitGroup) fs.CapStatus {
+	var (
+		ctlmsg  string
+		regToIC = xargs.ID != ""
+	)
+	if !regToIC {
+		xargs.ID = cos.GenUUID()
 	}
-	rns := xreg.RenewStoreCleanup(id)
+	if len(xargs.Buckets) > 0 {
+		ctlmsg = fmt.Sprintf("%v", xargs.Buckets)
+	}
+	rns := xreg.RenewStoreCleanup(xargs.ID, ctlmsg)
 	if rns.Err != nil || rns.IsRunning() {
 		debug.Assert(rns.Err == nil || cmn.IsErrXactUsePrev(rns.Err))
 		if wg != nil {
@@ -126,18 +155,18 @@ func (t *target) runStoreCleanup(id string, wg *sync.WaitGroup, bcks ...cmn.Bck)
 		return fs.CapStatus{}
 	}
 	xcln := rns.Entry.Get()
-	if regToIC && xcln.ID() == id {
+	if regToIC && xcln.ID() == xargs.ID {
 		// pre-existing UUID: notify IC members
-		regMsg := xactRegMsg{UUID: id, Kind: apc.ActStoreCleanup, Srcs: []string{t.SID()}}
+		regMsg := xactRegMsg{UUID: xargs.ID, Kind: apc.ActStoreCleanup, Srcs: []string{t.SID()}}
 		msg := t.newAmsgActVal(apc.ActRegGlobalXaction, regMsg)
 		t.bcastAsyncIC(msg)
 	}
 	ini := space.IniCln{
+		StatsT:  t.statsT,
 		Xaction: xcln.(*space.XactCln),
 		Config:  cmn.GCO.Get(),
-		StatsT:  t.statsT,
-		Buckets: bcks,
 		WG:      wg,
+		Args:    xargs,
 	}
 	xcln.AddNotif(&xact.NotifXact{
 		Base: nl.Base{When: core.UponTerm, Dsts: []string{equalIC}, F: t.notifyTerm},

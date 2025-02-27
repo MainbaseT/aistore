@@ -1,12 +1,11 @@
-// Package ais provides core functionality for the AIStore object storage.
+// Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
 	"bytes"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"time"
@@ -26,10 +25,10 @@ import (
 
 type nopHB struct{}
 
-func (*nopHB) HeardFrom(string, int64) {}
-func (*nopHB) TimedOut(string) bool    { return false }
-func (*nopHB) reg(string)              {}
-func (*nopHB) set(time.Duration) bool  { return false }
+func (*nopHB) HeardFrom(string, int64) int64 { return 0 }
+func (*nopHB) TimedOut(string) bool          { return false }
+func (*nopHB) reg(string)                    {}
+func (*nopHB) set(time.Duration) bool        { return false }
 
 var _ hbTracker = (*nopHB)(nil)
 
@@ -138,7 +137,7 @@ var _ = Describe("Notifications xaction test", func() {
 			writer := httptest.NewRecorder()
 			n.handler(writer, req)
 			resp := writer.Result()
-			respBody, _ := io.ReadAll(resp.Body)
+			respBody, _ := cos.ReadAllN(resp.Body, resp.ContentLength)
 			resp.Body.Close()
 			Expect(resp.StatusCode).To(BeEquivalentTo(expectedStatus))
 			return respBody

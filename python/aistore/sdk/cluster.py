@@ -1,16 +1,15 @@
 #
-# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 #
 
 from __future__ import annotations  # pylint: disable=unused-variable
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 
 from aistore.sdk.const import (
     HTTP_METHOD_GET,
     ACT_LIST,
-    PROVIDER_AIS,
     QPARAM_WHAT,
     QPARAM_PRIMARY_READY_REB,
     QPARAM_PROVIDER,
@@ -25,8 +24,8 @@ from aistore.sdk.const import (
     WHAT_ALL_XACT_STATUS,
     WHAT_ALL_RUNNING_STATUS,
     WHAT_NODE_STATS_AND_STATUS,
-    WHAT_NODE_STATS_AND_STATUS_V322,
 )
+from aistore.sdk.provider import Provider
 
 from aistore.sdk.types import (
     BucketModel,
@@ -35,15 +34,8 @@ from aistore.sdk.types import (
     ETLInfo,
     ActionMsg,
     Smap,
-    NodeStats,
-    NodeStatsV322,
-    ClusterPerformance,
-    NodeCounter,
-    NodeLatency,
-    NodeThroughput,
 )
 from aistore.sdk.request_client import RequestClient
-from aistore.sdk.errors import AISError
 
 logger = logging.getLogger("cluster")
 
@@ -84,13 +76,13 @@ class Cluster:
         """
         return self._get_smap().proxy_si.public_net.direct_url
 
-    def list_buckets(self, provider: str = PROVIDER_AIS):
+    def list_buckets(self, provider: Union[str, Provider] = Provider.AIS):
         """
         Returns list of buckets in AIStore cluster.
 
         Args:
-            provider (str, optional): Name of bucket provider, one of "ais", "aws", "gcp", "az" or "ht".
-            Defaults to "ais". Empty provider returns buckets of all providers.
+            provider (str or Provider, optional): Provider of bucket (one of "ais", "aws", "gcp", ...).
+                Defaults to "ais". Empty provider returns buckets of all providers.
 
         Returns:
             List[BucketModel]: A list of buckets
@@ -101,7 +93,7 @@ class Cluster:
             requests.ConnectionTimeout: Timed out connecting to AIStore
             requests.ReadTimeout: Timed out waiting response from AIStore
         """
-        params = {QPARAM_PROVIDER: provider}
+        params = {QPARAM_PROVIDER: Provider.parse(provider).value}
         action = ActionMsg(action=ACT_LIST).dict()
 
         return self.client.request_deserialize(
@@ -187,26 +179,14 @@ class Cluster:
             logger.debug(err)
             return False
 
-    # pylint: disable=too-many-locals
-    def get_performance(
-        self,
-        get_throughput: bool = True,
-        get_latency: bool = True,
-        get_counters: bool = True,
-    ) -> ClusterPerformance:
+    def get_performance(self) -> Dict:
         """
-        Retrieves and calculates the performance metrics for each target node in the AIStore cluster.
-        It compiles throughput, latency, and various operational counters from each target node,
-        providing a comprehensive view of the cluster's overall performance
-
-        Args:
-            get_throughput (bool, optional): get cluster throughput
-            get_latency (bool, optional): get cluster latency
-            get_counters (bool, optional): get cluster counters
+        Retrieves the raw performance and status data from each target node in the AIStore cluster.
 
         Returns:
-            ClusterPerformance: An object encapsulating the detailed performance metrics of the cluster,
-                including throughput, latency, and counters for each node
+            Dict: A dictionary where each key is the ID of a target node and each value is the
+                    raw AIS performance/status JSON returned by that node (for more information,
+                    see https://aistore.nvidia.com/docs/metrics-reference#target-metrics).
 
         Raises:
             requests.RequestException: If there's an ambiguous exception while processing the request
@@ -214,49 +194,22 @@ class Cluster:
             requests.ConnectionTimeout: If the connection to the cluster times out
             requests.ReadTimeout: If the timeout is reached while awaiting a response from the cluster
         """
-
+        performance_data = {}
         targets = self._get_targets()
-        target_stats = {}
         params = {QPARAM_WHAT: WHAT_NODE_STATS_AND_STATUS}
-        res_model = NodeStats
+
         for target_id in targets:
             headers = {HEADER_NODE_ID: target_id}
-            try:
-                res = self.client.request_deserialize(
-                    HTTP_METHOD_GET,
-                    path=f"{URL_PATH_REVERSE}/{URL_PATH_DAEMON}",
-                    res_model=res_model,
-                    headers=headers,
-                    params=params,
-                )
-            except AISError as err:
-                if "unrecognized what=node_status" in err.message:
-                    params = {QPARAM_WHAT: WHAT_NODE_STATS_AND_STATUS_V322}
-                    res_model = NodeStatsV322
-                    res = self.client.request_deserialize(
-                        HTTP_METHOD_GET,
-                        path=f"{URL_PATH_REVERSE}/{URL_PATH_DAEMON}",
-                        res_model=res_model,
-                        headers=headers,
-                        params=params,
-                    )
-                else:
-                    raise err
-            target_stats[target_id] = res
-        throughputs = {}
-        latencies = {}
-        counters = {}
-        for target_id, val in target_stats.items():
-            if get_throughput:
-                throughputs[target_id] = NodeThroughput(val.tracker)
-            if get_latency:
-                latencies[target_id] = NodeLatency(val.tracker)
-            if get_counters:
-                counters[target_id] = NodeCounter(val.tracker)
+            resp = self.client.request(
+                HTTP_METHOD_GET,
+                path=f"{URL_PATH_REVERSE}/{URL_PATH_DAEMON}",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            performance_data[target_id] = resp.json()
 
-        return ClusterPerformance(
-            throughput=throughputs, latency=latencies, counters=counters
-        )
+        return performance_data
 
     def _get_smap(self):
         return self.client.request_deserialize(
@@ -269,3 +222,9 @@ class Cluster:
     def _get_targets(self):
         tmap = self._get_smap().tmap
         return list(tmap.keys())
+
+    def get_uuid(self) -> str:
+        """
+        Returns: UUID of AIStore Cluster
+        """
+        return self._get_smap().uuid

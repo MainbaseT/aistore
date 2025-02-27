@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -8,10 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	ratomic "sync/atomic"
 	"syscall"
@@ -24,6 +26,10 @@ type (
 		where fmt.Stringer
 		what  string
 	}
+	ErrAlreadyExists struct {
+		where fmt.Stringer
+		what  string
+	}
 	ErrSignal struct {
 		signal syscall.Signal
 	}
@@ -31,6 +37,15 @@ type (
 		errs []error
 		cnt  int64
 		mu   sync.Mutex
+	}
+
+	// background:
+	// - normally, keeping objects under their original names
+	// - FNTL excepted (see core/lom)
+	ErrMv struct {
+		// - type 1: mv readme aaa/bbb, where destination aaa/bbb[/ccc/...] is a virtual directory
+		// - type 2 (a.k.a. ENOTDIR): mv readme aaa/bbb/ccc, where destination aaa/bbb is (or contains) a file
+		ty int
 	}
 )
 
@@ -41,6 +56,8 @@ var (
 
 	errQuantityNonNegative = errors.New("quantity should not be negative")
 )
+
+var ErrWorkChanFull = errors.New("work channel full")
 
 var errBufferUnderrun = errors.New("buffer underrun")
 
@@ -63,10 +80,25 @@ func IsErrNotFound(err error) bool {
 	return ok
 }
 
+// ErrAlreadyExists
+
+func NewErrAlreadyExists(where fmt.Stringer, what string) *ErrAlreadyExists {
+	return &ErrAlreadyExists{where: where, what: what}
+}
+
+func (e *ErrAlreadyExists) Error() string {
+	s := e.what + " already exists"
+	if e.where == nil {
+		return s
+	}
+	return e.where.String() + ": " + s
+}
+
 //
 // gen-purpose not-finding-anything: objects, directories, xactions, nodes, ...
 //
 
+// NOTE: compare with cmn.IsErrObjNought() that also includes lmeta-not-found et al.
 func IsNotExist(err error, ecode int) bool {
 	if ecode == http.StatusNotFound || IsErrNotFound(err) {
 		return true
@@ -147,6 +179,25 @@ func IsErrSyscallTimeout(err error) bool {
 	return ok && syscallErr.Timeout()
 }
 
+func IsPathErr(err error) (ok bool) {
+	pathErr := (*iofs.PathError)(nil)
+	if errors.As(err, &pathErr) {
+		ok = true
+	}
+	return ok
+}
+
+// "file name too long" errno 0x24 (36); either one of the two possible reasons:
+// - len(pathname) > PATH_MAX = 4096
+// - len(basename) > 255
+func IsErrFntl(err error) bool {
+	return strings.Contains(err.Error(), "too long") && errors.Is(err, syscall.ENAMETOOLONG)
+}
+
+func IsErrNotDir(err error) bool {
+	return strings.Contains(err.Error(), "directory") && errors.Is(err, syscall.ENOTDIR)
+}
+
 // likely out of socket descriptors
 func IsErrConnectionNotAvail(err error) (yes bool) {
 	return errors.Is(err, syscall.EADDRNOTAVAIL)
@@ -165,14 +216,21 @@ func IsErrOOS(err error) bool {
 	return errors.Is(err, syscall.ENOSPC)
 }
 
-func isErrDNSLookup(err error) bool {
-	_, ok := err.(*net.DNSError)
-	return ok
+func IsErrDNSLookup(err error) bool {
+	if _, ok := err.(*net.DNSError); ok {
+		return ok
+	}
+	wrapped := &net.DNSError{}
+	return errors.As(err, &wrapped)
+}
+
+func IsClientTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func IsUnreachable(err error, status int) bool {
 	return IsErrConnectionRefused(err) ||
-		isErrDNSLookup(err) ||
+		IsErrDNSLookup(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		status == http.StatusRequestTimeout ||
 		status == http.StatusServiceUnavailable ||
@@ -203,4 +261,27 @@ func Err2ClientURLErr(err error) (uerr *url.Error) {
 func IsErrClientURLTimeout(err error) bool {
 	uerr := Err2ClientURLErr(err)
 	return uerr != nil && uerr.Timeout()
+}
+
+func checkMvErr(err error, dst string) error {
+	if finfo, errN := os.Stat(dst); errN == nil && finfo.IsDir() {
+		return &ErrMv{1}
+	}
+	if IsErrNotDir(err) {
+		return &ErrMv{2}
+	}
+	return err
+}
+
+func IsErrMv(err error) bool {
+	_, ok := err.(*ErrMv)
+	return ok
+}
+
+func (e *ErrMv) Error() string {
+	if e.ty == 2 {
+		// with underlying `ENOTDIR`
+		return "destination contains an object in its path"
+	}
+	return "destination exists and is a virtual directory"
 }

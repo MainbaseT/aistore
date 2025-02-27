@@ -1,26 +1,13 @@
 
 SHELL := /bin/bash
 PYTHON = python3
+GO = go
 PYTEST = $(PYTHON) -m pytest
-PIP = pip3
-DOCFILE := ../docs/python_sdk.md
+PIP ?= pip3
+SDK_DOCFILE := ../docs/python_sdk.md
+TORCH_DOCFILE := ../docs/pytorch.md
 PYAISLOADER_TEST_TYPE ?= short
-define PREFIX =
----
-layout: post
-title: PYTHON SDK
-permalink: /docs/python-sdk
-redirect_from:
- - /python_sdk.md/
- - /docs/python_sdk.md/
----
 
-AIStore Python SDK is a growing set of client-side objects and methods to access and utilize AIS clusters.
-
-> For PyTorch integration and usage examples, please refer to [AIS Python SDK](https://pypi.org/project/aistore) available via Python Package Index (PyPI), or see [https://github.com/NVIDIA/aistore/tree/main/python/aistore](https://github.com/NVIDIA/aistore/tree/main/python/aistore).
-
-endef
-export PREFIX
 BOTO_UNIT_TEST_COUNT := $(shell ls -1 tests/unit/botocore_patch/test*py | wc -l)
 export AWS_SESSION_TOKEN := testing
 # will be fetched from CI pipeline secrets
@@ -53,6 +40,10 @@ botocore_deps:
 s3_test_deps:
 	$(PIP) install --upgrade -r tests/s3compat/requirements --quiet
 
+.PHONY: python_unit_tests_scenario_gen
+python_unit_tests_scenario_gen:
+	@ $(GO) run tests/unit/sdk/hrw/scenario_gen.go
+
 .PHONY: python_tests
 python_tests: common_deps dev_deps botocore_deps python_sdk_tests python_etl_tests python_botocore_tests
 
@@ -62,15 +53,19 @@ python_sdk_tests: common_deps python_sdk_unit_tests python_sdk_integration_tests
 
 .PHONY: python_sdk_integration_tests
 python_sdk_integration_tests: common_deps
-	$(PYTEST) -v tests/integration/sdk -m "not etl"
+	$(PYTEST) -v tests/integration/sdk -m "not etl and not authn"
 
 .PHONY: python_sdk_unit_tests
-python_sdk_unit_tests: common_deps
+python_sdk_unit_tests: common_deps python_unit_tests_scenario_gen
 	$(PYTEST) -v tests/unit/sdk
 
 .PHONY: python_etl_tests
 python_etl_tests: common_deps
 	$(PYTEST) -v -s tests/integration/sdk/ -m etl
+
+.PHONY: python_authn_tests
+python_authn_tests: common_deps
+	$(PYTEST) -v -s tests/integration/sdk/ -m authn
 
 .PHONY: python_s3_compat_test
 python_s3_compat_test: s3_test_deps
@@ -101,21 +96,37 @@ python_pytorch_integration_tests: common_deps dev_deps
 	$(PYTEST) -v tests/integration/pytorch
 
 .PHONY: lint
-lint: common_deps
+lint: common_deps botocore_deps
 	pylint --rcfile=.pylintrc --recursive=y aistore
 
 .PHONY: lint-tests
 lint-tests: common_deps botocore_deps
 	pylint --rcfile=.pylintrc-tests --recursive=y tests
 
-.PHONY: generate-docs
-generate-docs:
+.PHONY: generate-sdk-docs
+generate-sdk-docs:
+	@ chmod +x doc_prefixes.sh
 	@ set -e
 	@ [[ $$(pipx --help) ]] || $(PIP) install pipx; $(PYTHON) -m pipx ensurepath --force
 	@ [[ $$(pydoc-markdown --help) ]] || pipx install --force pydoc-markdown[novella]
-	@ echo "$$PREFIX" > $(DOCFILE)
-	@ pydoc-markdown -I ./aistore/sdk -m client -m cluster -m bucket -m object -m multiobj.object_group -m multiobj.object_names -m multiobj.object_range -m multiobj.object_template -m job -m object_reader -m object_iterator -m etl '{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(DOCFILE)
-	@ sed -i -e 's/####/###/g' $(DOCFILE)
+	@ source doc_prefixes.sh &&  echo "$$SDK_PREFIX" > $(SDK_DOCFILE)
+	@ pydoc-markdown -I ./aistore/sdk \
+	-m authn.authn_client -m authn.cluster_manager -m authn.role_manager -m authn.token_manager -m authn.user_manager -m authn.access_attr \
+	-m bucket -m client -m cluster -m etl -m job -m multiobj.object_group -m multiobj.object_names -m multiobj.object_range -m multiobj.object_template \
+	-m obj.object -m obj.object_reader -m obj.obj_file.object_file -m obj.object_props -m obj.object_attributes \
+	'{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(SDK_DOCFILE)	
+	@ sed -i -e 's/####/###/g' $(SDK_DOCFILE)
+
+.PHONY: generate-pytorch-docs
+generate-pytorch-docs:
+	@ chmod +x doc_prefixes.sh
+	@ set -e
+	@ [[ $$(pipx --help) ]] || $(PIP) install pipx; $(PYTHON) -m pipx ensurepath --force
+	@ [[ $$(pydoc-markdown --help) ]] || pipx install --force pydoc-markdown[novella]
+	@ source doc_prefixes.sh && echo "$$TORCH_PREFIX" > $(TORCH_DOCFILE)
+	@ pydoc-markdown -I ./aistore/pytorch -m base_map_dataset -m base_iter_dataset -m map_dataset -m iter_dataset -m shard_reader -m multishard_dataset '{ renderer: { type: markdown, descriptive_class_title: "Class: ", render_toc: true, render_toc_title: "", render_module_header: false, classdef_with_decorators: true } }' >> $(TORCH_DOCFILE)
+	@ sed -i -e 's/####/###/g' $(TORCH_DOCFILE)
+
 
 .PHONY:
 test-pyaisloader:
